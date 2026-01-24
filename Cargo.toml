@@ -1,0 +1,18 @@
+[package]
+name = "rrm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+base16ct = { version = "1.0.0", features = ["alloc"] }
+clap = { version = "4.5.54", features = ["derive"] }
+digest = { version = "0.10.7", features = ["std"] }
+log = { version = "0.4.29", features = ["std"] }
+roxmltree = "0.21.1"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+sha1 = "0.10.6"
+shlex = "1.3.0"
+simple_logger = { version = "5.1.0", features = ["colors", "stderr"] }
+wild = "2.2.1"
+zip = "7.1.0"
