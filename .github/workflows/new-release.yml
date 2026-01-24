@@ -1,0 +1,76 @@
+# .github/workflows/new-release.yml
+name: Release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [created]
+
+jobs:
+  new_release:
+    name: release ${{ matrix.build }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [linux, windows, mac]
+        include:
+          - build: linux
+            target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            binary: rcr
+          - build: windows
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: rcr.exe
+          - build: mac
+            target: x86_64-apple-darwin
+            os: macos-latest
+            binary: rcr
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install musl-tools on Linux
+        if: matrix.build == 'linux'
+        run: sudo apt-get update --yes && sudo apt-get install --yes musl-tools
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build artifacts
+        run: cargo build --locked --release --features memmap2 --target ${{ matrix.target }}
+      - name: Package artifacts (Non-Windows)
+        if: matrix.build != 'windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          ARCHIVE=rcr_${{ matrix.target }}.zip
+          zip -9r ${ARCHIVE} ${{ matrix.binary }}
+          printf "%s %s" "$(sha256sum "${ARCHIVE}" | cut -d ' ' -f 1)" "$ARCHIVE" > "${ARCHIVE}.sha256sum"
+      - name: Package artifacts (Windows)
+        if: matrix.build == 'windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          $ARCHIVE = "rcr_${{ matrix.target }}.zip"
+          Compress-Archive -Path ${{ matrix.binary }} -DestinationPath $ARCHIVE -CompressionLevel Optimal
+          $hash = (Get-FileHash $ARCHIVE -Algorithm SHA256).Hash.ToLower()
+          "$hash $ARCHIVE" | Out-File -Encoding ascii -NoNewline "$ARCHIVE.sha256sum"
+      - name: Upload release assets (release)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/${{ matrix.target }}/release/rcr_${{ matrix.target }}.zip
+            target/${{ matrix.target }}/release/rcr_${{ matrix.target }}.zip.sha256sum
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts (manual)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rcr_${{ matrix.build }}
+          path: |
+            target/${{ matrix.target }}/release/rcr_${{ matrix.target }}.zip
+            target/${{ matrix.target }}/release/rcr_${{ matrix.target }}.zip.sha256sum
