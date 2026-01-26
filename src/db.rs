@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
-use std::path::Path;
+use camino::Utf8Path;
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, params};
 
-pub fn open_or_create<P: AsRef<Path>>(db_path: P) -> Result<Connection> {
-    const CREATE_STATEMENTS: [&str; 10] = [
+pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
+    const CREATE_STATEMENTS: [&str; 14] = [
         /* dat file */
         "CREATE TABLE IF NOT EXISTS dats ( id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, description VARCHAR NOT NULL, \
         version VARCHAR NOT NULL, author VARCHAR NOT NULL, hash_type VARCHAR NOT NULL);",
@@ -17,20 +17,26 @@ pub fn open_or_create<P: AsRef<Path>>(db_path: P) -> Result<Connection> {
         FOREIGN KEY (dat_id) REFERENCES dats(id), FOREIGN KEY (set_id) REFERENCES sets(id) );",
         /* file system */
         "CREATE TABLE IF NOT EXISTS dirs ( id INTEGER PRIMARY KEY, dat_id INTEGER NOT NULL, path VARCHAR NOT NULL, \
-        FOREIGN KEY (dat_id) REFERENCES dats(id), UNIQUE(path, dat_id) );",
+        parent_id INTEGER, FOREIGN KEY (dat_id) REFERENCES dats(id), FOREIGN KEY (parent_id) REFERENCES dirs(id), UNIQUE(path, dat_id) );",
         "CREATE TABLE IF NOT EXISTS files ( id INTEGER PRIMARY KEY, dir_id INTEGER NOT NULL, name VARCHAR NOT NULL, \
         size VARCHAR NOT NULL, hash VARCHAR NOT NULL, status VARCHAR NOT NULL, set_id INTEGER, rom_id INTEGER, \
         FOREIGN KEY (dir_id) REFERENCES dirs(id),  FOREIGN KEY (set_id) REFERENCES sets(id), \
         FOREIGN KEY (rom_id) REFERENCES roms(id) );",
         /* indices */
+        "CREATE INDEX IF NOT EXISTS idx_dat_sets ON sets(dat_id);",
         "CREATE INDEX IF NOT EXISTS idx_dat_sets_name ON sets(dat_id, name);",
-        "CREATE INDEX IF NOT EXISTS idx_dat_roms_hash ON roms(dat_id, hash);",
+        "CREATE INDEX IF NOT EXISTS idx_set_roms ON roms(set_id);",
         "CREATE INDEX IF NOT EXISTS idx_dat_roms_name ON roms(dat_id, name);",
+        "CREATE INDEX IF NOT EXISTS idx_dat_roms_hash ON roms(dat_id, hash);",
+        "CREATE INDEX IF NOT EXISTS idx_dat_dirs ON dirs(dat_id);",
         "CREATE INDEX IF NOT EXISTS idx_dat_dirs_path ON dirs(dat_id, path);",
+        "CREATE INDEX IF NOT EXISTS idx_dir_files ON files(dir_id);",
         "CREATE INDEX IF NOT EXISTS idx_dir_files_name ON files(dir_id, name);",
+        /* alter */
+        //"ALTER TABLE dirs ADD COLUMN parent_id INTEGER;"
     ];
 
-    let conn = Connection::open(db_path)?;
+    let conn = Connection::open(db_path.as_ref())?;
 
     for stmt in CREATE_STATEMENTS {
         conn.execute(stmt, ())?;
@@ -83,6 +89,7 @@ pub struct DirRecord {
     pub id: DirId,
     pub dat_id: DatId,
     pub path: String,
+    pub parent_id: Option<DirId>,
 }
 
 #[derive(Debug)]
@@ -195,7 +202,7 @@ pub fn get_set_with_roms(conn: &Connection, set_id: SetId) -> Result<(SetRecord,
             name: row.get(1)?,
         })
     })?;
-    let roms = get_roms_by_set(conn, set_record.dat_id, set_id)?;
+    let roms = get_roms_by_set(conn, set_id)?;
     Ok((set_record, roms))
 }
 
@@ -205,7 +212,7 @@ pub fn get_sets(conn: &Connection, dat_id: DatId) -> Result<Vec<SetRecord>> {
         .query_map(params![dat_id.0], |row| {
             Ok(SetRecord {
                 id: SetId(row.get(0)?),
-                dat_id: dat_id,
+                dat_id,
                 name: row.get(1)?,
             })
         })?
@@ -229,7 +236,7 @@ pub fn get_sets_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: boo
         .query_map(params![dat_id.0, search_name], |row| {
             Ok(SetRecord {
                 id: SetId(row.get(0)?),
-                dat_id: dat_id,
+                dat_id,
                 name: row.get(1)?,
             })
         })?
@@ -242,7 +249,7 @@ pub fn insert_set(conn: &Connection, dat_id: DatId, name: &str) -> Result<SetRec
     let id = conn.last_insert_rowid();
     Ok(SetRecord {
         id: SetId(id),
-        dat_id: dat_id,
+        dat_id,
         name: name.to_string(),
     })
 }
@@ -270,17 +277,17 @@ pub fn insert_rom(
     })
 }
 
-pub fn get_roms_by_set(conn: &Connection, dat_id: DatId, set_id: SetId) -> Result<Vec<RomRecord>> {
-    let mut stmt = conn.prepare("SELECT id, name, size, hash FROM roms WHERE dat_id = (?1) AND set_id = (?2)")?;
+pub fn get_roms_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<RomRecord>> {
+    let mut stmt = conn.prepare("SELECT id, dat_id, name, size, hash FROM roms WHERE set_id = (?1)")?;
     let matches = stmt
-        .query_map(params![dat_id.0, set_id.0], |row| {
+        .query_map(params![set_id.0], |row| {
             Ok(RomRecord {
                 id: RomId(row.get(0)?),
-                dat_id,
+                dat_id: DatId(row.get(1)?),
                 set_id,
-                name: row.get(1)?,
-                size: row.get::<_, String>(2)?.parse().unwrap(),
-                hash: row.get(3)?,
+                name: row.get(2)?,
+                size: row.get::<_, String>(3)?.parse().unwrap(),
+                hash: row.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -303,7 +310,7 @@ pub fn get_roms_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: boo
         .query_map(params![dat_id.0, search_name], |row| {
             Ok(RomRecord {
                 id: RomId(row.get(0)?),
-                dat_id: dat_id,
+                dat_id,
                 set_id: SetId(row.get(1)?),
                 name: row.get(2)?,
                 size: row.get::<_, String>(3)?.parse().unwrap(),
@@ -320,7 +327,7 @@ pub fn get_roms_by_hash(conn: &Connection, dat_id: DatId, hash: &str) -> Result<
         .query_map(params![dat_id.0, hash], |row| {
             Ok(RomRecord {
                 id: RomId(row.get(0)?),
-                dat_id: dat_id,
+                dat_id,
                 set_id: SetId(row.get(1)?),
                 name: row.get(2)?,
                 size: row.get::<_, String>(3)?.parse().unwrap(),
@@ -331,56 +338,92 @@ pub fn get_roms_by_hash(conn: &Connection, dat_id: DatId, hash: &str) -> Result<
     Ok(matches)
 }
 
-pub fn get_directory<P: AsRef<Path>>(conn: &Connection, dat_id: DatId, path: P) -> Result<Option<DirRecord>> {
-    let path = path.as_ref().canonicalize()?;
-    let path_str = path.to_string_lossy();
-
-    let id = match conn.query_one(
-        "SELECT id FROM dirs WHERE path = (?1) AND dat_id = (?2)",
-        params![path_str, dat_id.0],
-        |row| row.get::<_, i64>(0),
-    ) {
-        Ok(id) => Some(id),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => bail!(e),
-    };
-    Ok(id.map(|id| DirRecord {
-        id: DirId(id),
-        path: path_str.to_string(),
-        dat_id: dat_id,
-    }))
-}
-
-pub fn get_directories(conn: &Connection, dat_id: DatId) -> Result<Vec<DirRecord>> {
-    let mut stmt = conn.prepare("SELECT id, path FROM dirs WHERE dat_id = (?1)")?;
-    let matches = stmt
-        .query_map(params![dat_id.0], |row| {
+pub fn get_directory(conn: &Connection, dat_id: DatId, path: &str) -> Result<Option<DirRecord>> {
+    match conn.query_one(
+        "SELECT id, parent_id FROM dirs WHERE path = (?1) AND dat_id = (?2)",
+        params![path, dat_id.0],
+        |row| {
             Ok(DirRecord {
                 id: DirId(row.get(0)?),
-                path: row.get(1)?,
-                dat_id: dat_id,
+                path: path.to_string(),
+                dat_id,
+                parent_id: row.get::<_, Option<i64>>(1)?.map(DirId),
+            })
+        },
+    ) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => bail!(e),
+    }
+}
+
+pub fn get_directories(conn: &Connection, dat_id: DatId, parent_id: Option<DirId>) -> Result<Vec<DirRecord>> {
+    let matches = if let Some(parent_id) = parent_id {
+        let mut stmt = conn.prepare("SELECT id, path, parent_id FROM dirs WHERE dat_id = (?1) AND parent_id = (?2)")?;
+        stmt.query_map(params![dat_id.0, parent_id.0], |row| dir_from_row(dat_id, row))?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let mut stmt = conn.prepare("SELECT id, path, parent_id FROM dirs WHERE dat_id = (?1)")?;
+        stmt.query_map(params![dat_id.0], |row| dir_from_row(dat_id, row))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(matches)
+}
+
+fn dir_from_row(dat_id: DatId, row: &rusqlite::Row<'_>) -> rusqlite::Result<DirRecord> {
+    Ok(DirRecord {
+        id: DirId(row.get(0)?),
+        path: row.get(1)?,
+        dat_id,
+        parent_id: row.get::<_, Option<i64>>(2)?.map(DirId),
+    })
+}
+
+pub fn get_directories_by_path(conn: &Connection, path: &str) -> Result<Vec<DirRecord>> {
+    let mut stmt = conn.prepare("SELECT id, dat_id, parent_id FROM dirs WHERE path = (?1)")?;
+    let matches = stmt
+        .query_map(params![path], |row| {
+            Ok(DirRecord {
+                id: DirId(row.get(0)?),
+                path: path.to_string(),
+                dat_id: DatId(row.get(1)?),
+                parent_id: row.get::<_, Option<i64>>(2)?.map(DirId),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(matches)
 }
 
-pub fn insert_directory<P: AsRef<Path>>(conn: &Connection, dat_id: DatId, path: P) -> Result<DirRecord> {
-    let path = path.as_ref().canonicalize()?;
-    let path_str = path.to_string_lossy();
-
-    conn.execute("INSERT INTO dirs (path, dat_id) VALUES (?1, ?2)", params![path_str, dat_id.0])?;
+pub fn insert_directory(conn: &Connection, dat_id: DatId, path: &str, parent_id: Option<DirId>) -> Result<DirRecord> {
+    if let Some(parent_id) = parent_id {
+        conn.execute(
+            "INSERT INTO dirs (path, dat_id, parent_id) VALUES (?1, ?2, ?3)",
+            params![path, dat_id.0, parent_id.0],
+        )?;
+    } else {
+        conn.execute("INSERT INTO dirs (path, dat_id) VALUES (?1, ?2)", params![path, dat_id.0])?;
+    }
     let id = conn.last_insert_rowid();
     Ok(DirRecord {
         id: DirId(id),
-        path: path_str.to_string(),
-        dat_id: dat_id,
+        path: path.to_string(),
+        dat_id,
+        parent_id,
     })
 }
 
-pub fn get_file<P: AsRef<Path>>(conn: &Connection, dir_id: DirId, name: P) -> Result<Option<FileRecord>> {
-    let name = name.as_ref().to_string_lossy();
+pub fn update_directories(conn: &Connection, old_dat_id: DatId, new_dat_id: DatId) -> Result<usize> {
+    let num_updated = conn.execute("UPDATE dirs SET dat_id = (?1) WHERE dat_id = (?2)", params![new_dat_id.0, old_dat_id.0])?;
+    Ok(num_updated)
+}
 
+
+pub fn delete_directory(conn: &Connection, dir_id: DirId) -> Result<bool> {
+    let num_deleted = conn.execute("DELETE FROM dirs WHERE id = (?1)", params![dir_id.0])?;
+    Ok(num_deleted != 0)
+}
+
+pub fn get_file(conn: &Connection, dir_id: DirId, name: &str) -> Result<Option<FileRecord>> {
     let record = match conn.query_one(
         "SELECT id, size, hash, status, set_id, rom_id FROM files WHERE name = (?1) AND dir_id = (?2)",
         params![name, dir_id.0],
@@ -403,7 +446,7 @@ pub fn get_file<P: AsRef<Path>>(conn: &Connection, dir_id: DirId, name: P) -> Re
 
             Ok(FileRecord {
                 id: row.get(0)?,
-                dir_id: dir_id,
+                dir_id,
                 name: name.to_string(),
                 size: row.get::<_, String>(1)?.parse().unwrap(),
                 hash: row.get(2)?,
@@ -424,19 +467,19 @@ pub fn get_files(conn: &Connection, dir_id: DirId, filter_name: Option<&str>) ->
             "SELECT id, name, size, hash, status, set_id, rom_id FROM files WHERE dir_id = (?1) AND name LIKE (?2)",
         )?;
 
-        stmt.query_map(params![dir_id.0, format!("%{}%", filter_name)], |row| fun_name(dir_id, row))?
+        stmt.query_map(params![dir_id.0, format!("%{}%", filter_name)], |row| file_from_row(dir_id, row))?
             .collect::<Result<Vec<_>, _>>()?
     } else {
         let mut stmt =
             conn.prepare("SELECT id, name, size, hash, status, set_id, rom_id FROM files WHERE dir_id = (?1)")?;
 
-        stmt.query_map(params![dir_id.0], |row| fun_name(dir_id, row))?
+        stmt.query_map(params![dir_id.0], |row| file_from_row(dir_id, row))?
             .collect::<Result<Vec<_>, _>>()?
     };
     Ok(matches)
 }
 
-fn fun_name(dir_id: DirId, row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+fn file_from_row(dir_id: DirId, row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
     let status = match row.get::<_, String>(4)?.as_ref() {
         "hash" => MatchStatus::Hash {
             set_id: SetId(row.get(5)?),
@@ -454,7 +497,7 @@ fn fun_name(dir_id: DirId, row: &rusqlite::Row<'_>) -> rusqlite::Result<FileReco
     };
     Ok(FileRecord {
         id: row.get(0)?,
-        dir_id: dir_id,
+        dir_id,
         name: row.get(1)?,
         size: row.get::<_, String>(2)?.parse().unwrap(),
         hash: row.get(3)?,
@@ -497,14 +540,19 @@ pub fn insert_file(
     }
 
     let id = conn.last_insert_rowid();
-    return Ok(FileRecord {
+    Ok(FileRecord {
         id,
         dir_id,
         name: name.to_string(),
         size,
         hash: hash.to_string(),
         status,
-    });
+    })
+}
+
+pub fn delete_file(conn: &Connection, dir_id: DirId, name: &str) -> Result<bool> {
+    let num_deleted = conn.execute("DELETE FROM files WHERE dir_id = (?1) AND name = (?2)", params![dir_id.0, name])?;
+    Ok(num_deleted != 0)
 }
 
 pub fn delete_files(conn: &Connection, dir_id: DirId) -> Result<usize> {

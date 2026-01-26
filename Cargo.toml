@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 base16ct = { version = "1.0.0", features = ["alloc"] }
+camino = "1.2.2"
 clap = { version = "4.5.54", features = ["derive"] }
 digest = { version = "0.10.7", features = ["std"] }
 log = { version = "0.4.29", features = ["std"] }
