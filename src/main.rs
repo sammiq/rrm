@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use roxmltree::{Document, ParsingOptions};
@@ -138,8 +138,13 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let args = shlex::split(line).ok_or(anyhow!("error: Invalid quoting"))?;
-        match Cli::try_parse_from(args) {
+        let maybe_args = shlex::split(line);
+        if maybe_args.is_none() {
+            eprintln!("error: Invalid quoting");
+            continue;
+        }
+
+        match Cli::try_parse_from(maybe_args.unwrap()) {
             Ok(cli) => {
                 match cli.command {
                     Commands::Data { data } => match data {
@@ -163,11 +168,9 @@ fn main() -> Result<()> {
                                     Ok(imported) => {
                                         dat_id = Some(imported.id);
                                         println!("dat file `{}` imported and updated.", imported.name);
-                                    },
+                                    }
                                     Err(e) => println!("Failed to import dat file. {e}"),
                                 }
-
-
                             } else {
                                 println!("No dat file selected");
                             }
@@ -292,15 +295,7 @@ fn update_dat(conn: &mut Connection, dat_file: Utf8PathBuf, old_dat_id: db::DatI
         db::delete_files(&tx, directory.id)?;
         for (_, file) in unique_files {
             //rematch using existing information, but link to the new dat
-            process_file_matches(
-                &tx,
-                imported.id,
-                directory.id,
-                file.size,
-                &file.name,
-                &file.hash,
-                &matched_sets,
-            )?;
+            process_file_matches(&tx, imported.id, directory.id, file.size, &file.name, &file.hash, &matched_sets)?;
         }
     }
     //relink all directories to the new dat
@@ -309,8 +304,6 @@ fn update_dat(conn: &mut Connection, dat_file: Utf8PathBuf, old_dat_id: db::DatI
     tx.commit()?;
     Ok(imported)
 }
-
-
 
 fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result<db::DatRecord> {
     //TODO check whether name named item exists
