@@ -52,39 +52,52 @@ enum ListMode {
 
 #[derive(Debug, Subcommand)]
 enum FileCommands {
+    /// scan a path and match files with the current dat file
     Scan {
+        /// extensions to exclude when scanning files
         #[arg(long, value_delimiter = ',', default_value = "m3u,dat,txt")]
         exclude: Vec<String>,
+        /// scan recursively each directory found
         #[arg(short('R'), long, default_value_t = false)]
         recursive: bool,
+        /// re-scan existing files in the directory and not just new files
         #[arg(long, default_value_t = false)]
-        fullscan: bool,
+        full: bool,
+        /// the path to use for scanning files
         #[arg(default_value=".", value_hint = clap::ValueHint::DirPath)]
         path: Utf8PathBuf,
     },
+    /// list all files scanned and show their status
     List {
+        /// show only files with this status
         #[arg(long, value_enum, default_value_t = ListMode::All)]
         mode: ListMode,
+        /// show only files partially matching this name
         partial_name: Option<String>,
     },
+    /// list all sets matched by scanned files
     Sets {
+        /// show missing sets instead of matches
         #[arg(long, default_value_t = false)]
         missing: bool,
+        /// show only sets partially matching this name
+        partial_name: Option<String>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum DataCommands {
-    /// import a reference dat file into the system
+    /// import a dat file into the system and make it the current dat file
     Import {
         #[arg(value_hint = clap::ValueHint::FilePath)]
         dat_file: Utf8PathBuf,
     },
+    /// update the current dat file with a new version and re-match files
     Update {
         #[arg(value_hint = clap::ValueHint::FilePath)]
         dat_file: Utf8PathBuf,
     },
-    /// List reference dat files in the system
+    /// List dat files in the system
     List,
     /// Select the current dat file
     Select { index: usize },
@@ -235,14 +248,13 @@ fn main() -> Result<()> {
                                 FileCommands::Scan {
                                     exclude,
                                     recursive,
-                                    fullscan,
+                                    full,
                                     path,
                                 } => {
                                     //make sure path is resolved to something absolte and proper before scanning
                                     let scan_path = path.canonicalize_utf8()?;
                                     if scan_path.is_dir() {
-                                        match scan_files(&mut conn, dat_id, &scan_path, &exclude, recursive, !fullscan)
-                                        {
+                                        match scan_files(&mut conn, dat_id, &scan_path, &exclude, recursive, !full) {
                                             Ok(_) => {
                                                 println!("Directory `{}` scanned.", scan_path)
                                             }
@@ -258,10 +270,12 @@ fn main() -> Result<()> {
                                         Err(e) => println!("Failed to list files. {e}"),
                                     }
                                 }
-                                FileCommands::Sets { missing } => match list_sets(&mut conn, dat_id, missing) {
-                                    Ok(_) => {}
-                                    Err(e) => println!("Failed to list files. {e}"),
-                                },
+                                FileCommands::Sets { missing, partial_name } => {
+                                    match list_sets(&mut conn, dat_id, missing, partial_name.as_deref()) {
+                                        Ok(_) => {}
+                                        Err(e) => println!("Failed to list files. {e}"),
+                                    }
+                                }
                             }
                         } else {
                             println!("No dat file selected");
@@ -758,7 +772,7 @@ fn list_files(conn: &mut Connection, dat_id: db::DatId, mode: ListMode, partial_
     Ok(())
 }
 
-fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool) -> Result<()> {
+fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool, partial_name: Option<&str>) -> Result<()> {
     let dirs = db::get_directories(conn, dat_id, None)?;
 
     let mut sets_to_files: BTreeMap<db::SetId, Vec<db::FileRecord>> = BTreeMap::new();
@@ -789,12 +803,29 @@ fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool) -> Result<
     if missing {
         println!("--- MISSING SETS ---");
         for set in &sets {
+            if let Some(partial_name) = partial_name
+                && !set
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&partial_name.to_ascii_lowercase())
+            {
+                continue;
+            }
             println_if!(!sets_to_files.contains_key(&set.id), "[❌] {}", set.name);
         }
         println!("{} / {} sets missing.", sets.len() - sets_to_files.len(), sets.len());
     } else {
         println!("--- FOUND SETS ---");
         for set in &sets {
+            if let Some(partial_name) = partial_name
+                && !set
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&partial_name.to_ascii_lowercase())
+            {
+                continue;
+            }
+
             if let Some(files) = sets_to_files.get(&set.id) {
                 let roms = db::get_roms_by_set(conn, set.id)?;
                 let roms_by_id: BTreeMap<db::RomId, &db::RomRecord> = roms.iter().map(|rom| (rom.id, rom)).collect();
