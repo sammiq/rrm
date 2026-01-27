@@ -117,10 +117,19 @@ impl MatchStatus {
             Self::Match { .. } => "match",
         }
     }
+
+    pub fn ids(&self) -> Option<(SetId, RomId)> {
+        match self {
+            Self::None => None,
+            Self::Hash { set_id, rom_id } | Self::Name { set_id, rom_id } | Self::Match { set_id, rom_id } => {
+                Some((*set_id, *rom_id))
+            }
+        }
+    }
 }
 
-pub fn get_dat(conn: &Connection, dat_id: DatId) -> Result<Option<DatRecord>> {
-    let record = match conn.query_one(
+pub fn get_dat(conn: &Connection, dat_id: DatId) -> Result<DatRecord> {
+    let record = conn.query_one(
         "SELECT name, description, version, author, hash_type FROM dats WHERE id = (?1)",
         params![dat_id.0],
         |row| {
@@ -133,11 +142,7 @@ pub fn get_dat(conn: &Connection, dat_id: DatId) -> Result<Option<DatRecord>> {
                 hash_type: row.get(4)?,
             })
         },
-    ) {
-        Ok(record) => Some(record),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => bail!(e),
-    };
+    )?;
     Ok(record)
 }
 
@@ -147,7 +152,7 @@ pub fn get_dats(conn: &Connection) -> Result<Vec<DatRecord>> {
         .query_map(params![], |row| {
             Ok(DatRecord {
                 id: DatId(row.get(0)?),
-                name: row.get(2)?,
+                name: row.get(1)?,
                 description: row.get(2)?,
                 version: row.get(3)?,
                 author: row.get(4)?,
@@ -285,7 +290,10 @@ pub fn get_rom(conn: &Connection, rom_id: RomId) -> Result<RomRecord> {
                 dat_id: DatId(row.get(0)?),
                 set_id: SetId(row.get(1)?),
                 name: row.get(2)?,
-                size: row.get::<_, String>(3)?.parse().unwrap(),
+                size: row
+                    .get::<_, String>(3)?
+                    .parse()
+                    .expect("field is non null and should always be convertible"),
                 hash: row.get(4)?,
             })
         },
@@ -302,7 +310,10 @@ pub fn get_roms_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<RomRecord
                 dat_id: DatId(row.get(1)?),
                 set_id,
                 name: row.get(2)?,
-                size: row.get::<_, String>(3)?.parse().unwrap(),
+                size: row
+                    .get::<_, String>(3)?
+                    .parse()
+                    .expect("field is non null and should always be convertible"),
                 hash: row.get(4)?,
             })
         })?
@@ -329,7 +340,10 @@ pub fn get_roms_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: boo
                 dat_id,
                 set_id: SetId(row.get(1)?),
                 name: row.get(2)?,
-                size: row.get::<_, String>(3)?.parse().unwrap(),
+                size: row
+                    .get::<_, String>(3)?
+                    .parse()
+                    .expect("field is non null and should always be convertible"),
                 hash: row.get(4)?,
             })
         })?
@@ -346,7 +360,10 @@ pub fn get_roms_by_hash(conn: &Connection, dat_id: DatId, hash: &str) -> Result<
                 dat_id,
                 set_id: SetId(row.get(1)?),
                 name: row.get(2)?,
-                size: row.get::<_, String>(3)?.parse().unwrap(),
+                size: row
+                    .get::<_, String>(3)?
+                    .parse()
+                    .expect("field is non null and should always be convertible"),
                 hash: hash.to_string(),
             })
         })?
@@ -531,12 +548,7 @@ pub fn insert_file(
     hash: &str,
     status: MatchStatus,
 ) -> Result<FileRecord> {
-    let ids = match status {
-        MatchStatus::None => None,
-        MatchStatus::Hash { set_id, rom_id } => Some((set_id, rom_id)),
-        MatchStatus::Name { set_id, rom_id } => Some((set_id, rom_id)),
-        MatchStatus::Match { set_id, rom_id } => Some((set_id, rom_id)),
-    };
+    let ids = status.ids();
     if let Some((set_id, rom_id)) = ids {
         conn.execute(
             "INSERT INTO files (dir_id, name, size, hash, status, set_id, rom_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -569,12 +581,11 @@ pub fn insert_file(
 }
 
 pub fn update_file(conn: &Connection, file_id: i64, name: &str, status: MatchStatus) -> Result<bool> {
-    let (set_id, rom_id) = match status {
-        MatchStatus::None => (None, None),
-        MatchStatus::Hash { set_id, rom_id } => (Some(set_id.0), Some(rom_id.0)),
-        MatchStatus::Name { set_id, rom_id } => (Some(set_id.0), Some(rom_id.0)),
-        MatchStatus::Match { set_id, rom_id } => (Some(set_id.0), Some(rom_id.0)),
+    let (set_id, rom_id) = match status.ids() {
+        Some((set_id, rom_id)) => (Some(set_id.0), Some(rom_id.0)),
+        None => (None, None),
     };
+
     let num_updated = conn.execute(
         "UPDATE files SET name = (?1), status = (?2), set_id = (?3), rom_id = (?4) WHERE id = (?5)",
         params![name, status.to_str(), set_id, rom_id, file_id],

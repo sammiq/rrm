@@ -14,6 +14,19 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 const APP_NAME: &str = "rrm";
 
+// constants for XML dat file
+const TAG_HEADER: &str = "header";
+const ATTR_HEADER_NAME: &str = "name";
+const ATTR_HEADER_DESC: &str = "description";
+const ATTR_HEADER_VERSION: &str = "version";
+const ATTR_HEADER_AUTHOR: &str = "author";
+const TAG_GAME: &str = "game";
+const ATTR_GAME_NAME: &str = "name";
+const TAG_ROM: &str = "rom";
+const ATTR_ROM_NAME: &str = "name";
+const ATTR_ROM_SIZE: &str = "size";
+const ATTR_ROM_HASH: &str = "sha1";
+
 macro_rules! println_if {
     ($cond:expr, $($arg:tt)*) => {
         if $cond {
@@ -152,17 +165,23 @@ fn main() -> Result<()> {
     let mut dat_id = None;
 
     //default the dat to the current directory if it exists
-    if let Ok(current_path) = Utf8PathBuf::from(".").canonicalize_utf8() {
+    if let Some(current_path) = std::env::current_dir()
+        .ok()
+        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+        .and_then(|path| path.canonicalize_utf8().ok())
+    {
         let paths = db::get_directories_by_path(&conn, current_path.as_str())?;
-        if !paths.is_empty()
-            && let Some(dat) = db::get_dat(&conn, paths[0].dat_id)?
-        {
+        if !paths.is_empty() {
+            let dat = db::get_dat(&conn, paths[0].dat_id)?;
             println!("dat file `{}` selected.", dat.name);
             dat_id = Some(dat.id);
+        } else {
+            eprintln!("No default dat file for current path.");
+            list_dat_files(&conn)?;
         }
     } else {
-        println!("No default dat file.");
-        list_dat_files(&conn);
+        eprintln!("Invalid current path, no default dat file for current path.");
+        list_dat_files(&conn)?;
     }
 
     let args = Args::parse();
@@ -185,21 +204,19 @@ fn main() -> Result<()> {
                 continue;
             }
 
-            let maybe_args = shlex::split(line);
-            if maybe_args.is_none() {
-                eprintln!("error: Invalid quoting");
-                continue;
-            }
-
-            match Cli::try_parse_from(maybe_args.unwrap()) {
-                Ok(cli) => {
-                    let exit = do_command(&mut conn, &mut dat_id, &cli.command)?;
-                    if exit {
-                        break;
+            if let Some(args) = shlex::split(line) {
+                match Cli::try_parse_from(args) {
+                    Ok(cli) => {
+                        let exit = do_command(&mut conn, &mut dat_id, &cli.command)?;
+                        if exit {
+                            break;
+                        }
                     }
-                }
-                Err(e) => e.print()?,
-            };
+                    Err(e) => e.print()?,
+                };
+            } else {
+                eprintln!("error: Invalid quoting");
+            }
         }
     }
     Ok(())
@@ -207,145 +224,154 @@ fn main() -> Result<()> {
 
 fn do_command(conn: &mut Connection, dat_id: &mut Option<db::DatId>, command: &Commands) -> Result<bool> {
     match command {
-        Commands::Data { data } => match data {
-            DataCommands::Import { dat_file } => {
-                if dat_file.is_file() {
-                    match import_dat(conn, dat_file) {
-                        Ok(imported) => {
-                            *dat_id = Some(imported.id);
-                            println!("dat file `{}` imported and selected.", imported.name);
-                        }
-                        Err(e) => println!("Failed to import dat file. {e}"),
-                    }
-                } else {
-                    println!("`{}` is not a valid file", dat_file);
-                }
-            }
-            DataCommands::Update { dat_file } => {
-                if let Some(old_dat_id) = *dat_id {
-                    //ideally we would ask the user to confirm
-                    match update_dat(conn, dat_file, old_dat_id) {
-                        Ok(imported) => {
-                            *dat_id = Some(imported.id);
-                            println!("dat file `{}` imported and updated.", imported.name);
-                        }
-                        Err(e) => println!("Failed to import dat file. {e}"),
-                    }
-                } else {
-                    println!("No dat file selected");
-                }
-            }
-            DataCommands::List => list_dat_files(&*conn),
-            DataCommands::Select { index } => match db::get_dats(&*conn) {
-                Ok(dats) => {
-                    if let Some(dat) = dats.get(*index) {
-                        println!("dat file `{}` selected.", dat.name);
-                        *dat_id = Some(dat.id);
-                    } else {
-                        println!("Invalid dat file selection.");
-                        list_dat_files(&*conn);
-                    }
-                }
-                Err(e) => println!("Failed to select dat file. {e}"),
-            },
-            DataCommands::Records => {
-                if let Some(dat_id) = *dat_id {
-                    match list_dat_records(&*conn, dat_id) {
-                        Ok(_) => {}
-                        Err(e) => println!("Failed to list dat file. {e}"),
-                    }
-                } else {
-                    println!("No dat file selected");
-                }
-            }
-            DataCommands::Sets { name } => {
-                if let Some(dat_id) = *dat_id {
-                    match find_sets_by_name(&*conn, dat_id, name) {
-                        Ok(_) => {}
-                        Err(e) => println!("Failed to find sets. {e}"),
-                    }
-                } else {
-                    println!("No dat file selected");
-                }
-            }
-            DataCommands::Roms { name } => {
-                if let Some(dat_id) = *dat_id {
-                    match find_roms(&*conn, dat_id, name) {
-                        Ok(_) => {}
-                        Err(e) => println!("Failed to find roms. {e}"),
-                    }
-                } else {
-                    println!("No dat file selected");
-                }
-            }
-        },
-        Commands::Files { files } => {
-            if let Some(dat_id) = *dat_id {
-                match files {
-                    FileCommands::Scan {
-                        exclude,
-                        recursive,
-                        full,
-                        path,
-                    } => {
-                        //make sure path is resolved to something absolte and proper before scanning
-                        let scan_path = path.canonicalize_utf8()?;
-                        if scan_path.is_dir() {
-                            match scan_files(conn, dat_id, &scan_path, exclude, *recursive, !full) {
-                                Ok(_) => {
-                                    println!("Directory `{}` scanned.", scan_path)
-                                }
-                                Err(e) => println!("Failed to scan directory. {e}"),
-                            }
-                        } else {
-                            println!("`{}` is not a valid directory", scan_path);
-                        }
-                    }
-                    FileCommands::List { mode, partial_name } => {
-                        match list_files(conn, dat_id, *mode, partial_name.as_deref()) {
-                            Ok(_) => {}
-                            Err(e) => println!("Failed to list files. {e}"),
-                        }
-                    }
-                    FileCommands::Sets { missing, partial_name } => {
-                        match list_sets(conn, dat_id, *missing, partial_name.as_deref()) {
-                            Ok(_) => {}
-                            Err(e) => println!("Failed to list files. {e}"),
-                        }
-                    }
-                    FileCommands::Rename => match rename_files(conn, dat_id) {
-                        Ok(_) => {}
-                        Err(e) => println!("Failed to rename files. {e}"),
-                    },
-                }
-            } else {
-                println!("No dat file selected");
-            }
-        }
+        Commands::Data { data } => handle_data_commands(conn, dat_id, data),
+        Commands::Files { files } => handle_file_commands(conn, dat_id, files),
         Commands::Exit => return Ok(true),
     };
     Ok(false)
 }
 
-fn list_dat_files(conn: &Connection) {
-    match db::get_dats(conn) {
-        Ok(dats) => {
-            println!("Installed dat files:");
-            for (i, dat) in dats.iter().enumerate() {
-                println!("[{i}] {} version: {} author: {}", dat.name, dat.version, dat.author);
+fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, data: &DataCommands) {
+    match data {
+        DataCommands::Import { dat_file } => {
+            if dat_file.is_file() {
+                match import_dat(conn, dat_file) {
+                    Ok(imported) => {
+                        println!("dat file `{}` imported and selected.", imported.name);
+                        *dat_id = Some(imported.id);
+                    }
+                    Err(e) => eprintln!("Failed to import dat file. {e}"),
+                }
+            } else {
+                eprintln!("`{}` is not a valid file", dat_file);
             }
         }
-        Err(e) => println!("Failed to list dat files. {e}"),
+        DataCommands::Update { dat_file } => {
+            if let Some(old_dat_id) = *dat_id {
+                //ideally we would ask the user to confirm
+                match update_dat(conn, dat_file, old_dat_id) {
+                    Ok(imported) => {
+                        println!("dat file `{}` imported and updated.", imported.name);
+                        *dat_id = Some(imported.id);
+                    }
+                    Err(e) => eprintln!("Failed to import dat file. {e}"),
+                }
+            } else {
+                eprintln!("No dat file selected");
+            }
+        }
+        DataCommands::List => {
+            if let Err(e) = list_dat_files(conn) {
+                eprintln!("Failed to list dat files. {e}");
+            }
+        }
+        DataCommands::Select { index } => match db::get_dats(conn) {
+            Ok(dats) => {
+                if let Some(dat) = dats.get(*index) {
+                    println!("dat file `{}` selected.", dat.name);
+                    *dat_id = Some(dat.id);
+                } else {
+                    eprintln!("Invalid dat file selection.");
+                }
+            }
+            Err(e) => eprintln!("Failed to select dat file. {e}"),
+        },
+        DataCommands::Records => {
+            if let Some(dat_id) = *dat_id {
+                if let Err(e) = list_dat_records(conn, dat_id) {
+                    eprintln!("Failed to list dat file. {e}");
+                }
+            } else {
+                eprintln!("No dat file selected");
+            }
+        }
+        DataCommands::Sets { name } => {
+            if let Some(dat_id) = *dat_id {
+                if let Err(e) = find_sets_by_name(conn, dat_id, name) {
+                    eprintln!("Failed to find sets. {e}");
+                }
+            } else {
+                eprintln!("No dat file selected");
+            }
+        }
+        DataCommands::Roms { name } => {
+            if let Some(dat_id) = *dat_id {
+                if let Err(e) = find_roms(conn, dat_id, name) {
+                    eprintln!("Failed to find roms. {e}");
+                }
+            } else {
+                eprintln!("No dat file selected");
+            }
+        }
     }
+}
+
+fn handle_file_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, files: &FileCommands) {
+    if let Some(dat_id) = *dat_id {
+        match files {
+            FileCommands::Scan {
+                exclude,
+                recursive,
+                full,
+                path,
+            } => {
+                //make sure path is resolved to something absolte and proper before scanning
+                if let Some(scan_path) = path.canonicalize_utf8().ok()
+                    && scan_path.is_dir()
+                {
+                    match scan_files(conn, dat_id, &scan_path, exclude, *recursive, !full) {
+                        Ok(_) => println!("Directory `{}` scanned.", scan_path),
+                        Err(e) => eprintln!("Failed to scan directory. {e}"),
+                    }
+                } else {
+                    eprintln!("`{}` is not a valid directory", path);
+                }
+            }
+            FileCommands::List { mode, partial_name } => {
+                if let Err(e) = list_files(conn, dat_id, *mode, partial_name.as_deref()) {
+                    eprintln!("Failed to list files. {e}");
+                }
+            }
+            FileCommands::Sets { missing, partial_name } => {
+                if let Err(e) = list_sets(conn, dat_id, *missing, partial_name.as_deref()) {
+                    eprintln!("Failed to list files. {e}");
+                }
+            }
+            FileCommands::Rename => {
+                if let Err(e) = rename_files(conn, dat_id) {
+                    eprintln!("Failed to rename files. {e}");
+                }
+            }
+        }
+    } else {
+        eprintln!("No dat file selected");
+    };
+}
+
+fn list_dat_files(conn: &Connection) -> Result<()> {
+    let dats = db::get_dats(conn)?;
+    if dats.is_empty() {
+        eprintln!("No installed dat files.")
+    } else {
+        println!("Installed dat files:");
+        for (i, dat) in dats.iter().enumerate() {
+            println!("[{i}] {} version: {} author: {}", dat.name, dat.version, dat.author);
+        }
+    }
+    Ok(())
 }
 
 fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) -> Result<db::DatRecord> {
     let imported = import_dat(conn, dat_file)?;
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+
     for directory in db::get_directories(&tx, old_dat_id, None)? {
         //check if its a zip file, if so, restrict matches to set name if matched
-        let matched_sets = if directory.path.ends_with("zip") {
+        let matched_sets = if Utf8Path::new(&directory.path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
             match_sets(&tx, imported.id, &directory.path)?
         } else {
             BTreeSet::new()
@@ -379,7 +405,8 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
     )
     .context("Unable to parse reference dat file")?;
 
-    //find header get the mandatory fields, according to https://github.com/Logiqx/logiqx-dev/blob/master/DatLib/datafile.dtd
+    //find header get the mandatory fields, according to
+    // https://github.com/Logiqx/logiqx-dev/blob/master/DatLib/datafile.dtd
     let mut name = None;
     let mut description = None;
     let mut version = None;
@@ -387,47 +414,57 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
     for header_node in df_xml
         .root_element()
         .children()
-        .find(|node| node.tag_name().name() == "header")
+        .find(|node| node.tag_name().name() == TAG_HEADER)
         .map(|header| header.children())
         .context("Could not find header in reference dat file")?
     {
         match header_node.tag_name().name() {
-            "name" => name = header_node.text(),
-            "description" => description = header_node.text(),
-            "version" => version = header_node.text(),
-            "author" => author = header_node.text(),
+            ATTR_HEADER_NAME => name = header_node.text(),
+            ATTR_HEADER_DESC => description = header_node.text(),
+            ATTR_HEADER_VERSION => version = header_node.text(),
+            ATTR_HEADER_AUTHOR => author = header_node.text(),
             _ => {}
         };
     }
 
-    if (name.is_none()) || (description.is_none()) || (version.is_none()) || (author.is_none()) {
-        bail!("Required fields in reference dat header not found");
-    }
-
     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
 
-    let dat = db::insert_dat(&tx, name.unwrap(), description.unwrap(), version.unwrap(), author.unwrap(), "sha1")?;
+    let dat = db::insert_dat(
+        &tx,
+        name.context("unable to find name attribute in header")?,
+        description.context("unable to find description attribute in header")?,
+        version.context("unable to find version attribute in header")?,
+        author.context("unable to find author attribute in header")?,
+        "sha1",
+    )?;
 
     let dat_id = dat.id;
 
     for game_node in df_xml
         .root_element()
         .children()
-        .filter(|node| node.tag_name().name() == "game")
+        .filter(|node| node.tag_name().name() == TAG_GAME)
     {
         let game_name = game_node
-            .attribute("name")
+            .attribute(ATTR_GAME_NAME)
             .context("Unable to read game name in reference dat file")?;
 
         let set = db::insert_set(&tx, dat_id, game_name)?;
 
         let set_id = set.id;
 
-        for rom_node in game_node.descendants().filter(|node| node.tag_name().name() == "rom") {
-            let rom_name = rom_node.attribute("name").context("Unable to read game name")?;
-            let rom_size = rom_node.attribute("size").context("Unable to read game size")?;
-            let rom_hash = rom_node.attribute("sha1").context("Unable to read game hash")?;
-            db::insert_rom(&tx, dat_id, set_id, rom_name, rom_size.parse().unwrap(), rom_hash)?;
+        for rom_node in game_node.descendants().filter(|node| node.tag_name().name() == TAG_ROM) {
+            let rom_name = rom_node.attribute(ATTR_ROM_NAME).context("Unable to read game name")?;
+            let rom_size = rom_node.attribute(ATTR_ROM_SIZE).context("Unable to read game size")?;
+            let rom_hash = rom_node.attribute(ATTR_ROM_HASH).context("Unable to read game hash")?;
+            db::insert_rom(
+                &tx,
+                dat_id,
+                set_id,
+                rom_name,
+                rom_size.parse().context("should be a valid number")?,
+                rom_hash,
+            )?;
         }
     }
 
@@ -437,7 +474,7 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
 }
 
 fn list_dat_records(conn: &Connection, dat_id: db::DatId) -> Result<()> {
-    let dat_record = db::get_dat(conn, dat_id)?.unwrap();
+    let dat_record = db::get_dat(conn, dat_id)?;
     println!("Name:        {}", dat_record.name);
     println!("Description: {}", dat_record.description);
     println!("Version:     {}", dat_record.version);
@@ -498,7 +535,9 @@ fn scan_files(
     incremental: bool,
 ) -> Result<()> {
     let mut tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+
     scan_directory(&mut tx, dat_id, scan_path, exclude, recursive, incremental, None)?;
+
     tx.commit()?;
     Ok(())
 }
@@ -652,7 +691,7 @@ fn scan_zip_file(
 }
 
 fn match_sets<P: AsRef<Utf8Path>>(conn: &Connection, dat_id: db::DatId, path: P) -> Result<BTreeSet<db::SetId>> {
-    let name = path.as_ref().file_prefix().unwrap();
+    let name = path.as_ref().file_prefix().context("should have a file name")?;
     let sets = db::get_sets_by_name(conn, dat_id, name, true)?;
     let matched: BTreeSet<db::SetId> = sets.iter().map(|record| record.id).collect();
     Ok(matched)
@@ -687,21 +726,9 @@ fn match_roms(
     // Step 1: is there any roms called the same as the filename?
     let named_roms = db::get_roms_by_name(conn, dat_id, filename, true)?;
     if named_roms.is_empty() {
-        // Step 2a: if nothing named the same, check for hash matches, and match accordingly
-        let hash_roms = db::get_roms_by_hash(conn, dat_id, hash)?;
-        let matched = if hash_roms.is_empty() {
-            Match::None
-        } else {
-            let matches = hash_roms
-                .iter()
-                .map(|rom| db::MatchStatus::Hash {
-                    set_id: rom.set_id,
-                    rom_id: rom.id,
-                })
-                .collect();
-            Match::Partial(matches)
-        };
-        Ok(matched)
+        // Step 2a: if nothing named the same, check for hash matches,
+        // and match accordingly, otherwise return no match
+        match_hashes(conn, dat_id, hash, || Match::None)
     } else {
         //Step 2b: if something is named the same, check for exact matches with those items
         let exact_matches: Vec<db::MatchStatus> = named_roms
@@ -718,29 +745,41 @@ fn match_roms(
             return Ok(Match::Exact(exact_matches));
         }
 
-        //Step 3b: if something is named the same, check whether we got hash only
-        //matches, if so, then treat it as a hash match, otherwise its name only matches
-        let hash_roms = db::get_roms_by_hash(conn, dat_id, hash)?;
-        let matches: Vec<db::MatchStatus> = if hash_roms.is_empty() {
-            named_roms
+        // Step 3b: if something is named the same, but the hash doesn't match,
+        // check whether we got hash only matches, and if so, then treat it as a hash match,
+        // otherwise return the name only matches
+        match_hashes(conn, dat_id, hash, || {
+            let matches = named_roms
                 .iter()
                 .filter(|rom| matched_sets.is_empty() || matched_sets.contains(&rom.set_id))
                 .map(|rom| db::MatchStatus::Name {
                     set_id: rom.set_id,
                     rom_id: rom.id,
                 })
-                .collect()
-        } else {
-            hash_roms
-                .iter()
-                .map(|rom| db::MatchStatus::Hash {
-                    set_id: rom.set_id,
-                    rom_id: rom.id,
-                })
-                .collect()
-        };
-        Ok(Match::Partial(matches))
+                .collect();
+            Match::Partial(matches)
+        })
     }
+}
+
+fn match_hashes<F>(conn: &Connection, dat_id: db::DatId, hash: &str, no_match_fn: F) -> Result<Match>
+where
+    F: FnOnce() -> Match,
+{
+    let hash_roms = db::get_roms_by_hash(conn, dat_id, hash)?;
+    let matched = if hash_roms.is_empty() {
+        no_match_fn()
+    } else {
+        let matches = hash_roms
+            .iter()
+            .map(|rom| db::MatchStatus::Hash {
+                set_id: rom.set_id,
+                rom_id: rom.id,
+            })
+            .collect();
+        Match::Partial(matches)
+    };
+    Ok(matched)
 }
 
 fn process_file_matches(
@@ -771,6 +810,36 @@ fn process_file_matches(
     Ok(())
 }
 
+fn should_display_file_status(status: &db::MatchStatus, mode: ListMode) -> bool {
+    matches!(
+        (status, mode),
+        (db::MatchStatus::None, ListMode::Unmatched | ListMode::All)
+            | (db::MatchStatus::Hash { .. }, ListMode::Warning | ListMode::All)
+            | (db::MatchStatus::Name { .. }, ListMode::Warning | ListMode::All)
+            | (db::MatchStatus::Match { .. }, ListMode::Matched | ListMode::All)
+    )
+}
+
+fn format_file_status(conn: &Connection, file: &db::FileRecord) -> Result<String> {
+    let result = match file.status {
+        db::MatchStatus::None => {
+            format!("[❌] {} {} - unknown file", file.hash, file.name)
+        }
+        db::MatchStatus::Hash { rom_id, .. } => {
+            let rom = db::get_rom(conn, rom_id)?;
+            format!("[⚠️] {} {} - incorrect name, should be named {}", file.hash, file.name, rom.name)
+        }
+        db::MatchStatus::Name { rom_id, .. } => {
+            let rom = db::get_rom(conn, rom_id)?;
+            format!("[⚠️] {} {} - incorrect hash, should have hash {}", file.hash, file.name, rom.hash)
+        }
+        db::MatchStatus::Match { .. } => {
+            format!("[✅] {} {}", file.hash, file.name)
+        }
+    };
+    Ok(result)
+}
+
 fn list_files(conn: &mut Connection, dat_id: db::DatId, mode: ListMode, partial_name: Option<&str>) -> Result<()> {
     let dirs = db::get_directories(conn, dat_id, None)?;
 
@@ -783,35 +852,8 @@ fn list_files(conn: &mut Connection, dat_id: db::DatId, mode: ListMode, partial_
 
         let mut lines = Vec::new();
         for file in files {
-            match file.status {
-                db::MatchStatus::None => {
-                    if mode == ListMode::Unmatched || mode == ListMode::All {
-                        lines.push(format!("[❌] {} {} - unknown file", file.hash, file.name));
-                    }
-                }
-                db::MatchStatus::Hash { set_id: _, rom_id } => {
-                    if mode == ListMode::Warning || mode == ListMode::All {
-                        let rom = db::get_rom(conn, rom_id)?;
-                        lines.push(format!(
-                            "[⚠️] {} {} - incorrect name, should be named {}",
-                            file.hash, file.name, rom.name
-                        ));
-                    }
-                }
-                db::MatchStatus::Name { set_id: _, rom_id } => {
-                    if mode == ListMode::Warning || mode == ListMode::All {
-                        let rom = db::get_rom(conn, rom_id)?;
-                        lines.push(format!(
-                            "[⚠️] {} {} - incorrect hash, should have hash {}",
-                            file.hash, file.name, rom.hash
-                        ));
-                    }
-                }
-                db::MatchStatus::Match { set_id: _, rom_id: _ } => {
-                    if mode == ListMode::Matched || mode == ListMode::All {
-                        lines.push(format!("[✅] {} {}", file.hash, file.name));
-                    }
-                }
+            if should_display_file_status(&file.status, mode) {
+                lines.push(format_file_status(conn, &file)?);
             }
         }
 
@@ -837,20 +879,9 @@ fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool, partial_na
     for dir in dirs {
         let files = db::get_files(conn, dir.id, None)?;
         for file in files {
-            match file.status {
-                db::MatchStatus::None => {}
-                db::MatchStatus::Hash { set_id, rom_id } => {
-                    sets_to_files.entry(set_id).or_default().push(file);
-                    found_roms.insert(rom_id);
-                }
-                db::MatchStatus::Name { set_id, rom_id } => {
-                    sets_to_files.entry(set_id).or_default().push(file);
-                    found_roms.insert(rom_id);
-                }
-                db::MatchStatus::Match { set_id, rom_id } => {
-                    sets_to_files.entry(set_id).or_default().push(file);
-                    found_roms.insert(rom_id);
-                }
+            if let Some((set_id, rom_id)) = file.status.ids() {
+                sets_to_files.entry(set_id).or_default().push(file);
+                found_roms.insert(rom_id);
             }
         }
     }
@@ -920,11 +951,15 @@ fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool, partial_na
 fn rename_files(conn: &mut Connection, dat_id: db::DatId) -> Result<()> {
     let mut tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
     for directory in db::get_directories(&tx, dat_id, None)? {
-        if directory.path.ends_with("zip") {
+        if Utf8Path::new(&directory.path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
             continue;
         }
+
         let dir_files = db::get_files(&tx, directory.id, None)?;
-        //db::delete_files(&tx, directory.id)?;
+
         let mut matches_by_name = BTreeMap::new();
         for file in &dir_files {
             matches_by_name.entry(&file.name).or_insert(Vec::new()).push(file);
@@ -942,8 +977,7 @@ fn rename_files(conn: &mut Connection, dat_id: db::DatId) -> Result<()> {
                     let old_path = path.join(name);
                     let new_path = path.join(&rom.name);
                     let mut sp = tx.savepoint()?;
-                    if let Err(e) =
-                        db::update_file(&sp, file.id, &rom.name, db::MatchStatus::Match { set_id, rom_id })
+                    if let Err(e) = db::update_file(&sp, file.id, &rom.name, db::MatchStatus::Match { set_id, rom_id })
                     {
                         eprintln!("Failed to rename {old_path}. Error was {e}");
                         sp.rollback()?;
