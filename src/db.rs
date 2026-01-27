@@ -32,8 +32,6 @@ pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_dat_dirs_path ON dirs(dat_id, path);",
         "CREATE INDEX IF NOT EXISTS idx_dir_files ON files(dir_id);",
         "CREATE INDEX IF NOT EXISTS idx_dir_files_name ON files(dir_id, name);",
-        /* alter */
-        //"ALTER TABLE dirs ADD COLUMN parent_id INTEGER;"
     ];
 
     let conn = Connection::open(db_path.as_ref())?;
@@ -277,6 +275,24 @@ pub fn insert_rom(
     })
 }
 
+pub fn get_rom(conn: &Connection, rom_id: RomId) -> Result<RomRecord> {
+    let record = conn.query_one(
+        "SELECT dat_id, set_id, name, size, hash FROM roms WHERE id = (?1)",
+        params![rom_id.0],
+        |row| {
+            Ok(RomRecord {
+                id: rom_id,
+                dat_id: DatId(row.get(0)?),
+                set_id: SetId(row.get(1)?),
+                name: row.get(2)?,
+                size: row.get::<_, String>(3)?.parse().unwrap(),
+                hash: row.get(4)?,
+            })
+        },
+    )?;
+    Ok(record)
+}
+
 pub fn get_roms_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<RomRecord>> {
     let mut stmt = conn.prepare("SELECT id, dat_id, name, size, hash FROM roms WHERE set_id = (?1)")?;
     let matches = stmt
@@ -359,11 +375,12 @@ pub fn get_directory(conn: &Connection, dat_id: DatId, path: &str) -> Result<Opt
 
 pub fn get_directories(conn: &Connection, dat_id: DatId, parent_id: Option<DirId>) -> Result<Vec<DirRecord>> {
     let matches = if let Some(parent_id) = parent_id {
-        let mut stmt = conn.prepare("SELECT id, path, parent_id FROM dirs WHERE dat_id = (?1) AND parent_id = (?2)")?;
+        let mut stmt = conn
+            .prepare("SELECT id, path, parent_id FROM dirs WHERE dat_id = (?1) AND parent_id = (?2) ORDER BY path")?;
         stmt.query_map(params![dat_id.0, parent_id.0], |row| dir_from_row(dat_id, row))?
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        let mut stmt = conn.prepare("SELECT id, path, parent_id FROM dirs WHERE dat_id = (?1)")?;
+        let mut stmt = conn.prepare("SELECT id, path, parent_id FROM dirs WHERE dat_id = (?1) ORDER BY path")?;
         stmt.query_map(params![dat_id.0], |row| dir_from_row(dat_id, row))?
             .collect::<Result<Vec<_>, _>>()?
     };
@@ -380,7 +397,7 @@ fn dir_from_row(dat_id: DatId, row: &rusqlite::Row<'_>) -> rusqlite::Result<DirR
 }
 
 pub fn get_directories_by_path(conn: &Connection, path: &str) -> Result<Vec<DirRecord>> {
-    let mut stmt = conn.prepare("SELECT id, dat_id, parent_id FROM dirs WHERE path = (?1)")?;
+    let mut stmt = conn.prepare("SELECT id, dat_id, parent_id FROM dirs WHERE path = (?1) ORDER BY path")?;
     let matches = stmt
         .query_map(params![path], |row| {
             Ok(DirRecord {
@@ -413,10 +430,10 @@ pub fn insert_directory(conn: &Connection, dat_id: DatId, path: &str, parent_id:
 }
 
 pub fn update_directories(conn: &Connection, old_dat_id: DatId, new_dat_id: DatId) -> Result<usize> {
-    let num_updated = conn.execute("UPDATE dirs SET dat_id = (?1) WHERE dat_id = (?2)", params![new_dat_id.0, old_dat_id.0])?;
+    let num_updated =
+        conn.execute("UPDATE dirs SET dat_id = (?1) WHERE dat_id = (?2)", params![new_dat_id.0, old_dat_id.0])?;
     Ok(num_updated)
 }
-
 
 pub fn delete_directory(conn: &Connection, dir_id: DirId) -> Result<bool> {
     let num_deleted = conn.execute("DELETE FROM dirs WHERE id = (?1)", params![dir_id.0])?;
@@ -464,14 +481,15 @@ pub fn get_file(conn: &Connection, dir_id: DirId, name: &str) -> Result<Option<F
 pub fn get_files(conn: &Connection, dir_id: DirId, filter_name: Option<&str>) -> Result<Vec<FileRecord>> {
     let matches = if let Some(filter_name) = filter_name {
         let mut stmt = conn.prepare(
-            "SELECT id, name, size, hash, status, set_id, rom_id FROM files WHERE dir_id = (?1) AND name LIKE (?2)",
+            "SELECT id, name, size, hash, status, set_id, rom_id FROM files WHERE dir_id = (?1) AND name LIKE (?2) ORDER BY name",
         )?;
 
         stmt.query_map(params![dir_id.0, format!("%{}%", filter_name)], |row| file_from_row(dir_id, row))?
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        let mut stmt =
-            conn.prepare("SELECT id, name, size, hash, status, set_id, rom_id FROM files WHERE dir_id = (?1)")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, size, hash, status, set_id, rom_id FROM files WHERE dir_id = (?1) ORDER BY name",
+        )?;
 
         stmt.query_map(params![dir_id.0], |row| file_from_row(dir_id, row))?
             .collect::<Result<Vec<_>, _>>()?
@@ -548,6 +566,20 @@ pub fn insert_file(
         hash: hash.to_string(),
         status,
     })
+}
+
+pub fn update_file(conn: &Connection, file_id: i64, name: &str, status: MatchStatus) -> Result<bool> {
+    let (set_id, rom_id) = match status {
+        MatchStatus::None => (None, None),
+        MatchStatus::Hash { set_id, rom_id } => (Some(set_id.0), Some(rom_id.0)),
+        MatchStatus::Name { set_id, rom_id } => (Some(set_id.0), Some(rom_id.0)),
+        MatchStatus::Match { set_id, rom_id } => (Some(set_id.0), Some(rom_id.0)),
+    };
+    let num_updated = conn.execute(
+        "UPDATE files SET name = (?1), status = (?2), set_id = (?3), rom_id = (?4) WHERE id = (?5)",
+        params![name, status.to_str(), set_id, rom_id, file_id],
+    )?;
+    Ok(num_updated != 0)
 }
 
 pub fn delete_file(conn: &Connection, dir_id: DirId, name: &str) -> Result<bool> {
