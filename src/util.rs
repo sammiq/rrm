@@ -3,6 +3,9 @@ use sha1::{Digest, Sha1};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
+#[cfg(windows)]
+use std::os::windows::prelude::*;
+
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn data_dir() -> Option<Utf8PathBuf> {
     env_to_path("XDG_CONFIG_HOME").or_else(|| home_path(".local/share"))
