@@ -11,7 +11,7 @@ pub fn data_dir() -> Option<Utf8PathBuf> {
     env_to_path("XDG_CONFIG_HOME").or_else(|| home_path(".local/share"))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(target_os = "macos"))]
 fn env_to_path(env_var: &str) -> Option<Utf8PathBuf> {
     std::env::var_os(env_var).and_then(|opath| {
         Utf8PathBuf::from_os_string(opath)
@@ -20,7 +20,7 @@ fn env_to_path(env_var: &str) -> Option<Utf8PathBuf> {
     })
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn home_path(dirname: &str) -> Option<Utf8PathBuf> {
     std::env::home_dir()
         .and_then(|home| Utf8PathBuf::from_path_buf(home).ok())
