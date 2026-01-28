@@ -5,6 +5,86 @@ use camino::Utf8Path;
 use anyhow::{Result, bail};
 use rusqlite::{Connection, params};
 
+//macro that generates a select statement
+macro_rules! sql_query_one {
+    ($conn:expr, $table:expr, $fields:expr, where { $($where_field:ident $(= $where_value:expr)?),+ $(,)? }, $mapper:expr) => {{
+        let wheres = vec![$(concat!(stringify!($where_field), " = :", stringify!($where_field))),+].join(" AND ");
+        let sql = format!("SELECT {} FROM {} WHERE {}", $fields, $table, wheres);
+
+        $conn.query_one(
+            &sql,
+            &[$(
+                (concat!(":", stringify!($where_field)), &sql_query_one!(@value $where_field $(= $where_value)?) as &dyn rusqlite::ToSql)
+            ),+] as &[(&str, &dyn rusqlite::ToSql)],
+            $mapper
+        )
+    }};
+
+    (@value $field:ident = $value:expr) => { $value };
+    (@value $field:ident) => { $field };
+}
+
+// macro that allows an insert statement to be built from a table name and the passed data to avoid errors
+macro_rules! sql_insert {
+    ($conn:expr, $table:expr, set { $($field:ident $(= $value:expr)?),+ } $(,)?) => {{
+        let fields_str = vec![$(stringify!($field)),+].join(", ");
+        let params_str = vec![$(concat!(":", stringify!($field))),+].join(", ");
+        let sql = format!("INSERT INTO {} ({}) VALUES ({})", $table, fields_str, params_str);
+
+        $conn.execute(
+            &sql,
+            &[$(
+                (concat!(":", stringify!($field)), &sql_insert!(@value $field $(= $value)?) as &dyn rusqlite::ToSql)
+            ),+] as &[(&str, &dyn rusqlite::ToSql)]
+        )
+    }};
+
+    (@value $field:ident = $value:expr) => { $value };
+    (@value $field:ident) => { $field };
+}
+
+// macro that allows an update statement to be built from a table name and the passed data to avoid errors
+macro_rules! sql_update {
+    ($conn:expr, $table:expr, where { $($where_field:ident $(= $where_value:expr)?),+ }, set { $($field:ident $(= $value:expr)?),+ } $(,)?) => {{
+        let sets = vec![$(concat!(stringify!($field), " = :s_", stringify!($field))),+].join(", ");
+        let wheres = vec![$(concat!(stringify!($where_field), " = :w_", stringify!($where_field))),+].join(" AND ");
+        let sql = format!("UPDATE {} SET {} WHERE {}", $table, sets, wheres);
+
+        $conn.execute(
+            &sql,
+            &[
+                $(
+                    (concat!(":s_", stringify!($field)), &sql_update!(@value $field $(= $value)?) as &dyn rusqlite::ToSql)
+                ),+,
+                $(
+                    (concat!(":w_", stringify!($where_field)), &sql_update!(@value $where_field $(= $where_value)?) as &dyn rusqlite::ToSql)
+                ),+
+            ] as &[(&str, &dyn rusqlite::ToSql)]
+        )
+    }};
+
+    (@value $field:ident = $value:expr) => { $value };
+    (@value $field:ident) => { $field };
+}
+
+// macro that allows an delete statement to be built from a table name and the passed data to avoid errors
+macro_rules! sql_delete {
+    ($conn:expr, $table:expr, where { $($where_field:ident $(= $where_value:expr)?),+ } $(,)?) => {{
+        let wheres = vec![$(concat!(stringify!($where_field), " = :", stringify!($where_field))),+].join(" AND ");
+        let sql = format!("DELETE FROM {} WHERE {}", $table, wheres);
+
+        $conn.execute(
+            &sql,
+            &[$(
+                (concat!(":", stringify!($where_field)), &sql_delete!(@value $where_field $(= $where_value)?) as &dyn rusqlite::ToSql)
+            ),+] as &[(&str, &dyn rusqlite::ToSql)]
+        )
+    }};
+
+    (@value $field:ident = $value:expr) => { $value };
+    (@value $field:ident) => { $field };
+}
+
 pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
     const CREATE_STATEMENTS: [&str; 14] = [
         /* dat file */
@@ -90,9 +170,12 @@ pub struct DirRecord {
     pub parent_id: Option<DirId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileId(i64);
+
 #[derive(Debug)]
 pub struct FileRecord {
-    pub id: i64,
+    pub id: FileId,
     pub dir_id: DirId,
     pub name: String,
     pub size: u64,
@@ -128,37 +211,28 @@ impl MatchStatus {
     }
 }
 
+const DAT_FIELDS: &str = "id, name, description, version, author, hash_type";
+
+fn dat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatRecord> {
+    Ok(DatRecord {
+        id: DatId(row.get("id")?),
+        name: row.get("name")?,
+        description: row.get("description")?,
+        version: row.get("version")?,
+        author: row.get("author")?,
+        hash_type: row.get("hash_type")?,
+    })
+}
+
 pub fn get_dat(conn: &Connection, dat_id: DatId) -> Result<DatRecord> {
-    let record = conn.query_one(
-        "SELECT name, description, version, author, hash_type FROM dats WHERE id = (?1)",
-        params![dat_id.0],
-        |row| {
-            Ok(DatRecord {
-                id: dat_id,
-                name: row.get(0)?,
-                description: row.get(1)?,
-                version: row.get(2)?,
-                author: row.get(3)?,
-                hash_type: row.get(4)?,
-            })
-        },
-    )?;
+    let record = sql_query_one!(conn, "dats", DAT_FIELDS, where {id = dat_id.0}, dat_from_row)?;
     Ok(record)
 }
 
 pub fn get_dats(conn: &Connection) -> Result<Vec<DatRecord>> {
-    let mut stmt = conn.prepare("SELECT id, name, description, version, author, hash_type FROM dats")?;
+    let mut stmt = conn.prepare(format!("SELECT {DAT_FIELDS} FROM dats").as_str())?;
     let matches = stmt
-        .query_map(params![], |row| {
-            Ok(DatRecord {
-                id: DatId(row.get(0)?),
-                name: row.get(1)?,
-                description: row.get(2)?,
-                version: row.get(3)?,
-                author: row.get(4)?,
-                hash_type: row.get(5)?,
-            })
-        })?
+        .query_map(params![], dat_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(matches)
 }
@@ -171,9 +245,16 @@ pub fn insert_dat(
     author: &str,
     hash_type: &str,
 ) -> Result<DatRecord> {
-    conn.execute(
-        "INSERT INTO dats (name, description, version, author, hash_type) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![name, description, version, author, hash_type,],
+    sql_insert!(
+        conn,
+        "dats",
+        set {
+            name,
+            description,
+            version,
+            author,
+            hash_type
+        }
     )?;
     let id = conn.last_insert_rowid();
     Ok(DatRecord {
@@ -186,39 +267,25 @@ pub fn insert_dat(
     })
 }
 
+const SET_FIELDS: &str = "id, dat_id, name";
+
+fn set_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SetRecord> {
+    Ok(SetRecord {
+        id: SetId(row.get("id")?),
+        dat_id: DatId(row.get("dat_id")?),
+        name: row.get("name")?,
+    })
+}
+
 pub fn get_set(conn: &Connection, set_id: SetId) -> Result<SetRecord> {
-    let record = conn.query_one("SELECT dat_id, name FROM sets WHERE id = (?1)", params![set_id.0], |row| {
-        Ok(SetRecord {
-            id: set_id,
-            dat_id: DatId(row.get(0)?),
-            name: row.get(1)?,
-        })
-    })?;
+    let record = sql_query_one!(conn, "sets", SET_FIELDS, where {id = set_id.0}, set_from_row)?;
     Ok(record)
 }
 
-pub fn get_set_with_roms(conn: &Connection, set_id: SetId) -> Result<(SetRecord, Vec<RomRecord>)> {
-    let set_record = conn.query_one("SELECT dat_id, name FROM sets WHERE id = (?1)", params![set_id.0], |row| {
-        Ok(SetRecord {
-            id: set_id,
-            dat_id: DatId(row.get(0)?),
-            name: row.get(1)?,
-        })
-    })?;
-    let roms = get_roms_by_set(conn, set_id)?;
-    Ok((set_record, roms))
-}
-
 pub fn get_sets(conn: &Connection, dat_id: DatId) -> Result<Vec<SetRecord>> {
-    let mut stmt = conn.prepare("SELECT id, name FROM sets WHERE dat_id = (?1)")?;
+    let mut stmt = conn.prepare(format!("SELECT {SET_FIELDS} FROM sets WHERE dat_id = (?1)").as_str())?;
     let matches = stmt
-        .query_map(params![dat_id.0], |row| {
-            Ok(SetRecord {
-                id: SetId(row.get(0)?),
-                dat_id,
-                name: row.get(1)?,
-            })
-        })?
+        .query_map(params![dat_id.0], set_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(matches)
 }
@@ -226,35 +293,93 @@ pub fn get_sets(conn: &Connection, dat_id: DatId) -> Result<Vec<SetRecord>> {
 pub fn get_sets_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: bool) -> Result<Vec<SetRecord>> {
     let (mut stmt, search_name) = if exact {
         (
-            conn.prepare("SELECT id, name FROM sets WHERE dat_id = (?1) AND name = (?2)")?,
+            conn.prepare(format!("SELECT {SET_FIELDS} FROM sets WHERE dat_id = (?1) AND name = (?2)").as_str())?,
             name.to_string(),
         )
     } else {
         (
-            conn.prepare("SELECT id, name FROM sets WHERE dat_id = (?1) AND name LIKE (?2)")?,
+            conn.prepare(format!("SELECT {SET_FIELDS} FROM sets WHERE dat_id = (?1) AND name LIKE (?2)").as_str())?,
             format!("%{name}%"),
         )
     };
     let matches = stmt
-        .query_map(params![dat_id.0, search_name], |row| {
-            Ok(SetRecord {
-                id: SetId(row.get(0)?),
-                dat_id,
-                name: row.get(1)?,
-            })
-        })?
+        .query_map(params![dat_id.0, search_name], set_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(matches)
 }
 
 pub fn insert_set(conn: &Connection, dat_id: DatId, name: &str) -> Result<SetRecord> {
-    conn.execute("INSERT INTO sets (dat_id, name) VALUES (?1, ?2)", params![dat_id.0, name])?;
+    sql_insert!(conn, "sets", set {dat_id = dat_id.0, name})?;
     let id = conn.last_insert_rowid();
     Ok(SetRecord {
         id: SetId(id),
         dat_id,
         name: name.to_string(),
     })
+}
+
+const ROM_FIELDS: &str = "id, dat_id, set_id, name, size, hash";
+
+fn rom_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RomRecord> {
+    Ok(RomRecord {
+        id: RomId(row.get("id")?),
+        dat_id: DatId(row.get("dat_id")?),
+        set_id: SetId(row.get("set_id")?),
+        name: row.get("name")?,
+        size: row
+            .get::<_, String>("size")?
+            .parse()
+            .expect("field is non null and should always be convertible"),
+        hash: row.get("hash")?,
+    })
+}
+
+pub fn get_rom(conn: &Connection, rom_id: RomId) -> Result<RomRecord> {
+    let record = sql_query_one!(conn, "roms", ROM_FIELDS, where {id = rom_id.0}, rom_from_row)?;
+    Ok(record)
+}
+
+pub fn get_roms(conn: &Connection, dat_id: DatId) -> Result<Vec<RomRecord>> {
+    let mut stmt = conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1)").as_str())?;
+    let matches = stmt
+        .query_map(params![dat_id.0], rom_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(matches)
+}
+
+pub fn get_roms_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<RomRecord>> {
+    let mut stmt = conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE set_id = (?1)").as_str())?;
+    let matches = stmt
+        .query_map(params![set_id.0], rom_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(matches)
+}
+
+pub fn get_roms_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: bool) -> Result<Vec<RomRecord>> {
+    let (mut stmt, search_name) = if exact {
+        (
+            conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1) AND name = (?2)").as_str())?,
+            name.to_string(),
+        )
+    } else {
+        (
+            conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1) AND name LIKE (?2)").as_str())?,
+            format!("%{name}%"),
+        )
+    };
+    let matches = stmt
+        .query_map(params![dat_id.0, search_name], rom_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(matches)
+}
+
+pub fn get_roms_by_hash(conn: &Connection, dat_id: DatId, hash: &str) -> Result<Vec<RomRecord>> {
+    let mut stmt =
+        conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1) AND hash = (?2)").as_str())?;
+    let matches = stmt
+        .query_map(params![dat_id.0, hash], rom_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(matches)
 }
 
 pub fn insert_rom(
@@ -265,10 +390,7 @@ pub fn insert_rom(
     size: u64,
     hash: &str,
 ) -> Result<RomRecord> {
-    conn.execute(
-        "INSERT INTO roms (dat_id, set_id, name, size, hash) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![dat_id.0, set_id.0, name, size.to_string(), hash],
-    )?;
+    sql_insert!(conn, "roms", set {dat_id = dat_id.0, set_id = set_id.0, name, size = size.to_string(), hash})?;
     let id = conn.last_insert_rowid();
     Ok(RomRecord {
         id: RomId(id),
@@ -280,111 +402,21 @@ pub fn insert_rom(
     })
 }
 
-pub fn get_rom(conn: &Connection, rom_id: RomId) -> Result<RomRecord> {
-    let record = conn.query_one(
-        "SELECT dat_id, set_id, name, size, hash FROM roms WHERE id = (?1)",
-        params![rom_id.0],
-        |row| {
-            Ok(RomRecord {
-                id: rom_id,
-                dat_id: DatId(row.get(0)?),
-                set_id: SetId(row.get(1)?),
-                name: row.get(2)?,
-                size: row
-                    .get::<_, String>(3)?
-                    .parse()
-                    .expect("field is non null and should always be convertible"),
-                hash: row.get(4)?,
-            })
-        },
-    )?;
-    Ok(record)
+const DIR_FIELDS: &str = "id, dat_id, path, parent_id";
+
+fn dir_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirRecord> {
+    Ok(DirRecord {
+        id: DirId(row.get("id")?),
+        dat_id: DatId(row.get("dat_id")?),
+        path: row.get("path")?,
+        parent_id: row.get::<_, Option<i64>>("parent_id")?.map(DirId),
+    })
 }
 
-pub fn get_roms_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<RomRecord>> {
-    let mut stmt = conn.prepare("SELECT id, dat_id, name, size, hash FROM roms WHERE set_id = (?1)")?;
-    let matches = stmt
-        .query_map(params![set_id.0], |row| {
-            Ok(RomRecord {
-                id: RomId(row.get(0)?),
-                dat_id: DatId(row.get(1)?),
-                set_id,
-                name: row.get(2)?,
-                size: row
-                    .get::<_, String>(3)?
-                    .parse()
-                    .expect("field is non null and should always be convertible"),
-                hash: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(matches)
-}
-
-pub fn get_roms_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: bool) -> Result<Vec<RomRecord>> {
-    let (mut stmt, search_name) = if exact {
-        (
-            conn.prepare("SELECT id, set_id, name, size, hash FROM roms WHERE dat_id = (?1) AND name = (?2)")?,
-            name.to_string(),
-        )
-    } else {
-        (
-            conn.prepare("SELECT id, set_id, name, size, hash FROM roms WHERE dat_id = (?1) AND name LIKE (?2)")?,
-            format!("%{name}%"),
-        )
-    };
-    let matches = stmt
-        .query_map(params![dat_id.0, search_name], |row| {
-            Ok(RomRecord {
-                id: RomId(row.get(0)?),
-                dat_id,
-                set_id: SetId(row.get(1)?),
-                name: row.get(2)?,
-                size: row
-                    .get::<_, String>(3)?
-                    .parse()
-                    .expect("field is non null and should always be convertible"),
-                hash: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(matches)
-}
-
-pub fn get_roms_by_hash(conn: &Connection, dat_id: DatId, hash: &str) -> Result<Vec<RomRecord>> {
-    let mut stmt = conn.prepare("SELECT id, set_id, name, size FROM roms WHERE dat_id = (?1) AND hash = (?2)")?;
-    let matches = stmt
-        .query_map(params![dat_id.0, hash], |row| {
-            Ok(RomRecord {
-                id: RomId(row.get(0)?),
-                dat_id,
-                set_id: SetId(row.get(1)?),
-                name: row.get(2)?,
-                size: row
-                    .get::<_, String>(3)?
-                    .parse()
-                    .expect("field is non null and should always be convertible"),
-                hash: hash.to_string(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(matches)
-}
-
-pub fn get_directory(conn: &Connection, dat_id: DatId, path: &str) -> Result<Option<DirRecord>> {
-    match conn.query_one(
-        "SELECT id, parent_id FROM dirs WHERE path = (?1) AND dat_id = (?2)",
-        params![path, dat_id.0],
-        |row| {
-            Ok(DirRecord {
-                id: DirId(row.get(0)?),
-                path: path.to_string(),
-                dat_id,
-                parent_id: row.get::<_, Option<i64>>(1)?.map(DirId),
-            })
-        },
+pub fn get_directory_by_path(conn: &Connection, dat_id: DatId, path: &str) -> Result<Option<DirRecord>> {
+    match sql_query_one!(conn, "dirs", DIR_FIELDS, where {path, dat_id = dat_id.0}, dir_from_row
     ) {
-        Ok(id) => Ok(Some(id)),
+        Ok(dir) => Ok(Some(dir)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => bail!(e),
     }
@@ -392,51 +424,30 @@ pub fn get_directory(conn: &Connection, dat_id: DatId, path: &str) -> Result<Opt
 
 pub fn get_directories(conn: &Connection, dat_id: DatId, parent_id: Option<DirId>) -> Result<Vec<DirRecord>> {
     let matches = if let Some(parent_id) = parent_id {
-        let mut stmt = conn
-            .prepare("SELECT id, path, parent_id FROM dirs WHERE dat_id = (?1) AND parent_id = (?2) ORDER BY path")?;
-        stmt.query_map(params![dat_id.0, parent_id.0], |row| dir_from_row(dat_id, row))?
+        let mut stmt = conn.prepare(
+            format!("SELECT {DIR_FIELDS} FROM dirs WHERE dat_id = (?1) AND parent_id = (?2) ORDER BY path").as_str(),
+        )?;
+        stmt.query_map(params![dat_id.0, parent_id.0], dir_from_row)?
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        let mut stmt = conn.prepare("SELECT id, path, parent_id FROM dirs WHERE dat_id = (?1) ORDER BY path")?;
-        stmt.query_map(params![dat_id.0], |row| dir_from_row(dat_id, row))?
+        let mut stmt =
+            conn.prepare(format!("SELECT {DIR_FIELDS} FROM dirs WHERE dat_id = (?1) ORDER BY path").as_str())?;
+        stmt.query_map(params![dat_id.0], dir_from_row)?
             .collect::<Result<Vec<_>, _>>()?
     };
     Ok(matches)
 }
 
-fn dir_from_row(dat_id: DatId, row: &rusqlite::Row<'_>) -> rusqlite::Result<DirRecord> {
-    Ok(DirRecord {
-        id: DirId(row.get(0)?),
-        path: row.get(1)?,
-        dat_id,
-        parent_id: row.get::<_, Option<i64>>(2)?.map(DirId),
-    })
-}
-
 pub fn get_directories_by_path(conn: &Connection, path: &str) -> Result<Vec<DirRecord>> {
-    let mut stmt = conn.prepare("SELECT id, dat_id, parent_id FROM dirs WHERE path = (?1) ORDER BY path")?;
+    let mut stmt = conn.prepare(format!("SELECT {DIR_FIELDS} FROM dirs WHERE path = (?1) ORDER BY path").as_str())?;
     let matches = stmt
-        .query_map(params![path], |row| {
-            Ok(DirRecord {
-                id: DirId(row.get(0)?),
-                path: path.to_string(),
-                dat_id: DatId(row.get(1)?),
-                parent_id: row.get::<_, Option<i64>>(2)?.map(DirId),
-            })
-        })?
+        .query_map(params![path], dir_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(matches)
 }
 
 pub fn insert_directory(conn: &Connection, dat_id: DatId, path: &str, parent_id: Option<DirId>) -> Result<DirRecord> {
-    if let Some(parent_id) = parent_id {
-        conn.execute(
-            "INSERT INTO dirs (path, dat_id, parent_id) VALUES (?1, ?2, ?3)",
-            params![path, dat_id.0, parent_id.0],
-        )?;
-    } else {
-        conn.execute("INSERT INTO dirs (path, dat_id) VALUES (?1, ?2)", params![path, dat_id.0])?;
-    }
+    sql_insert!(conn, "dirs", set {path, dat_id = dat_id.0, parent_id = parent_id.map(|id| id.0)})?;
     let id = conn.last_insert_rowid();
     Ok(DirRecord {
         id: DirId(id),
@@ -447,97 +458,64 @@ pub fn insert_directory(conn: &Connection, dat_id: DatId, path: &str, parent_id:
 }
 
 pub fn update_directories(conn: &Connection, old_dat_id: DatId, new_dat_id: DatId) -> Result<usize> {
-    let num_updated =
-        conn.execute("UPDATE dirs SET dat_id = (?1) WHERE dat_id = (?2)", params![new_dat_id.0, old_dat_id.0])?;
+    let num_updated = sql_update!(conn, "dirs", where {
+        dat_id = old_dat_id.0
+    },
+    set {
+        dat_id = new_dat_id.0
+    })?;
     Ok(num_updated)
 }
 
 pub fn delete_directory(conn: &Connection, dir_id: DirId) -> Result<bool> {
-    let num_deleted = conn.execute("DELETE FROM dirs WHERE id = (?1)", params![dir_id.0])?;
+    let num_deleted = sql_delete!(conn, "dirs", where {id = dir_id.0})?;
     Ok(num_deleted != 0)
 }
 
-pub fn get_file(conn: &Connection, dir_id: DirId, name: &str) -> Result<Option<FileRecord>> {
-    let record = match conn.query_one(
-        "SELECT id, size, hash, status, set_id, rom_id FROM files WHERE name = (?1) AND dir_id = (?2)",
-        params![name, dir_id.0],
-        |row| {
-            let status = match row.get::<_, String>(3)?.as_ref() {
-                "hash" => MatchStatus::Hash {
-                    set_id: SetId(row.get(4)?),
-                    rom_id: RomId(row.get(5)?),
-                },
-                "name" => MatchStatus::Name {
-                    set_id: SetId(row.get(4)?),
-                    rom_id: RomId(row.get(5)?),
-                },
-                "match" => MatchStatus::Match {
-                    set_id: SetId(row.get(4)?),
-                    rom_id: RomId(row.get(5)?),
-                },
-                _ => MatchStatus::None,
-            };
+const FILE_FIELDS: &str = "id, dir_id, name, size, hash, status, set_id, rom_id";
 
-            Ok(FileRecord {
-                id: row.get(0)?,
-                dir_id,
-                name: name.to_string(),
-                size: row.get::<_, String>(1)?.parse().unwrap(),
-                hash: row.get(2)?,
-                status,
-            })
+fn file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+    let status = match row.get::<_, String>("status")?.as_ref() {
+        "hash" => MatchStatus::Hash {
+            set_id: SetId(row.get("set_id")?),
+            rom_id: RomId(row.get("rom_id")?),
         },
-    ) {
-        Ok(record) => Some(record),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => bail!(e),
+        "name" => MatchStatus::Name {
+            set_id: SetId(row.get("set_id")?),
+            rom_id: RomId(row.get("rom_id")?),
+        },
+        "match" => MatchStatus::Match {
+            set_id: SetId(row.get("set_id")?),
+            rom_id: RomId(row.get("rom_id")?),
+        },
+        _ => MatchStatus::None,
     };
-    Ok(record)
+    Ok(FileRecord {
+        id: FileId(row.get("id")?),
+        dir_id: DirId(row.get("dir_id")?),
+        name: row.get("name")?,
+        size: row.get::<_, String>("size")?.parse().unwrap(),
+        hash: row.get("hash")?,
+        status,
+    })
 }
 
 pub fn get_files(conn: &Connection, dir_id: DirId, filter_name: Option<&str>) -> Result<Vec<FileRecord>> {
     let matches = if let Some(filter_name) = filter_name {
         let mut stmt = conn.prepare(
-            "SELECT id, name, size, hash, status, set_id, rom_id FROM files WHERE dir_id = (?1) AND name LIKE (?2) ORDER BY name",
+            format!("SELECT {FILE_FIELDS} FROM files WHERE dir_id = (?1) AND name LIKE (?2) ORDER BY name").as_str(),
         )?;
 
-        stmt.query_map(params![dir_id.0, format!("%{}%", filter_name)], |row| file_from_row(dir_id, row))?
+        stmt.query_map(params![dir_id.0, format!("%{}%", filter_name)], file_from_row)?
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, size, hash, status, set_id, rom_id FROM files WHERE dir_id = (?1) ORDER BY name",
-        )?;
+        let mut stmt =
+            conn.prepare(format!("SELECT {FILE_FIELDS} FROM files WHERE dir_id = (?1) ORDER BY name").as_str())?;
 
-        stmt.query_map(params![dir_id.0], |row| file_from_row(dir_id, row))?
+        stmt.query_map(params![dir_id.0], file_from_row)?
             .collect::<Result<Vec<_>, _>>()?
     };
     Ok(matches)
-}
-
-fn file_from_row(dir_id: DirId, row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
-    let status = match row.get::<_, String>(4)?.as_ref() {
-        "hash" => MatchStatus::Hash {
-            set_id: SetId(row.get(5)?),
-            rom_id: RomId(row.get(6)?),
-        },
-        "name" => MatchStatus::Name {
-            set_id: SetId(row.get(5)?),
-            rom_id: RomId(row.get(6)?),
-        },
-        "match" => MatchStatus::Match {
-            set_id: SetId(row.get(5)?),
-            rom_id: RomId(row.get(6)?),
-        },
-        _ => MatchStatus::None,
-    };
-    Ok(FileRecord {
-        id: row.get(0)?,
-        dir_id,
-        name: row.get(1)?,
-        size: row.get::<_, String>(2)?.parse().unwrap(),
-        hash: row.get(3)?,
-        status,
-    })
 }
 
 pub fn insert_file(
@@ -548,30 +526,24 @@ pub fn insert_file(
     hash: &str,
     status: MatchStatus,
 ) -> Result<FileRecord> {
-    let ids = status.ids();
-    if let Some((set_id, rom_id)) = ids {
-        conn.execute(
-            "INSERT INTO files (dir_id, name, size, hash, status, set_id, rom_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                dir_id.0,
-                name,
-                size.to_string(),
-                hash,
-                status.to_str(),
-                set_id.0,
-                rom_id.0
-            ],
-        )?;
-    } else {
-        conn.execute(
-            "INSERT INTO files (dir_id, name, size, hash, status) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![dir_id.0, name, size.to_string(), hash, status.to_str()],
-        )?;
-    }
-
+    let (set_id, rom_id) = match status.ids() {
+        Some((set_id, rom_id)) => (Some(set_id.0), Some(rom_id.0)),
+        None => (None, None),
+    };
+    sql_insert!(
+        conn,
+        "files",
+        set {dir_id = dir_id.0,
+        name,
+        size = size.to_string(),
+        hash,
+        status = status.to_str(),
+        set_id,
+        rom_id}
+    )?;
     let id = conn.last_insert_rowid();
     Ok(FileRecord {
-        id,
+        id: FileId(id),
         dir_id,
         name: name.to_string(),
         size,
@@ -580,25 +552,23 @@ pub fn insert_file(
     })
 }
 
-pub fn update_file(conn: &Connection, file_id: i64, name: &str, status: MatchStatus) -> Result<bool> {
+pub fn update_file(conn: &Connection, file_id: FileId, name: &str, status: MatchStatus) -> Result<bool> {
     let (set_id, rom_id) = match status.ids() {
         Some((set_id, rom_id)) => (Some(set_id.0), Some(rom_id.0)),
         None => (None, None),
     };
 
-    let num_updated = conn.execute(
-        "UPDATE files SET name = (?1), status = (?2), set_id = (?3), rom_id = (?4) WHERE id = (?5)",
-        params![name, status.to_str(), set_id, rom_id, file_id],
-    )?;
+    let num_updated =
+        sql_update!(conn, "files", where {id = file_id.0}, set {name, status = status.to_str(), set_id, rom_id})?;
     Ok(num_updated != 0)
 }
 
 pub fn delete_file(conn: &Connection, dir_id: DirId, name: &str) -> Result<bool> {
-    let num_deleted = conn.execute("DELETE FROM files WHERE dir_id = (?1) AND name = (?2)", params![dir_id.0, name])?;
+    let num_deleted = sql_delete!(conn, "files", where {dir_id = dir_id.0, name})?;
     Ok(num_deleted != 0)
 }
 
 pub fn delete_files(conn: &Connection, dir_id: DirId) -> Result<usize> {
-    let num_deleted = conn.execute("DELETE FROM files WHERE dir_id = (?1)", params![dir_id.0])?;
+    let num_deleted = sql_delete!(conn, "files", where {dir_id = dir_id.0})?;
     Ok(num_deleted)
 }
