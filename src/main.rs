@@ -128,16 +128,23 @@ enum DataCommands {
         #[arg(value_hint = clap::ValueHint::FilePath)]
         dat_file: Utf8PathBuf,
     },
+    Remove,
     /// List dat files in the system
     List,
     /// Select the current dat file
-    Select { index: usize },
+    Select {
+        index: usize,
+    },
     /// Show all Set and Roms in the current dat file
     Records,
     /// Search for a Set in the current dat file
-    Sets { partial_name: Option<String> },
+    Sets {
+        partial_name: Option<String>,
+    },
     /// Search for a Rom in the current dat file
-    Roms { partial_name: Option<String> },
+    Roms {
+        partial_name: Option<String>,
+    },
 }
 
 fn readline() -> Result<String> {
@@ -164,26 +171,6 @@ fn main() -> Result<()> {
 
     let mut dat_id = None;
 
-    //default the dat to the current directory if it exists
-    if let Some(current_path) = std::env::current_dir()
-        .ok()
-        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
-        .and_then(|path| path.canonicalize_utf8().ok())
-    {
-        let paths = db::get_directories_by_path(&conn, current_path.as_str())?;
-        if !paths.is_empty() {
-            let dat = db::get_dat(&conn, paths[0].dat_id)?;
-            println!("dat file `{}` selected.", dat.name);
-            dat_id = Some(dat.id);
-        } else {
-            eprintln!("No default dat file for current path.");
-            list_dat_files(&conn)?;
-        }
-    } else {
-        eprintln!("Invalid current path, no default dat file for current path.");
-        list_dat_files(&conn)?;
-    }
-
     let args = Args::parse();
     if let Some(index) = args.select {
         do_command(
@@ -193,7 +180,28 @@ fn main() -> Result<()> {
                 data: DataCommands::Select { index },
             },
         )?;
+    } else {
+        //default the dat to the current directory if it exists
+        if let Some(current_path) = std::env::current_dir()
+            .ok()
+            .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+            .and_then(|path| path.canonicalize_utf8().ok())
+        {
+            let paths = db::get_directories_by_path(&conn, current_path.as_str())?;
+            if !paths.is_empty() {
+                let dat = db::get_dat(&conn, paths[0].dat_id)?;
+                println!("dat file `{}` selected.", dat.name);
+                dat_id = Some(dat.id);
+            } else {
+                eprintln!("No default dat file for current path.");
+                list_dat_files(&conn)?;
+            }
+        } else {
+            eprintln!("Invalid current path, no default dat file for current path.");
+            list_dat_files(&conn)?;
+        }
     }
+
     if let Some(command) = args.command {
         do_command(&mut conn, &mut dat_id, &command)?;
     } else {
@@ -248,13 +256,40 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, d
         }
         DataCommands::Update { dat_file } => {
             if let Some(old_dat_id) = *dat_id {
-                //ideally we would ask the user to confirm
-                match update_dat(conn, dat_file, old_dat_id) {
-                    Ok(imported) => {
-                        println!("dat file `{}` imported and updated.", imported.name);
-                        *dat_id = Some(imported.id);
+                print!("Are you sure you want to update the current dat file? (y/N): ");
+                match ask_for_confirmation() {
+                    Ok(true) => match update_dat(conn, dat_file, old_dat_id) {
+                        Ok(imported) => {
+                            println!("dat file `{}` imported and updated.", imported.name);
+                            *dat_id = Some(imported.id);
+                        }
+                        Err(e) => eprintln!("Failed to import dat file. {e}"),
+                    },
+                    Ok(false) => {},
+                    Err(e) => {
+                        eprintln!("Failed to read confirmation. {e}");
                     }
-                    Err(e) => eprintln!("Failed to import dat file. {e}"),
+                }
+            } else {
+                eprintln!("No dat file selected");
+            }
+        }
+        DataCommands::Remove => {
+            if let Some(old_dat_id) = *dat_id {
+                //ask the user to confirm
+                print!("Are you sure you want to remove the current dat file? (y/N): ");
+                match ask_for_confirmation() {
+                    Ok(true) => match delete_dat(conn, old_dat_id) {
+                        Ok(_) => {
+                            println!("dat file removed.");
+                            *dat_id = None;
+                        }
+                        Err(e) => eprintln!("Failed to remove dat file. {e}"),
+                    },
+                    Ok(false) => {},
+                    Err(e) => {
+                        eprintln!("Failed to read confirmation. {e}");
+                    }
                 }
             } else {
                 eprintln!("No dat file selected");
@@ -304,6 +339,14 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, d
             }
         }
     }
+}
+
+fn ask_for_confirmation() -> Result<bool> {
+    std::io::stdout().flush()?;
+    let mut buffer = String::new();
+    std::io::stdin().read_line(&mut buffer)?;
+    let buffer = buffer.trim();
+    Ok(buffer.eq_ignore_ascii_case("y"))
 }
 
 fn handle_file_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, files: &FileCommands) {
@@ -471,6 +514,25 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
     tx.commit()?;
 
     Ok(dat)
+}
+
+fn delete_dat(conn: &mut Connection, dat_id: db::DatId) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+
+    //remove all scanned files and directories
+    for dir in db::get_directories(&tx, dat_id, None)? {
+        db::delete_files(&tx, dir.id)?;
+    }
+    db::delete_directories(&tx, dat_id)?;
+
+    //remove all roms and sets before removing the dat
+    db::delete_roms(&tx, dat_id)?;
+    db::delete_sets(&tx, dat_id)?;
+
+    db::delete_dat(&tx, dat_id)?;
+
+    tx.commit()?;
+    Ok(())
 }
 
 fn list_dat_records(conn: &Connection, dat_id: db::DatId) -> Result<()> {

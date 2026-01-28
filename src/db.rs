@@ -296,6 +296,11 @@ pub fn insert_dat(
     })
 }
 
+pub fn delete_dat(conn: &Connection, dat_id: DatId) -> Result<bool> {
+    let num_deleted = sql_delete!(conn, "dats", where {id = dat_id.0})?;
+    Ok(num_deleted != 0)
+}
+
 const SET_FIELDS: &str = "id, dat_id, name";
 
 fn set_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SetRecord> {
@@ -337,6 +342,11 @@ pub fn insert_set(conn: &Connection, dat_id: DatId, name: &str) -> Result<SetRec
         dat_id,
         name: name.to_string(),
     })
+}
+
+pub fn delete_sets(conn: &Connection, dat_id: DatId) -> Result<usize> {
+    let num_deleted = sql_delete!(conn, "sets", where {dat_id = dat_id.0})?;
+    Ok(num_deleted)
 }
 
 const ROM_FIELDS: &str = "id, dat_id, set_id, name, size, hash";
@@ -407,6 +417,11 @@ pub fn insert_rom(
     })
 }
 
+pub fn delete_roms(conn: &Connection, dat_id: DatId) -> Result<usize> {
+    let num_deleted = sql_delete!(conn, "roms", where {dat_id = dat_id.0})?;
+    Ok(num_deleted)
+}
+
 const DIR_FIELDS: &str = "id, dat_id, path, parent_id";
 
 fn dir_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirRecord> {
@@ -465,6 +480,11 @@ pub fn update_directories(conn: &Connection, old_dat_id: DatId, new_dat_id: DatI
 pub fn delete_directory(conn: &Connection, dir_id: DirId) -> Result<bool> {
     let num_deleted = sql_delete!(conn, "dirs", where {id = dir_id.0})?;
     Ok(num_deleted != 0)
+}
+
+pub fn delete_directories(conn: &Connection, dat_id: DatId) -> Result<usize> {
+    let num_deleted = sql_delete!(conn, "dirs", where {dat_id = dat_id.0})?;
+    Ok(num_deleted)
 }
 
 const FILE_FIELDS: &str = "id, dir_id, name, size, hash, status, set_id, rom_id";
@@ -563,3 +583,4 @@ pub fn delete_files(conn: &Connection, dir_id: DirId) -> Result<usize> {
     let num_deleted = sql_delete!(conn, "files", where {dir_id = dir_id.0})?;
     Ok(num_deleted)
 }
+
