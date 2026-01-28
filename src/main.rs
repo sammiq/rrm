@@ -135,9 +135,9 @@ enum DataCommands {
     /// Show all Set and Roms in the current dat file
     Records,
     /// Search for a Set in the current dat file
-    Sets { name: String },
+    Sets { partial_name: Option<String> },
     /// Search for a Rom in the current dat file
-    Roms { name: String },
+    Roms { partial_name: Option<String> },
 }
 
 fn readline() -> Result<String> {
@@ -285,18 +285,18 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, d
                 eprintln!("No dat file selected");
             }
         }
-        DataCommands::Sets { name } => {
+        DataCommands::Sets { partial_name } => {
             if let Some(dat_id) = *dat_id {
-                if let Err(e) = find_sets_by_name(conn, dat_id, name) {
+                if let Err(e) = find_sets_by_name(conn, dat_id, partial_name.as_deref()) {
                     eprintln!("Failed to find sets. {e}");
                 }
             } else {
                 eprintln!("No dat file selected");
             }
         }
-        DataCommands::Roms { name } => {
+        DataCommands::Roms { partial_name } => {
             if let Some(dat_id) = *dat_id {
-                if let Err(e) = find_roms(conn, dat_id, name) {
+                if let Err(e) = find_roms(conn, dat_id, partial_name.as_deref()) {
                     eprintln!("Failed to find roms. {e}");
                 }
             } else {
@@ -490,25 +490,30 @@ fn list_dat_records(conn: &Connection, dat_id: db::DatId) -> Result<()> {
     Ok(())
 }
 
-fn find_sets_by_name(conn: &Connection, dat_id: db::DatId, name: &str) -> Result<()> {
-    let sets = db::get_sets_by_name(conn, dat_id, name, false)?;
+fn find_sets_by_name(conn: &Connection, dat_id: db::DatId, name: Option<&str>) -> Result<()> {
+    let sets = if let Some(name) = name {
+        db::get_sets_by_name(conn, dat_id, name, false)
+    } else {
+        db::get_sets(conn, dat_id)
+    }?;
     if sets.is_empty() {
-        println!("No sets found matching `{name}`");
+        println!("No sets found.");
     } else {
         for set in sets {
             println!("{}", set.name);
-            for rom in db::get_roms_by_set(conn, set.id)? {
-                println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
-            }
         }
     }
     Ok(())
 }
 
-fn find_roms(conn: &Connection, dat_id: db::DatId, name: &str) -> Result<()> {
-    let roms = db::get_roms_by_name(conn, dat_id, name, false)?;
+fn find_roms(conn: &Connection, dat_id: db::DatId, name: Option<&str>) -> Result<()> {
+    let roms = if let Some(name) = name {
+        db::get_roms_by_name(conn, dat_id, name, false)
+    } else {
+        db::get_roms(conn, dat_id)
+    }?;
     if roms.is_empty() {
-        println!("No roms found matching `{name}`");
+        println!("No roms found.");
     } else {
         let mut roms_by_set: BTreeMap<db::SetId, Vec<db::RomRecord>> = BTreeMap::new();
         for rom in roms {
@@ -551,7 +556,7 @@ fn scan_directory(
     incremental: bool,
     parent_id: Option<db::DirId>,
 ) -> Result<(), anyhow::Error> {
-    let (dir_id, incremental) = match db::get_directory(tx, dat_id, scan_path.as_str())? {
+    let (dir_id, incremental) = match db::get_directory_by_path(tx, dat_id, scan_path.as_str())? {
         Some(dir) => {
             if incremental {
                 // add on to existing records
@@ -619,7 +624,7 @@ fn scan_directory(
         }
     }
     for existing_path in existing_paths {
-        match db::get_directory(tx, dat_id, existing_path) {
+        match db::get_directory_by_path(tx, dat_id, existing_path) {
             Ok(dir) => {
                 if let Some(dir) = dir {
                     if let Err(e) = db::delete_files(tx, dir.id) {
@@ -652,7 +657,7 @@ fn scan_zip_file(
     incremental: bool,
     parent_id: db::DirId,
 ) -> Result<()> {
-    let maybe_dir = db::get_directory(conn, dat_id, path.as_str())?;
+    let maybe_dir = db::get_directory_by_path(conn, dat_id, path.as_str())?;
     if incremental && maybe_dir.is_some() {
         //if incremental and we have scanned this zip file before, skip it
         return Ok(());
