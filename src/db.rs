@@ -24,6 +24,35 @@ macro_rules! sql_query_one {
     (@value $field:ident) => { $field };
 }
 
+macro_rules! sql_query {
+    ($conn:expr, $table:expr, $fields:expr, where { $($where_field:ident $(= $where_value:expr)?),+ $(,)? }, order by $order:expr, $mapper:expr) => {{
+        let wheres = vec![$(concat!(stringify!($where_field), " = :", stringify!($where_field))),+].join(" AND ");
+        let sql = format!("SELECT {} FROM {} WHERE {} ORDER BY {}", $fields, $table, wheres, $order);
+
+        $conn.prepare(&sql).and_then(|mut stmt| stmt.query_map(
+            &[$(
+                (concat!(":", stringify!($where_field)), &sql_query!(@value $where_field $(= $where_value)?) as &dyn rusqlite::ToSql)
+            ),+] as &[(&str, &dyn rusqlite::ToSql)],
+            $mapper
+        ).and_then(|r| r.collect::<Result<Vec<_>, _>>()))
+    }};
+
+    ($conn:expr, $table:expr, $fields:expr, where { $($where_field:ident $(= $where_value:expr)?),+ $(,)? }, $mapper:expr) => {{
+        let wheres = vec![$(concat!(stringify!($where_field), " = :", stringify!($where_field))),+].join(" AND ");
+        let sql = format!("SELECT {} FROM {} WHERE {}", $fields, $table, wheres);
+
+        $conn.prepare(&sql).and_then(|mut stmt| stmt.query_map(
+            &[$(
+                (concat!(":", stringify!($where_field)), &sql_query!(@value $where_field $(= $where_value)?) as &dyn rusqlite::ToSql)
+            ),+] as &[(&str, &dyn rusqlite::ToSql)],
+            $mapper
+        ).and_then(|r| r.collect::<Result<Vec<_>, _>>()))
+    }};
+
+    (@value $field:ident = $value:expr) => { $value };
+    (@value $field:ident) => { $field };
+}
+
 // macro that allows an insert statement to be built from a table name and the passed data to avoid errors
 macro_rules! sql_insert {
     ($conn:expr, $table:expr, set { $($field:ident $(= $value:expr)?),+ } $(,)?) => {{
@@ -283,28 +312,20 @@ pub fn get_set(conn: &Connection, set_id: SetId) -> Result<SetRecord> {
 }
 
 pub fn get_sets(conn: &Connection, dat_id: DatId) -> Result<Vec<SetRecord>> {
-    let mut stmt = conn.prepare(format!("SELECT {SET_FIELDS} FROM sets WHERE dat_id = (?1)").as_str())?;
-    let matches = stmt
-        .query_map(params![dat_id.0], set_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let matches = sql_query!(conn, "sets", SET_FIELDS, where {dat_id = dat_id.0}, set_from_row)?;
     Ok(matches)
 }
 
 pub fn get_sets_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: bool) -> Result<Vec<SetRecord>> {
-    let (mut stmt, search_name) = if exact {
-        (
-            conn.prepare(format!("SELECT {SET_FIELDS} FROM sets WHERE dat_id = (?1) AND name = (?2)").as_str())?,
-            name.to_string(),
-        )
+    let matches = if exact {
+        sql_query!(conn, "sets", SET_FIELDS, where {dat_id = dat_id.0, name}, set_from_row)
     } else {
-        (
-            conn.prepare(format!("SELECT {SET_FIELDS} FROM sets WHERE dat_id = (?1) AND name LIKE (?2)").as_str())?,
-            format!("%{name}%"),
-        )
-    };
-    let matches = stmt
-        .query_map(params![dat_id.0, search_name], set_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt =
+            conn.prepare(format!("SELECT {SET_FIELDS} FROM sets WHERE dat_id = (?1) AND name LIKE (?2)").as_str())?;
+        stmt.query_map(params![dat_id.0, format!("%{name}%")], set_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+    }?;
+
     Ok(matches)
 }
 
@@ -340,45 +361,29 @@ pub fn get_rom(conn: &Connection, rom_id: RomId) -> Result<RomRecord> {
 }
 
 pub fn get_roms(conn: &Connection, dat_id: DatId) -> Result<Vec<RomRecord>> {
-    let mut stmt = conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1)").as_str())?;
-    let matches = stmt
-        .query_map(params![dat_id.0], rom_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let matches = sql_query!(conn, "roms", ROM_FIELDS, where {dat_id = dat_id.0}, rom_from_row)?;
     Ok(matches)
 }
 
 pub fn get_roms_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<RomRecord>> {
-    let mut stmt = conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE set_id = (?1)").as_str())?;
-    let matches = stmt
-        .query_map(params![set_id.0], rom_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let matches = sql_query!(conn, "roms", ROM_FIELDS, where {set_id = set_id.0}, rom_from_row)?;
     Ok(matches)
 }
 
 pub fn get_roms_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: bool) -> Result<Vec<RomRecord>> {
-    let (mut stmt, search_name) = if exact {
-        (
-            conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1) AND name = (?2)").as_str())?,
-            name.to_string(),
-        )
+    let matches = if exact {
+        sql_query!(conn, "roms", ROM_FIELDS, where {dat_id = dat_id.0, name}, rom_from_row)
     } else {
-        (
-            conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1) AND name LIKE (?2)").as_str())?,
-            format!("%{name}%"),
-        )
-    };
-    let matches = stmt
-        .query_map(params![dat_id.0, search_name], rom_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt =
+            conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1) AND name LIKE (?2)").as_str())?;
+        stmt.query_map(params![dat_id.0, format!("%{name}%")], rom_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+    }?;
     Ok(matches)
 }
 
 pub fn get_roms_by_hash(conn: &Connection, dat_id: DatId, hash: &str) -> Result<Vec<RomRecord>> {
-    let mut stmt =
-        conn.prepare(format!("SELECT {ROM_FIELDS} FROM roms WHERE dat_id = (?1) AND hash = (?2)").as_str())?;
-    let matches = stmt
-        .query_map(params![dat_id.0, hash], rom_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let matches = sql_query!(conn, "roms", ROM_FIELDS, where {dat_id = dat_id.0, hash}, rom_from_row)?;
     Ok(matches)
 }
 
@@ -424,25 +429,15 @@ pub fn get_directory_by_path(conn: &Connection, dat_id: DatId, path: &str) -> Re
 
 pub fn get_directories(conn: &Connection, dat_id: DatId, parent_id: Option<DirId>) -> Result<Vec<DirRecord>> {
     let matches = if let Some(parent_id) = parent_id {
-        let mut stmt = conn.prepare(
-            format!("SELECT {DIR_FIELDS} FROM dirs WHERE dat_id = (?1) AND parent_id = (?2) ORDER BY path").as_str(),
-        )?;
-        stmt.query_map(params![dat_id.0, parent_id.0], dir_from_row)?
-            .collect::<Result<Vec<_>, _>>()?
+        sql_query!(conn, "dirs", DIR_FIELDS, where {dat_id = dat_id.0, parent_id = parent_id.0}, order by "path", dir_from_row)
     } else {
-        let mut stmt =
-            conn.prepare(format!("SELECT {DIR_FIELDS} FROM dirs WHERE dat_id = (?1) ORDER BY path").as_str())?;
-        stmt.query_map(params![dat_id.0], dir_from_row)?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+        sql_query!(conn, "dirs", DIR_FIELDS, where {dat_id = dat_id.0}, order by "path", dir_from_row)
+    }?;
     Ok(matches)
 }
 
 pub fn get_directories_by_path(conn: &Connection, path: &str) -> Result<Vec<DirRecord>> {
-    let mut stmt = conn.prepare(format!("SELECT {DIR_FIELDS} FROM dirs WHERE path = (?1) ORDER BY path").as_str())?;
-    let matches = stmt
-        .query_map(params![path], dir_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let matches = sql_query!(conn, "dirs", DIR_FIELDS, where {path}, order by "path", dir_from_row)?;
     Ok(matches)
 }
 
@@ -507,14 +502,10 @@ pub fn get_files(conn: &Connection, dir_id: DirId, filter_name: Option<&str>) ->
         )?;
 
         stmt.query_map(params![dir_id.0, format!("%{}%", filter_name)], file_from_row)?
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()
     } else {
-        let mut stmt =
-            conn.prepare(format!("SELECT {FILE_FIELDS} FROM files WHERE dir_id = (?1) ORDER BY name").as_str())?;
-
-        stmt.query_map(params![dir_id.0], file_from_row)?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+        sql_query!(conn, "files", FILE_FIELDS, where {dir_id = dir_id.0}, order by "name", file_from_row)
+    }?;
     Ok(matches)
 }
 
