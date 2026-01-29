@@ -130,11 +130,13 @@ enum DataCommands {
         dat_file: Utf8PathBuf,
 
         /// don't ask for confirmation, and perform the action
+        #[arg(long)]
         yes: bool
     },
     /// remove the current dat file and all matched files
     Remove {
         /// don't ask for confirmation, and perform the action
+        #[arg(long)]
         yes: bool
     },
     /// List dat files in the system
