@@ -119,29 +119,41 @@ enum FileCommands {
 enum DataCommands {
     /// import a dat file into the system and make it the current dat file
     Import {
+        /// the path and filename of the dat file to import
         #[arg(value_hint = clap::ValueHint::FilePath)]
         dat_file: Utf8PathBuf,
     },
     /// update the current dat file with a new version and re-match files
     Update {
+        /// the path and filename of the dat file to import
         #[arg(value_hint = clap::ValueHint::FilePath)]
         dat_file: Utf8PathBuf,
+
+        /// don't ask for confirmation, and perform the action
+        yes: bool
     },
-    Remove,
+    /// remove the current dat file and all matched files
+    Remove {
+        /// don't ask for confirmation, and perform the action
+        yes: bool
+    },
     /// List dat files in the system
     List,
     /// Select the current dat file
     Select {
+        /// the index of the dat file to select, as seen in list
         index: usize,
     },
     /// Show all Set and Roms in the current dat file
     Records,
     /// Search for a Set in the current dat file
     Sets {
+        /// an optional partial name to match
         partial_name: Option<String>,
     },
     /// Search for a Rom in the current dat file
     Roms {
+        /// an optional partial name to match
         partial_name: Option<String>,
     },
 }
@@ -265,13 +277,15 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, t
                 eprintln!("`{}` is not a valid file", dat_file);
             }
         }
-        DataCommands::Update { dat_file } => {
+        DataCommands::Update { dat_file, yes } => {
             if let Some(old_dat_id) = *dat_id {
-                let confirmed = if term.tty_in {
+                let confirmed = if *yes {
+                    Ok(true)
+                } else if term.tty_in {
                     print!("Are you sure you want to update the current dat file? (y/N): ");
                     ask_for_confirmation()
                 } else {
-                    Ok(true)
+                    Ok(false)
                 };
                 match confirmed {
                     Ok(true) => match update_dat(conn, dat_file, old_dat_id) {
@@ -290,14 +304,15 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, t
                 eprintln!("No dat file selected");
             }
         }
-        DataCommands::Remove => {
+        DataCommands::Remove { yes} => {
             if let Some(old_dat_id) = *dat_id {
-                //ask the user to confirm
-                let confirmed = if term.tty_in {
-                    print!("Are you sure you want to remove the current dat file? (y/N): ");
+                let confirmed = if *yes {
+                    Ok(true)
+                } else if term.tty_in {
+                    print!("Are you sure you want to update the current dat file? (y/N): ");
                     ask_for_confirmation()
                 } else {
-                    Ok(true)
+                    Ok(false)
                 };
                 match confirmed {
                     Ok(true) => match delete_dat(conn, old_dat_id) {
@@ -786,10 +801,12 @@ fn scan_zip_file(
 
     let file = File::open(path)?;
     let mut zip = zip::ZipArchive::new(file).with_context(|| format!("could not open '{}' as a zip file", path))?;
+    let mut file_count = 0u64;
     for i in 0..zip.len() {
         match zip.by_index(i) {
             Ok(mut inner_file) => {
                 if inner_file.is_file() {
+                    file_count += 1;
                     let (hash, size) = util::calc_hash(&mut inner_file)?;
                     let name = inner_file.name();
                     process_file_matches(conn, dat_id, dir_id, size, name, &hash, &matched)?;
@@ -798,7 +815,7 @@ fn scan_zip_file(
             Err(error) => bail!("{}", error),
         }
     }
-    Ok(zip.len() as u64)
+    Ok(file_count)
 }
 
 fn match_sets<P: AsRef<Utf8Path>>(conn: &Connection, dat_id: db::DatId, path: P) -> Result<BTreeSet<db::SetId>> {
