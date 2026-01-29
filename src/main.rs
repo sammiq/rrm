@@ -747,6 +747,12 @@ fn scan_directory(
     }
 
     for existing_path in existing_paths {
+        if incremental && Utf8Path::new(&existing_path).is_dir() {
+            //if its an incremental scan and the directory still exists, don't delete
+            //the directory as they may have missed the recursive flag and we don't
+            //want to delete data unnecessarily
+            continue;
+        }
         match db::get_directory_by_path(tx, dat_id, existing_path) {
             Ok(dir) => {
                 if let Some(dir) = dir {
