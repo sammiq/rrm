@@ -309,7 +309,7 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, t
                 let confirmed = if *yes {
                     Ok(true)
                 } else if term.tty_in {
-                    print!("Are you sure you want to update the current dat file? (y/N): ");
+                    print!("Are you sure you want to remove the current dat file? (y/N): ");
                     ask_for_confirmation()
                 } else {
                     Ok(false)
