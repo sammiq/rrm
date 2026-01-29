@@ -3,8 +3,7 @@ mod util;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::BufReader;
-use std::io::Write;
+use std::io::{BufReader, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -155,6 +154,11 @@ fn readline() -> Result<String> {
     Ok(buffer)
 }
 
+struct TermInfo {
+    tty_in: bool,
+    tty_out: bool,
+}
+
 fn main() -> Result<()> {
     let data_path = util::data_dir()
         .context("could not resolve data directory for platform")?
@@ -166,10 +170,13 @@ fn main() -> Result<()> {
         let bak = data_path.join("rrm.bak");
         std::fs::copy(&db_path, &bak)?;
     }
-
     let mut conn = db::open_or_create(&db_path)?;
-
     let mut dat_id = None;
+
+    let term = TermInfo {
+        tty_in: std::io::stdin().is_terminal(),
+        tty_out: std::io::stdout().is_terminal(),
+    };
 
     let args = Args::parse();
     if let Some(index) = args.select {
@@ -179,6 +186,7 @@ fn main() -> Result<()> {
             &Commands::Data {
                 data: DataCommands::Select { index },
             },
+            &term,
         )?;
     } else {
         //default the dat to the current directory if it exists
@@ -194,17 +202,15 @@ fn main() -> Result<()> {
                 dat_id = Some(dat.id);
             } else {
                 eprintln!("No default dat file for current path.");
-                list_dat_files(&conn)?;
             }
         } else {
             eprintln!("Invalid current path, no default dat file for current path.");
-            list_dat_files(&conn)?;
         }
     }
 
     if let Some(command) = args.command {
-        do_command(&mut conn, &mut dat_id, &command)?;
-    } else {
+        do_command(&mut conn, &mut dat_id, &command, &term)?;
+    } else if term.tty_in {
         loop {
             let line = readline()?;
             let line = line.trim();
@@ -215,7 +221,7 @@ fn main() -> Result<()> {
             if let Some(args) = shlex::split(line) {
                 match Cli::try_parse_from(args) {
                     Ok(cli) => {
-                        let exit = do_command(&mut conn, &mut dat_id, &cli.command)?;
+                        let exit = do_command(&mut conn, &mut dat_id, &cli.command, &term)?;
                         if exit {
                             break;
                         }
@@ -230,16 +236,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn do_command(conn: &mut Connection, dat_id: &mut Option<db::DatId>, command: &Commands) -> Result<bool> {
+fn do_command(
+    conn: &mut Connection,
+    dat_id: &mut Option<db::DatId>,
+    command: &Commands,
+    term: &TermInfo,
+) -> Result<bool> {
     match command {
-        Commands::Data { data } => handle_data_commands(conn, dat_id, data),
-        Commands::Files { files } => handle_file_commands(conn, dat_id, files),
+        Commands::Data { data } => handle_data_commands(conn, dat_id, term, data),
+        Commands::Files { files } => handle_file_commands(conn, dat_id, term, files),
         Commands::Exit => return Ok(true),
     };
     Ok(false)
 }
 
-fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, data: &DataCommands) {
+fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, term: &TermInfo, data: &DataCommands) {
     match data {
         DataCommands::Import { dat_file } => {
             if dat_file.is_file() {
@@ -256,8 +267,13 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, d
         }
         DataCommands::Update { dat_file } => {
             if let Some(old_dat_id) = *dat_id {
-                print!("Are you sure you want to update the current dat file? (y/N): ");
-                match ask_for_confirmation() {
+                let confirmed = if term.tty_in {
+                    print!("Are you sure you want to update the current dat file? (y/N): ");
+                    ask_for_confirmation()
+                } else {
+                    Ok(true)
+                };
+                match confirmed {
                     Ok(true) => match update_dat(conn, dat_file, old_dat_id) {
                         Ok(imported) => {
                             println!("dat file `{}` imported and updated.", imported.name);
@@ -265,7 +281,7 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, d
                         }
                         Err(e) => eprintln!("Failed to import dat file. {e}"),
                     },
-                    Ok(false) => {},
+                    Ok(false) => {}
                     Err(e) => {
                         eprintln!("Failed to read confirmation. {e}");
                     }
@@ -277,8 +293,13 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, d
         DataCommands::Remove => {
             if let Some(old_dat_id) = *dat_id {
                 //ask the user to confirm
-                print!("Are you sure you want to remove the current dat file? (y/N): ");
-                match ask_for_confirmation() {
+                let confirmed = if term.tty_in {
+                    print!("Are you sure you want to remove the current dat file? (y/N): ");
+                    ask_for_confirmation()
+                } else {
+                    Ok(true)
+                };
+                match confirmed {
                     Ok(true) => match delete_dat(conn, old_dat_id) {
                         Ok(_) => {
                             println!("dat file removed.");
@@ -286,7 +307,7 @@ fn handle_data_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, d
                         }
                         Err(e) => eprintln!("Failed to remove dat file. {e}"),
                     },
-                    Ok(false) => {},
+                    Ok(false) => {}
                     Err(e) => {
                         eprintln!("Failed to read confirmation. {e}");
                     }
@@ -349,7 +370,7 @@ fn ask_for_confirmation() -> Result<bool> {
     Ok(buffer.eq_ignore_ascii_case("y"))
 }
 
-fn handle_file_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, files: &FileCommands) {
+fn handle_file_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, term: &TermInfo, files: &FileCommands) {
     if let Some(dat_id) = *dat_id {
         match files {
             FileCommands::Scan {
@@ -362,7 +383,7 @@ fn handle_file_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, f
                 if let Some(scan_path) = path.canonicalize_utf8().ok()
                     && scan_path.is_dir()
                 {
-                    match scan_files(conn, dat_id, &scan_path, exclude, *recursive, !full) {
+                    match scan_files(conn, dat_id, term, &scan_path, exclude, *recursive, !full) {
                         Ok(_) => println!("Directory `{}` scanned.", scan_path),
                         Err(e) => eprintln!("Failed to scan directory. {e}"),
                     }
@@ -371,17 +392,17 @@ fn handle_file_commands(conn: &mut Connection, dat_id: &mut Option<db::DatId>, f
                 }
             }
             FileCommands::List { mode, partial_name } => {
-                if let Err(e) = list_files(conn, dat_id, *mode, partial_name.as_deref()) {
+                if let Err(e) = list_files(conn, dat_id, term, *mode, partial_name.as_deref()) {
                     eprintln!("Failed to list files. {e}");
                 }
             }
             FileCommands::Sets { missing, partial_name } => {
-                if let Err(e) = list_sets(conn, dat_id, *missing, partial_name.as_deref()) {
+                if let Err(e) = list_sets(conn, dat_id, term, *missing, partial_name.as_deref()) {
                     eprintln!("Failed to list files. {e}");
                 }
             }
             FileCommands::Rename => {
-                if let Err(e) = rename_files(conn, dat_id) {
+                if let Err(e) = rename_files(conn, dat_id, term) {
                     eprintln!("Failed to rename files. {e}");
                 }
             }
@@ -596,6 +617,7 @@ fn find_roms(conn: &Connection, dat_id: db::DatId, name: Option<&str>) -> Result
 fn scan_files(
     conn: &mut Connection,
     dat_id: db::DatId,
+    term: &TermInfo,
     scan_path: &Utf8Path, //expect this to be canonicalized
     exclude: &[String],
     recursive: bool,
@@ -603,21 +625,33 @@ fn scan_files(
 ) -> Result<()> {
     let mut tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
 
-    scan_directory(&mut tx, dat_id, scan_path, exclude, recursive, incremental, None)?;
+    let mut file_count = 0;
+    scan_directory(&mut tx, dat_id, term, scan_path, exclude, recursive, incremental, None, &mut file_count)?;
 
     tx.commit()?;
+
+    if term.tty_out {
+        println!("{ANSI_CURSOR_START}{} files scanned.{ANSI_ERASE_TO_END}", file_count);
+    } else {
+        println!("{} files scanned.", file_count);
+    }
     Ok(())
 }
+
+const ANSI_CURSOR_START: &str = "\x1B[1000D";
+const ANSI_ERASE_TO_END: &str = "\x1B[K";
 
 fn scan_directory(
     tx: &mut Transaction,
     dat_id: db::DatId,
+    term: &TermInfo,
     scan_path: &Utf8Path,
     exclude: &[String],
     recursive: bool,
     incremental: bool,
     parent_id: Option<db::DirId>,
-) -> Result<(), anyhow::Error> {
+    file_count: &mut u64,
+) -> Result<()> {
     let (dir_id, incremental) = match db::get_directory_by_path(tx, dat_id, scan_path.as_str())? {
         Some(dir) => {
             if incremental {
@@ -646,7 +680,7 @@ fn scan_directory(
         if util::is_hidden_file(path) {
             //skip
         } else if recursive && path.is_dir() {
-            scan_directory(tx, dat_id, path, exclude, recursive, incremental, Some(dir_id))?;
+            scan_directory(tx, dat_id, term, path, exclude, recursive, incremental, Some(dir_id), file_count)?;
             existing_paths.remove(path.as_str());
         } else if path.is_file() {
             if path
@@ -659,22 +693,27 @@ fn scan_directory(
             if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
                 //for zip files we need to rollback the entire directory and files if it failed to scan properly
                 let mut sp = tx.savepoint()?;
-                if let Err(e) = scan_zip_file(&sp, dat_id, path, incremental, dir_id) {
-                    eprintln!("Failed to scan {}. Error: {e}", path);
-                    sp.rollback()?;
-                } else {
-                    sp.commit()?;
+                match scan_zip_file(&sp, dat_id, path, incremental, dir_id) {
+                    Ok(files_scanned) => {
+                        sp.commit()?;
 
-                    existing_paths.remove(path.as_str());
+                        *file_count += files_scanned;
+                        existing_paths.remove(path.as_str());
+                    }
+                    Err(e) => {
+                        sp.rollback()?;
+
+                        eprintln!("Failed to scan {}. Error: {e}", path);
+                    }
                 }
             } else {
                 match path.file_name().context("Could not get filename") {
                     Ok(filename) => {
-                        if existing_names.remove(filename) && incremental {
+                        *file_count += 1;
+                        let exists = existing_names.remove(filename);
+                        if exists && incremental {
                             //there was an existing scanned file, so skip it
-                            continue;
-                        }
-                        if let Err(e) = scan_file(tx, dat_id, dir_id, path, filename) {
+                        } else if let Err(e) = scan_file(tx, dat_id, dir_id, path, filename) {
                             eprintln!("Failed to scan {}. Error: {e}", path);
                         }
                     }
@@ -684,7 +723,12 @@ fn scan_directory(
                 }
             }
         }
+        if term.tty_out {
+            print!("{ANSI_CURSOR_START}{} files scanned.{ANSI_ERASE_TO_END}", file_count);
+            std::io::stdout().flush()?;
+        }
     }
+
     for existing_path in existing_paths {
         match db::get_directory_by_path(tx, dat_id, existing_path) {
             Ok(dir) => {
@@ -718,11 +762,11 @@ fn scan_zip_file(
     path: &Utf8Path,
     incremental: bool,
     parent_id: db::DirId,
-) -> Result<()> {
+) -> Result<u64> {
     let maybe_dir = db::get_directory_by_path(conn, dat_id, path.as_str())?;
     if incremental && maybe_dir.is_some() {
         //if incremental and we have scanned this zip file before, skip it
-        return Ok(());
+        return Ok(0);
     }
 
     let dir_id = match maybe_dir {
@@ -754,7 +798,7 @@ fn scan_zip_file(
             Err(error) => bail!("{}", error),
         }
     }
-    Ok(())
+    Ok(zip.len() as u64)
 }
 
 fn match_sets<P: AsRef<Utf8Path>>(conn: &Connection, dat_id: db::DatId, path: P) -> Result<BTreeSet<db::SetId>> {
@@ -887,29 +931,64 @@ fn should_display_file_status(status: &db::MatchStatus, mode: ListMode) -> bool 
     )
 }
 
-fn format_file_status(conn: &Connection, file: &db::FileRecord) -> Result<String> {
+fn format_file_indicator(status: &db::MatchStatus, is_tty: bool) -> &str {
+    match status {
+        db::MatchStatus::None => {
+            if is_tty {
+                "❌"
+            } else {
+                "NONE"
+            }
+        }
+        db::MatchStatus::Hash { .. } | db::MatchStatus::Name { .. } => {
+            if is_tty {
+                "⚠️"
+            } else {
+                "WARN"
+            }
+        }
+        db::MatchStatus::Match { .. } => {
+            if is_tty {
+                "✅"
+            } else {
+                " OK "
+            }
+        }
+    }
+}
+
+fn format_file_status(conn: &Connection, file: &db::FileRecord, is_tty: bool) -> Result<String> {
+    let indicator = format_file_indicator(&file.status, is_tty);
     let result = match file.status {
         db::MatchStatus::None => {
-            format!("[❌] {} {} - unknown file", file.hash, file.name)
+            format!("[{indicator}] {} {} - unknown file", file.hash, file.name)
         }
         db::MatchStatus::Hash { rom_id, .. } => {
             let rom = db::get_rom(conn, rom_id)?;
-            format!("[⚠️] {} {} - incorrect name, should be named {}", file.hash, file.name, rom.name)
+            format!("[{indicator}] {} {} - incorrect name, should be named {}", file.hash, file.name, rom.name)
         }
         db::MatchStatus::Name { rom_id, .. } => {
             let rom = db::get_rom(conn, rom_id)?;
-            format!("[⚠️] {} {} - incorrect hash, should have hash {}", file.hash, file.name, rom.hash)
+            format!(
+                "[{indicator}] {} {} - incorrect hash, should have hash {}",
+                file.hash, file.name, rom.hash
+            )
         }
         db::MatchStatus::Match { .. } => {
-            format!("[✅] {} {}", file.hash, file.name)
+            format!("[{indicator}] {} {}", file.hash, file.name)
         }
     };
     Ok(result)
 }
 
-fn list_files(conn: &mut Connection, dat_id: db::DatId, mode: ListMode, partial_name: Option<&str>) -> Result<()> {
+fn list_files(
+    conn: &mut Connection,
+    dat_id: db::DatId,
+    term: &TermInfo,
+    mode: ListMode,
+    partial_name: Option<&str>,
+) -> Result<()> {
     let dirs = db::get_directories(conn, dat_id, None)?;
-
     for dir in dirs {
         let files = db::get_files(conn, dir.id, partial_name)?;
 
@@ -920,7 +999,7 @@ fn list_files(conn: &mut Connection, dat_id: db::DatId, mode: ListMode, partial_
         let mut lines = Vec::new();
         for file in files {
             if should_display_file_status(&file.status, mode) {
-                lines.push(format_file_status(conn, &file)?);
+                lines.push(format_file_status(conn, &file, term.tty_out)?);
             }
         }
 
@@ -937,7 +1016,45 @@ fn list_files(conn: &mut Connection, dat_id: db::DatId, mode: ListMode, partial_
     Ok(())
 }
 
-fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool, partial_name: Option<&str>) -> Result<()> {
+enum SetStatus {
+    Missing,
+    Partial,
+    Complete,
+}
+
+fn format_set_indicator(status: &SetStatus, is_tty: bool) -> &str {
+    match status {
+        SetStatus::Missing => {
+            if is_tty {
+                "❌"
+            } else {
+                "NONE"
+            }
+        }
+        SetStatus::Partial => {
+            if is_tty {
+                "⚠️"
+            } else {
+                "WARN"
+            }
+        }
+        SetStatus::Complete => {
+            if is_tty {
+                "✅"
+            } else {
+                " OK "
+            }
+        }
+    }
+}
+
+fn list_sets(
+    conn: &mut Connection,
+    dat_id: db::DatId,
+    term: &TermInfo,
+    missing: bool,
+    partial_name: Option<&str>,
+) -> Result<()> {
     let dirs = db::get_directories(conn, dat_id, None)?;
 
     let mut sets_to_files: BTreeMap<db::SetId, Vec<db::FileRecord>> = BTreeMap::new();
@@ -956,6 +1073,7 @@ fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool, partial_na
     let sets = db::get_sets(conn, dat_id)?;
     if missing {
         println!("--- MISSING SETS ---");
+        let status = format_set_indicator(&SetStatus::Missing, term.tty_out);
         for set in &sets {
             if let Some(partial_name) = partial_name
                 && !set
@@ -965,11 +1083,13 @@ fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool, partial_na
             {
                 continue;
             }
-            println_if!(!sets_to_files.contains_key(&set.id), "[❌] {}", set.name);
+            println_if!(!sets_to_files.contains_key(&set.id), "[{status}] {}", set.name);
         }
         println!("{} / {} sets missing.", sets.len() - sets_to_files.len(), sets.len());
     } else {
         println!("--- FOUND SETS ---");
+        let partial_status = format_set_indicator(&SetStatus::Partial, term.tty_out);
+        let complete_status = format_set_indicator(&SetStatus::Complete, term.tty_out);
         for set in &sets {
             if let Some(partial_name) = partial_name
                 && !set
@@ -984,29 +1104,34 @@ fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool, partial_na
                 let roms = db::get_roms_by_set(conn, set.id)?;
                 let roms_by_id: BTreeMap<db::RomId, &db::RomRecord> = roms.iter().map(|rom| (rom.id, rom)).collect();
                 if files.len() == roms.len() {
-                    println!("[✅] {}", set.name);
+                    println!("[{complete_status}] {}", set.name);
                 } else {
-                    println!("[⚠️] {}, set has missing roms", set.name);
+                    println!("[{partial_status}] {}, set has missing roms", set.name);
                 }
                 for file in files {
+                    let indicator = format_file_indicator(&file.status, term.tty_out);
                     match file.status {
                         db::MatchStatus::Hash { set_id: _, rom_id } => {
-                            println!(" ⚠️  {} {}, should be named {}", file.hash, file.name, roms_by_id[&rom_id].name);
+                            println!(
+                                " {indicator}  {} {}, should be named {}",
+                                file.hash, file.name, roms_by_id[&rom_id].name
+                            );
                         }
                         db::MatchStatus::Name { set_id: _, rom_id } => {
                             println!(
-                                "  ⚠️  {} {}, should have hash {}",
+                                "  {indicator}  {} {}, should have hash {}",
                                 file.hash, file.name, roms_by_id[&rom_id].hash
                             );
                         }
                         db::MatchStatus::Match { set_id: _, rom_id: _ } => {
-                            println!(" ✅  {} {}", file.hash, file.name);
+                            println!(" {indicator}  {} {}", file.hash, file.name);
                         }
                         db::MatchStatus::None => unreachable!(),
                     }
                 }
+                let indicator = format_file_indicator(&db::MatchStatus::None, term.tty_out);
                 for rom in roms {
-                    println_if!(!found_roms.contains(&rom.id), " ❌  {} {} missing", rom.hash, rom.name);
+                    println_if!(!found_roms.contains(&rom.id), " {indicator}  {} {} missing", rom.hash, rom.name);
                 }
             }
         }
@@ -1015,7 +1140,7 @@ fn list_sets(conn: &mut Connection, dat_id: db::DatId, missing: bool, partial_na
     Ok(())
 }
 
-fn rename_files(conn: &mut Connection, dat_id: db::DatId) -> Result<()> {
+fn rename_files(conn: &mut Connection, dat_id: db::DatId, term: &TermInfo) -> Result<()> {
     let mut tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
     for directory in db::get_directories(&tx, dat_id, None)? {
         if Utf8Path::new(&directory.path)
@@ -1044,14 +1169,15 @@ fn rename_files(conn: &mut Connection, dat_id: db::DatId) -> Result<()> {
                     let old_path = path.join(name);
                     let new_path = path.join(&rom.name);
                     let mut sp = tx.savepoint()?;
-                    if let Err(e) = db::update_file(&sp, file.id, &rom.name, db::MatchStatus::Match { set_id, rom_id })
-                    {
+                    let new_status = db::MatchStatus::Match { set_id, rom_id };
+                    if let Err(e) = db::update_file(&sp, file.id, &rom.name, new_status) {
                         eprintln!("Failed to rename {old_path}. Error was {e}");
                         sp.rollback()?;
                     } else {
                         match std::fs::rename(&old_path, &new_path) {
                             Ok(_) => {
-                                println!("[✅] {} {} -> {}", file.hash, file.name, rom.name);
+                                let indicator = format_file_indicator(&new_status, term.tty_out);
+                                println!("[{indicator}] {} {} -> {}", file.hash, file.name, rom.name);
                                 sp.commit()?;
                             }
                             Err(e) => {

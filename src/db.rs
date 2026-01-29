@@ -212,7 +212,7 @@ pub struct FileRecord {
     pub status: MatchStatus,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchStatus {
     None,
     Hash { set_id: SetId, rom_id: RomId },
@@ -221,7 +221,7 @@ pub enum MatchStatus {
 }
 
 impl MatchStatus {
-    fn to_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         match self {
             Self::None => "none",
             Self::Hash { .. } => "hash",
@@ -548,7 +548,7 @@ pub fn insert_file(
         name,
         size = size.to_string(),
         hash,
-        status = status.to_str(),
+        status = status.as_str(),
         set_id,
         rom_id}
     )?;
@@ -570,7 +570,7 @@ pub fn update_file(conn: &Connection, file_id: FileId, name: &str, status: Match
     };
 
     let num_updated =
-        sql_update!(conn, "files", where {id = file_id.0}, set {name, status = status.to_str(), set_id, rom_id})?;
+        sql_update!(conn, "files", where {id = file_id.0}, set {name, status = status.as_str(), set_id, rom_id})?;
     Ok(num_updated != 0)
 }
 
