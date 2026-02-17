@@ -440,7 +440,7 @@ fn list_dat_files(conn: &Connection) -> Result<()> {
     } else {
         println!("Installed dat files:");
         for (i, dat) in dats.iter().enumerate() {
-            println!("[{i}] {} version: {} author: {}", dat.name, dat.version, dat.author);
+            println!("[{i}] {} version: {}", dat.name, dat.version);
         }
     }
     Ok(())
@@ -960,20 +960,17 @@ fn insert_file_entries(
     hash: &str,
     matched: Match
 ) -> Result<()> {
-    match matched {
+    let items = match matched {
         Match::None => {
-            db::insert_file(conn, dir_id, file_name, file_size, hash, db::MatchStatus::None)?;
+            vec![db::MatchStatus::None]
         }
-        Match::Partial(items) => {
-            for item in items {
-                db::insert_file(conn, dir_id, file_name, file_size, hash, item)?;
-            }
+        Match::Partial(items) | Match::Exact(items) => {
+            items
         }
-        Match::Exact(items) => {
-            for item in items {
-                db::insert_file(conn, dir_id, file_name, file_size, hash, item)?;
-            }
-        }
+    };
+
+    for item in items {
+        db::insert_file(conn, dir_id, file_name, file_size, hash, item)?;
     }
 
     Ok(())
