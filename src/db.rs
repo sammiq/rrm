@@ -152,10 +152,10 @@ pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
     Ok(conn)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DatId(i64);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatRecord {
     pub id: DatId,
     pub name: String,
@@ -165,20 +165,20 @@ pub struct DatRecord {
     pub hash_type: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SetId(i64);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetRecord {
     pub id: SetId,
     pub dat_id: DatId,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RomId(i64);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RomRecord {
     pub id: RomId,
     pub dat_id: DatId,
@@ -188,10 +188,10 @@ pub struct RomRecord {
     pub hash: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DirId(i64);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirRecord {
     pub id: DirId,
     pub dat_id: DatId,
@@ -199,10 +199,10 @@ pub struct DirRecord {
     pub parent_id: Option<DirId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FileId(i64);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
     pub id: FileId,
     pub dir_id: DirId,
@@ -212,7 +212,7 @@ pub struct FileRecord {
     pub status: MatchStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchStatus {
     None,
     Hash { set_id: SetId, rom_id: RomId },
@@ -234,7 +234,7 @@ impl MatchStatus {
         match self {
             Self::None => None,
             Self::Hash { set_id, rom_id } | Self::Name { set_id, rom_id } | Self::Match { set_id, rom_id } => {
-                Some((*set_id, *rom_id))
+                Some((set_id.clone(), rom_id.clone()))
             }
         }
     }
@@ -253,7 +253,7 @@ fn dat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatRecord> {
     })
 }
 
-pub fn get_dat(conn: &Connection, dat_id: DatId) -> Result<DatRecord> {
+pub fn get_dat(conn: &Connection, dat_id: &DatId) -> Result<DatRecord> {
     let record = sql_query_one!(conn, "dats", DAT_FIELDS, where {id = dat_id.0}, dat_from_row)?;
     Ok(record)
 }
@@ -311,17 +311,17 @@ fn set_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SetRecord> {
     })
 }
 
-pub fn get_set(conn: &Connection, set_id: SetId) -> Result<SetRecord> {
+pub fn get_set(conn: &Connection, set_id: &SetId) -> Result<SetRecord> {
     let record = sql_query_one!(conn, "sets", SET_FIELDS, where {id = set_id.0}, set_from_row)?;
     Ok(record)
 }
 
-pub fn get_sets(conn: &Connection, dat_id: DatId) -> Result<Vec<SetRecord>> {
+pub fn get_sets(conn: &Connection, dat_id: &DatId) -> Result<Vec<SetRecord>> {
     let matches = sql_query!(conn, "sets", SET_FIELDS, where {dat_id = dat_id.0}, set_from_row)?;
     Ok(matches)
 }
 
-pub fn get_sets_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: bool) -> Result<Vec<SetRecord>> {
+pub fn get_sets_by_name(conn: &Connection, dat_id: &DatId, name: &str, exact: bool) -> Result<Vec<SetRecord>> {
     let matches = if exact {
         sql_query!(conn, "sets", SET_FIELDS, where {dat_id = dat_id.0, name}, set_from_row)
     } else {
@@ -334,17 +334,17 @@ pub fn get_sets_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: boo
     Ok(matches)
 }
 
-pub fn insert_set(conn: &Connection, dat_id: DatId, name: &str) -> Result<SetRecord> {
+pub fn insert_set(conn: &Connection, dat_id: &DatId, name: &str) -> Result<SetRecord> {
     sql_insert!(conn, "sets", set {dat_id = dat_id.0, name})?;
     let id = conn.last_insert_rowid();
     Ok(SetRecord {
         id: SetId(id),
-        dat_id,
+        dat_id: dat_id.clone(),
         name: name.to_string(),
     })
 }
 
-pub fn delete_sets(conn: &Connection, dat_id: DatId) -> Result<usize> {
+pub fn delete_sets(conn: &Connection, dat_id: &DatId) -> Result<usize> {
     let num_deleted = sql_delete!(conn, "sets", where {dat_id = dat_id.0})?;
     Ok(num_deleted)
 }
@@ -365,22 +365,22 @@ fn rom_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RomRecord> {
     })
 }
 
-pub fn get_rom(conn: &Connection, rom_id: RomId) -> Result<RomRecord> {
+pub fn get_rom(conn: &Connection, rom_id: &RomId) -> Result<RomRecord> {
     let record = sql_query_one!(conn, "roms", ROM_FIELDS, where {id = rom_id.0}, rom_from_row)?;
     Ok(record)
 }
 
-pub fn get_roms(conn: &Connection, dat_id: DatId) -> Result<Vec<RomRecord>> {
+pub fn get_roms(conn: &Connection, dat_id: &DatId) -> Result<Vec<RomRecord>> {
     let matches = sql_query!(conn, "roms", ROM_FIELDS, where {dat_id = dat_id.0}, rom_from_row)?;
     Ok(matches)
 }
 
-pub fn get_roms_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<RomRecord>> {
+pub fn get_roms_by_set(conn: &Connection, set_id: &SetId) -> Result<Vec<RomRecord>> {
     let matches = sql_query!(conn, "roms", ROM_FIELDS, where {set_id = set_id.0}, rom_from_row)?;
     Ok(matches)
 }
 
-pub fn get_roms_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: bool) -> Result<Vec<RomRecord>> {
+pub fn get_roms_by_name(conn: &Connection, dat_id: &DatId, name: &str, exact: bool) -> Result<Vec<RomRecord>> {
     let matches = if exact {
         sql_query!(conn, "roms", ROM_FIELDS, where {dat_id = dat_id.0, name}, rom_from_row)
     } else {
@@ -392,15 +392,15 @@ pub fn get_roms_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: boo
     Ok(matches)
 }
 
-pub fn get_roms_by_hash(conn: &Connection, dat_id: DatId, hash: &str) -> Result<Vec<RomRecord>> {
+pub fn get_roms_by_hash(conn: &Connection, dat_id: &DatId, hash: &str) -> Result<Vec<RomRecord>> {
     let matches = sql_query!(conn, "roms", ROM_FIELDS, where {dat_id = dat_id.0, hash}, rom_from_row)?;
     Ok(matches)
 }
 
 pub fn insert_rom(
     conn: &Connection,
-    dat_id: DatId,
-    set_id: SetId,
+    dat_id: &DatId,
+    set_id: &SetId,
     name: &str,
     size: u64,
     hash: &str,
@@ -409,15 +409,15 @@ pub fn insert_rom(
     let id = conn.last_insert_rowid();
     Ok(RomRecord {
         id: RomId(id),
-        dat_id,
-        set_id,
+        dat_id: dat_id.clone(),
+        set_id: set_id.clone(),
         name: name.to_string(),
         size,
         hash: hash.to_string(),
     })
 }
 
-pub fn delete_roms(conn: &Connection, dat_id: DatId) -> Result<usize> {
+pub fn delete_roms(conn: &Connection, dat_id: &DatId) -> Result<usize> {
     let num_deleted = sql_delete!(conn, "roms", where {dat_id = dat_id.0})?;
     Ok(num_deleted)
 }
@@ -433,7 +433,7 @@ fn dir_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirRecord> {
     })
 }
 
-pub fn get_directory_by_path(conn: &Connection, dat_id: DatId, path: &str) -> Result<Option<DirRecord>> {
+pub fn get_directory_by_path(conn: &Connection, dat_id: &DatId, path: &str) -> Result<Option<DirRecord>> {
     match sql_query_one!(conn, "dirs", DIR_FIELDS, where {path, dat_id = dat_id.0}, dir_from_row
     ) {
         Ok(dir) => Ok(Some(dir)),
@@ -442,7 +442,7 @@ pub fn get_directory_by_path(conn: &Connection, dat_id: DatId, path: &str) -> Re
     }
 }
 
-pub fn get_directories(conn: &Connection, dat_id: DatId, parent_id: Option<DirId>) -> Result<Vec<DirRecord>> {
+pub fn get_directories(conn: &Connection, dat_id: &DatId, parent_id: Option<&DirId>) -> Result<Vec<DirRecord>> {
     let matches = if let Some(parent_id) = parent_id {
         sql_query!(conn, "dirs", DIR_FIELDS, where {dat_id = dat_id.0, parent_id = parent_id.0}, order by "path", dir_from_row)
     } else {
@@ -456,18 +456,18 @@ pub fn get_directories_by_path(conn: &Connection, path: &str) -> Result<Vec<DirR
     Ok(matches)
 }
 
-pub fn insert_directory(conn: &Connection, dat_id: DatId, path: &str, parent_id: Option<DirId>) -> Result<DirRecord> {
+pub fn insert_directory(conn: &Connection, dat_id: &DatId, path: &str, parent_id: Option<&DirId>) -> Result<DirRecord> {
     sql_insert!(conn, "dirs", set {path, dat_id = dat_id.0, parent_id = parent_id.map(|id| id.0)})?;
     let id = conn.last_insert_rowid();
     Ok(DirRecord {
         id: DirId(id),
         path: path.to_string(),
-        dat_id,
-        parent_id,
+        dat_id: dat_id.clone(),
+        parent_id: parent_id.cloned(),
     })
 }
 
-pub fn update_directories(conn: &Connection, old_dat_id: DatId, new_dat_id: DatId) -> Result<usize> {
+pub fn update_directories(conn: &Connection, old_dat_id: DatId, new_dat_id: &DatId) -> Result<usize> {
     let num_updated = sql_update!(conn, "dirs", where {
         dat_id = old_dat_id.0
     },
@@ -482,7 +482,7 @@ pub fn delete_directory(conn: &Connection, dir_id: DirId) -> Result<bool> {
     Ok(num_deleted != 0)
 }
 
-pub fn delete_directories(conn: &Connection, dat_id: DatId) -> Result<usize> {
+pub fn delete_directories(conn: &Connection, dat_id: &DatId) -> Result<usize> {
     let num_deleted = sql_delete!(conn, "dirs", where {dat_id = dat_id.0})?;
     Ok(num_deleted)
 }
@@ -515,7 +515,7 @@ fn file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
     })
 }
 
-pub fn get_files(conn: &Connection, dir_id: DirId, filter_name: Option<&str>) -> Result<Vec<FileRecord>> {
+pub fn get_files(conn: &Connection, dir_id: &DirId, filter_name: Option<&str>) -> Result<Vec<FileRecord>> {
     let matches = if let Some(filter_name) = filter_name {
         let mut stmt = conn.prepare(
             format!("SELECT {FILE_FIELDS} FROM files WHERE dir_id = (?1) AND name LIKE (?2) ORDER BY name").as_str(),
@@ -531,7 +531,7 @@ pub fn get_files(conn: &Connection, dir_id: DirId, filter_name: Option<&str>) ->
 
 pub fn insert_file(
     conn: &Connection,
-    dir_id: DirId,
+    dir_id: &DirId,
     name: &str,
     size: u64,
     hash: &str,
@@ -555,7 +555,7 @@ pub fn insert_file(
     let id = conn.last_insert_rowid();
     Ok(FileRecord {
         id: FileId(id),
-        dir_id,
+        dir_id: dir_id.clone(),
         name: name.to_string(),
         size,
         hash: hash.to_string(),
@@ -563,7 +563,7 @@ pub fn insert_file(
     })
 }
 
-pub fn update_file(conn: &Connection, file_id: FileId, name: &str, status: MatchStatus) -> Result<bool> {
+pub fn update_file(conn: &Connection, file_id: &FileId, name: &str, status: &MatchStatus) -> Result<bool> {
     let (set_id, rom_id) = match status.ids() {
         Some((set_id, rom_id)) => (Some(set_id.0), Some(rom_id.0)),
         None => (None, None),
@@ -574,13 +574,12 @@ pub fn update_file(conn: &Connection, file_id: FileId, name: &str, status: Match
     Ok(num_updated != 0)
 }
 
-pub fn delete_file(conn: &Connection, dir_id: DirId, name: &str) -> Result<bool> {
+pub fn delete_file(conn: &Connection, dir_id: &DirId, name: &str) -> Result<bool> {
     let num_deleted = sql_delete!(conn, "files", where {dir_id = dir_id.0, name})?;
     Ok(num_deleted != 0)
 }
 
-pub fn delete_files(conn: &Connection, dir_id: DirId) -> Result<usize> {
+pub fn delete_files(conn: &Connection, dir_id: &DirId) -> Result<usize> {
     let num_deleted = sql_delete!(conn, "files", where {dir_id = dir_id.0})?;
     Ok(num_deleted)
 }
-
