@@ -72,9 +72,13 @@ enum Commands {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ListMode {
+    /// list all files
     All,
+    /// list only matched files
     Matched,
+    /// list only misnamed or bad dumps
     Warning,
+    /// list only unmatched files
     Unmatched,
 }
 
@@ -436,7 +440,7 @@ fn list_dat_files(conn: &Connection) -> Result<()> {
     } else {
         println!("Installed dat files:");
         for (i, dat) in dats.iter().enumerate() {
-            println!("[{i}] {} version: {} author: {}", dat.name, dat.version, dat.author);
+            println!("[{i}] {} version: {}", dat.name, dat.version);
         }
     }
     Ok(())
@@ -464,7 +468,7 @@ fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::Dat
         db::delete_files(&tx, directory.id)?;
         for (_, file) in unique_files {
             //rematch using existing information, but link to the new dat
-            process_file_matches(&tx, imported.id, directory.id, file.size, &file.name, &file.hash, &matched_sets)?;
+            process_file_entries(&tx, imported.id, directory.id, &file.name, file.size, &file.hash, &matched_sets)?;
         }
     }
     //relink all directories to the new dat
@@ -648,9 +652,9 @@ fn scan_files(
     tx.commit()?;
 
     if term.tty_out {
-        println!("{ANSI_CURSOR_START}{} files scanned.{ANSI_ERASE_TO_END}", file_count);
+        println!("{ANSI_CURSOR_START}{} new files scanned.{ANSI_ERASE_TO_END}", file_count);
     } else {
-        println!("{} files scanned.", file_count);
+        println!("{} new files scanned.", file_count);
     }
     Ok(())
 }
@@ -658,6 +662,7 @@ fn scan_files(
 const ANSI_CURSOR_START: &str = "\x1B[1000D";
 const ANSI_ERASE_TO_END: &str = "\x1B[K";
 
+#[allow(clippy::too_many_arguments)]
 fn scan_directory(
     tx: &mut Transaction,
     dat_id: db::DatId,
@@ -710,7 +715,7 @@ fn scan_directory(
             if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
                 //for zip files we need to rollback the entire directory and files if it failed to scan properly
                 let mut sp = tx.savepoint()?;
-                match scan_zip_file(&sp, dat_id, path, incremental, dir_id) {
+                match scan_zip_file(&sp, dat_id, path, incremental, exclude, dir_id) {
                     Ok(files_scanned) => {
                         sp.commit()?;
 
@@ -726,12 +731,16 @@ fn scan_directory(
             } else {
                 match path.file_name().context("Could not get filename") {
                     Ok(filename) => {
-                        *file_count += 1;
                         let exists = existing_names.remove(filename);
                         if exists && incremental {
                             //there was an existing scanned file, so skip it
-                        } else if let Err(e) = scan_file(tx, dat_id, dir_id, path, filename) {
+                            continue;
+                        }
+
+                        if let Err(e) = scan_file(tx, dat_id, dir_id, path, filename) {
                             eprintln!("Failed to scan {}. Error: {e}", path);
+                        } else {
+                            *file_count += 1;
                         }
                     }
                     Err(e) => {
@@ -741,7 +750,7 @@ fn scan_directory(
             }
         }
         if term.tty_out {
-            print!("{ANSI_CURSOR_START}{} files scanned.{ANSI_ERASE_TO_END}", file_count);
+            print!("{ANSI_CURSOR_START}{} new files scanned.{ANSI_ERASE_TO_END}", file_count);
             std::io::stdout().flush()?;
         }
     }
@@ -784,6 +793,7 @@ fn scan_zip_file(
     dat_id: db::DatId,
     path: &Utf8Path,
     incremental: bool,
+    exclude: &[String],
     parent_id: db::DirId,
 ) -> Result<u64> {
     let maybe_dir = db::get_directory_by_path(conn, dat_id, path.as_str())?;
@@ -814,15 +824,26 @@ fn scan_zip_file(
         match zip.by_index(i) {
             Ok(mut inner_file) => {
                 if inner_file.is_file() {
+                    if Utf8Path::new(inner_file.name())
+                        .extension()
+                        .map(|ext| exclude.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+                        .unwrap_or_default()
+                    {
+                        continue;
+                    }
+
                     file_count += 1;
-                    let (hash, size) = util::calc_hash(&mut inner_file)?;
-                    let name = inner_file.name();
-                    process_file_matches(conn, dat_id, dir_id, size, name, &hash, &matched)?;
+                    let (hash, file_size) = util::calc_hash(&mut inner_file)?;
+                    process_file_entries(conn, dat_id, dir_id, inner_file.name(), file_size, &hash, &matched)?;
                 }
             }
             Err(error) => bail!("{}", error),
         }
     }
+
+    //we could be smarter here and try to infer the largest set matched
+    //and assume that the set is supposed to be that if no set was matched.
+
     Ok(file_count)
 }
 
@@ -841,7 +862,7 @@ fn scan_file(conn: &Connection, dat_id: db::DatId, dir_id: db::DirId, path: &Utf
     let mut reader = BufReader::new(&file);
     let (hash, _) = util::calc_hash(&mut reader)?;
 
-    process_file_matches(conn, dat_id, dir_id, file_size, filename, &hash, &BTreeSet::new())?;
+    process_file_entries(conn, dat_id, dir_id, filename, file_size, &hash, &BTreeSet::new())?;
     Ok(())
 }
 
@@ -854,8 +875,8 @@ enum Match {
 fn match_roms(
     conn: &Connection,
     dat_id: db::DatId,
-    file_size: u64,
     filename: &str,
+    file_size: u64,
     hash: &str,
     matched_sets: &BTreeSet<db::SetId>,
 ) -> Result<Match> {
@@ -918,29 +939,38 @@ where
     Ok(matched)
 }
 
-fn process_file_matches(
+fn process_file_entries(
     conn: &Connection,
     dat_id: db::DatId,
     dir_id: db::DirId,
+    file_name: &str,
     file_size: u64,
-    filename: &str,
     hash: &str,
     matched_sets: &BTreeSet<db::SetId>,
 ) -> Result<()> {
-    match match_roms(conn, dat_id, file_size, filename, hash, matched_sets)? {
+    let matched = match_roms(conn, dat_id, file_name, file_size, hash, matched_sets)?;
+    insert_file_entries(conn,dir_id, file_name, file_size, hash, matched)
+}
+
+fn insert_file_entries(
+    conn: &Connection,
+    dir_id: db::DirId,
+    file_name: &str,
+    file_size: u64,
+    hash: &str,
+    matched: Match
+) -> Result<()> {
+    let items = match matched {
         Match::None => {
-            db::insert_file(conn, dir_id, filename, file_size, hash, db::MatchStatus::None)?;
+            vec![db::MatchStatus::None]
         }
-        Match::Partial(items) => {
-            for item in items {
-                db::insert_file(conn, dir_id, filename, file_size, hash, item)?;
-            }
+        Match::Partial(items) | Match::Exact(items) => {
+            items
         }
-        Match::Exact(items) => {
-            for item in items {
-                db::insert_file(conn, dir_id, filename, file_size, hash, item)?;
-            }
-        }
+    };
+
+    for item in items {
+        db::insert_file(conn, dir_id, file_name, file_size, hash, item)?;
     }
 
     Ok(())
