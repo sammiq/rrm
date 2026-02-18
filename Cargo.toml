@@ -8,7 +8,7 @@ anyhow = "1.0.101"
 base16ct = { version = "1.0.0", features = ["alloc"] }
 camino = "1.2.2"
 clap = { version = "4.5.59", features = ["derive"] }
-digest = "0.11.0"
+digest = "0.10.7"
 log = { version = "0.4.29", features = ["std"] }
 roxmltree = "0.21.1"
 rusqlite = { version = "0.38.0", features = ["bundled"] }

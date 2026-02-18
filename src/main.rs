@@ -227,9 +227,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(command) = args.command {
-        if let Err(e) = do_command(&mut conn, &mut dat_id, &command, &term) {
-            eprintln!("Unable to perform command, {e}");
-        }
+        do_command(&mut conn, &mut dat_id, &command, &term)?;
     } else if term.tty_in {
         loop {
             let line = readline()?;
@@ -293,9 +291,10 @@ fn handle_data_commands(
             })
         }
         DataCommands::Update { dat_file, yes } => {
-            let old_dat_id = dat_id.take().ok_or_else(|| anyhow!("No dat file selected"))?;
+            ensure!(dat_id.is_some(), "No dat file selected");
 
             if ask_for_confirmation(term, "Are you sure you want to update the current dat file? (y/N): ", *yes)? {
+                let old_dat_id = dat_id.take().expect("Option should contain data");
                 update_dat(conn, dat_file, old_dat_id).map(|imported| {
                     println!("dat file `{}` imported and updated.", imported.name);
                     *dat_id = Some(imported.id);
@@ -304,9 +303,10 @@ fn handle_data_commands(
             Ok(())
         }
         DataCommands::Remove { yes } => {
-            let old_dat_id = dat_id.take().ok_or_else(|| anyhow!("No dat file selected"))?;
+            ensure!(dat_id.is_some(), "No dat file selected");
 
             if ask_for_confirmation(term, "Are you sure you want to remove the current dat file? (y/N): ", *yes)? {
+                let old_dat_id = dat_id.take().expect("Option should contain data");
                 delete_dat(conn, old_dat_id).map(|_| {
                     println!("dat file removed.");
                     *dat_id = None;
@@ -364,7 +364,7 @@ fn handle_file_commands(
             full,
             path,
         } => {
-            //make sure path is resolved to something absolte and proper before scanning
+            //make sure path is resolved to something absolute and proper before scanning
             let scan_path = path.canonicalize_utf8()?;
             ensure!(scan_path.is_dir(), "`{}` is not a valid directory", scan_path);
             scan_files(conn, dat_id, term, &scan_path, exclude, *recursive, !full)
@@ -1163,7 +1163,7 @@ fn rename_files(conn: &mut Connection, dat_id: &db::DatId, term: &TermInfo) -> R
                         set_id: set_id.clone(),
                         rom_id: rom_id.clone(),
                     };
-                    if let Err(e) = db::update_file(&sp, &file.id, &rom.name, &file.status) {
+                    if let Err(e) = db::update_file(&sp, &file.id, &rom.name, &new_status) {
                         eprintln!("Failed to rename {old_path}. Error was {e}");
                         sp.rollback()?;
                     } else {
