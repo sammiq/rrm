@@ -65,6 +65,7 @@ impl<T> Id<T> {
         Self(id, std::marker::PhantomData)
     }
 }
+
 pub trait HasId {
     fn id(&self) -> i64;
 }
@@ -424,7 +425,7 @@ impl Queryable for DirRecord {
             id: row.get("id")?,
             dat_id: row.get("dat_id")?,
             path: row.get("path")?,
-            parent_id: row.get::<_, Option<i64>>("parent_id")?.map(DirId::new),
+            parent_id: row.get("parent_id")?,
         })
     }
 }
@@ -727,6 +728,7 @@ pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
     ];
 
     let conn = Connection::open(db_path.as_ref())?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
     for stmt in CREATE_STATEMENTS {
         conn.execute(stmt, ())?;
