@@ -654,7 +654,7 @@ fn scan_directory(
         }
     };
 
-    let existing_dirs = db::DirRecord::get_children(tx, dat_id, Some(&dir.id))?;
+    let existing_dirs = dir.get_children(tx, dat_id)?;
     let mut existing_paths: BTreeSet<&str> = existing_dirs.iter().map(|dir| dir.path.as_str()).collect();
     let existing_files = dir.get_files(tx)?;
     let mut existing_files_by_name: BTreeMap<&str, &db::FileRecord> =

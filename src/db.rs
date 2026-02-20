@@ -57,7 +57,7 @@ macro_rules! sql_query {
 // the wrong id and causing unintended consequences. Has Traits to allow it
 // to be used in rusqlite transparently.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id<T>(i64, std::marker::PhantomData<T>);
 
 impl<T> Id<T> {
@@ -67,16 +67,11 @@ impl<T> Id<T> {
 }
 pub trait HasId {
     fn id(&self) -> i64;
-    fn ref_id(&self) -> &i64;
 }
 
 impl<T> HasId for Id<T> {
     fn id(&self) -> i64 {
         self.0
-    }
-
-    fn ref_id(&self) -> &i64 {
-        &self.0
     }
 }
 
@@ -183,8 +178,8 @@ pub trait FindableByName: Queryable {
             let mut stmt = conn.prepare(
                 format!(
                     "SELECT {} FROM {} WHERE dat_id = (?1) AND name LIKE (?2) ORDER BY name",
-                    RomRecord::fields(),
-                    RomRecord::table_name()
+                    Self::fields(),
+                    Self::table_name()
                 )
                 .as_str(),
             )?;
@@ -592,12 +587,13 @@ impl RomRecord {
 
 impl DirRecord {
     pub fn get_by_path(conn: &Connection, path: &str) -> Result<Vec<DirRecord>> {
-        let matches = sql_query!(conn, DirRecord::table_name(), DirRecord::fields(), where {path}, order by "path", DirRecord::from_row)?;
+        let matches =
+            sql_query!(conn, Self::table_name(), DirRecord::fields(), where {path}, order by "path", Self::from_row)?;
         Ok(matches)
     }
 
     pub fn get_by_dat_path(conn: &Connection, dat_id: &DatId, path: &str) -> Result<Option<DirRecord>> {
-        match sql_query_one!(conn, DirRecord::table_name(), DirRecord::fields(), where {path, dat_id = dat_id}, DirRecord::from_row
+        match sql_query_one!(conn, Self::table_name(), Self::fields(), where {path, dat_id = dat_id}, Self::from_row
         ) {
             Ok(dir) => Ok(Some(dir)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -605,12 +601,8 @@ impl DirRecord {
         }
     }
 
-    pub fn get_children(conn: &Connection, dat_id: &DatId, parent_id: Option<&DirId>) -> Result<Vec<DirRecord>> {
-        let matches = if let Some(parent_id) = parent_id {
-            sql_query!(conn, DirRecord::table_name(), DirRecord::fields(), where {dat_id = dat_id, parent_id = parent_id}, order by "path", DirRecord::from_row)
-        } else {
-            sql_query!(conn, DirRecord::table_name(), DirRecord::fields(), where {dat_id = dat_id}, order by "path", DirRecord::from_row)
-        }?;
+    pub fn get_children(&self, conn: &Connection, dat_id: &DatId) -> Result<Vec<DirRecord>> {
+        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id = dat_id, parent_id = self.id}, order by "path", Self::from_row)?;
         Ok(matches)
     }
 
@@ -676,7 +668,10 @@ impl FileRecord {
             None => (None, None),
         };
 
-        let sql = format!("UPDATE {} SET name = :name, status = :status, set_id = :set_id, rom_id = :rom_id WHERE id = :id", DirRecord::table_name());
+        let sql = format!(
+            "UPDATE {} SET name = :name, status = :status, set_id = :set_id, rom_id = :rom_id WHERE id = :id",
+            Self::table_name()
+        );
         let num_updated = conn.execute(
             &sql,
             named_params! {
