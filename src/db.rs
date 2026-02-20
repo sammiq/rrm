@@ -547,18 +547,6 @@ impl MatchStatus {
 }
 
 impl DatRecord {
-    pub fn relink(conn: &Connection, old_dat_id: DatId, new_dat_id: &DatId) -> Result<usize> {
-        let sql = format!("UPDATE {} SET dat_id = :new_dat_id WHERE dat_id = :old_dat_id", DirRecord::table_name());
-        let num_updated = conn.execute(
-            &sql,
-            named_params! {
-                ":new_dat_id": new_dat_id.id(),
-                ":old_dat_id": old_dat_id.id(),
-            },
-        )?;
-        Ok(num_updated)
-    }
-
     pub fn get_sets(&self, conn: &Connection) -> Result<Vec<SetRecord>> {
         SetRecord::get_by_dat(conn, &self.id)
     }
@@ -574,14 +562,19 @@ impl DatRecord {
 
 impl SetRecord {
     pub fn get_roms(&self, conn: &Connection) -> Result<Vec<RomRecord>> {
-        let matches = sql_query!(conn, RomRecord::table_name(), RomRecord::fields(), where {set_id = self.id}, RomRecord::from_row)?;
-        Ok(matches)
+        RomRecord::get_by_set(conn, &self.id)
     }
 }
 
 impl RomRecord {
+    fn get_by_set(conn: &Connection, set_id: &SetId) -> Result<Vec<Self>> {
+        let matches =
+            sql_query!(conn, Self::table_name(), Self::fields(), where {set_id}, Self::from_row)?;
+        Ok(matches)
+    }
+
     pub fn get_by_hash(conn: &Connection, dat_id: &DatId, hash: &str) -> Result<Vec<RomRecord>> {
-        let matches = sql_query!(conn, RomRecord::table_name(), RomRecord::fields(), where {dat_id = dat_id, hash}, RomRecord::from_row)?;
+        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id, hash}, Self::from_row)?;
         Ok(matches)
     }
 }
@@ -594,7 +587,7 @@ impl DirRecord {
     }
 
     pub fn get_by_dat_path(conn: &Connection, dat_id: &DatId, path: &str) -> Result<Option<DirRecord>> {
-        match sql_query_one!(conn, Self::table_name(), Self::fields(), where {path, dat_id = dat_id}, Self::from_row
+        match sql_query_one!(conn, Self::table_name(), Self::fields(), where {path, dat_id}, Self::from_row
         ) {
             Ok(dir) => Ok(Some(dir)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -603,42 +596,37 @@ impl DirRecord {
     }
 
     pub fn get_children(&self, conn: &Connection, dat_id: &DatId) -> Result<Vec<DirRecord>> {
-        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id = dat_id, parent_id = self.id}, order by "path", Self::from_row)?;
+        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id, parent_id = self.id}, order by "path", Self::from_row)?;
         Ok(matches)
     }
 
     pub fn get_files(&self, conn: &Connection) -> Result<Vec<FileRecord>> {
-        let matches = sql_query!(conn, FileRecord::table_name(), FileRecord::fields(), where {dir_id = self.id}, order by "name", FileRecord::from_row)?;
-        Ok(matches)
+        FileRecord::get_by_dir(conn, &self.id)
     }
 
     pub fn find_files(&self, conn: &Connection, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
-        let matches = if exact {
-            sql_query!(conn, FileRecord::table_name(), FileRecord::fields(), where {dir_id = self.id, name}, order by "name", FileRecord::from_row)
-        } else {
-            let mut stmt = conn.prepare(
-                format!(
-                    "SELECT {} FROM {} WHERE dir_id = (?1) AND name LIKE (?2) ORDER BY name",
-                    FileRecord::fields(),
-                    FileRecord::table_name()
-                )
-                .as_str(),
-            )?;
-
-            stmt.query_map(params![self.id, format!("%{}%", name)], FileRecord::from_row)?
-                .collect::<Result<Vec<_>, _>>()
-        }?;
-        Ok(matches)
+        FileRecord::find_by_name(conn, &self.id, name, exact)
     }
 
     pub fn delete_files(&self, conn: &Connection) -> Result<usize> {
-        let sql = format!("DELETE FROM {} WHERE dir_id = :dir_id", FileRecord::table_name());
-        let num_deleted = conn.execute(&sql, named_params! {":dir_id": self.id})?;
-        Ok(num_deleted)
+        FileRecord::delete_files(conn, &self.id)
+    }
+
+    pub fn relink_dirs(conn: &Connection, old_dat_id: DatId, new_dat_id: &DatId) -> Result<usize> {
+        let sql = format!("UPDATE {} SET dat_id = :new_dat_id WHERE dat_id = :old_dat_id", Self::table_name());
+        let num_updated = conn.execute(
+            &sql,
+            named_params! {
+                ":new_dat_id": new_dat_id.id(),
+                ":old_dat_id": old_dat_id.id(),
+            },
+        )?;
+        Ok(num_updated)
     }
 }
 
 impl FileRecord {
+    //manual implentation due to complexity in mapping MatchStatus
     pub fn insert(conn: &Connection, new: &NewFile) -> Result<Self> {
         let (set_id, rom_id) = match new.status.ids() {
             Some((set_id, rom_id)) => (Some(set_id), Some(rom_id)),
@@ -661,6 +649,37 @@ impl FileRecord {
         conn.execute(&sql, params)?;
         let id = conn.last_insert_rowid();
         Self::get_by_id(conn, &FileId::from(id))
+    }
+
+    fn get_by_dir(conn: &Connection, dir_id: &DirId) -> Result<Vec<Self>> {
+        let matches =
+            sql_query!(conn, Self::table_name(), Self::fields(), where {dir_id}, order by "name", Self::from_row)?;
+        Ok(matches)
+    }
+
+    pub fn find_by_name(conn: &Connection, dir_id: &DirId, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
+        let matches = if exact {
+            sql_query!(conn, Self::table_name(), FileRecord::fields(), where {dir_id, name}, order by "name", Self::from_row)
+        } else {
+            let mut stmt = conn.prepare(
+                format!(
+                    "SELECT {} FROM {} WHERE dir_id = (?1) AND name LIKE (?2) ORDER BY name",
+                    Self::fields(),
+                    Self::table_name()
+                )
+                .as_str(),
+            )?;
+
+            stmt.query_map(params![dir_id, format!("%{}%", name)], FileRecord::from_row)?
+                .collect::<Result<Vec<_>, _>>()
+        }?;
+        Ok(matches)
+    }
+
+    pub fn delete_files(conn: &Connection, dir_id: &DirId) -> Result<usize> {
+        let sql = format!("DELETE FROM {} WHERE dir_id = :dir_id", Self::table_name());
+        let num_deleted = conn.execute(&sql, named_params! {":dir_id": dir_id})?;
+        Ok(num_deleted)
     }
 
     pub fn update(&self, conn: &Connection, name: &str, status: &MatchStatus) -> Result<Self> {

@@ -211,9 +211,9 @@ fn main() -> Result<()> {
     } else {
         //default the dat to the current directory if it exists
         if let Some(current_path) = std::env::current_dir()
+            .and_then(|path| path.canonicalize())
             .ok()
-            .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
-            .and_then(|path| path.canonicalize_utf8().ok())
+            .and_then(|path| Utf8PathBuf::try_from(path).ok())
         {
             let paths = db::DirRecord::get_by_path(&conn, current_path.as_str())?;
             if !paths.is_empty() {
@@ -417,8 +417,9 @@ fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::Dat
             process_file_entries(&tx, &imported.id, &directory.id, &file.name, file.size, &file.hash, &matched_sets)?;
         }
     }
+
     //relink all directories to the new dat
-    db::DatRecord::relink(&tx, old_dat_id, &imported.id)?;
+    db::DirRecord::relink_dirs(&tx, old_dat_id, &imported.id)?;
 
     tx.commit()?;
     Ok(imported)
