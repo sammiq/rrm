@@ -148,7 +148,7 @@ pub trait Queryable: Sized {
 pub trait Deletable: Queryable {
     // move the id as we are removing the record so the id will no longer
     // be valid and we want to avoid accidentally using it after deletion
-    fn delete(conn: &Connection, id: Self::IdType) -> Result<bool> {
+    fn delete_by_id(conn: &Connection, id: &Self::IdType) -> Result<bool> {
         let sql = format!("DELETE FROM {} WHERE id = :id", Self::table_name());
         let num_deleted = conn.execute(&sql, named_params! {":id": id.id()})?;
         Ok(num_deleted != 0)
