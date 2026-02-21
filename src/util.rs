@@ -14,7 +14,7 @@ pub fn data_dir() -> Option<Utf8PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn env_to_path(env_var: &str) -> Option<Utf8PathBuf> {
     std::env::var_os(env_var).and_then(|opath| {
-        Utf8PathBuf::from_os_string(opath)
+        Utf8PathBuf::try_from(opath)
             .ok()
             .and_then(|path| path.canonicalize_utf8().ok())
     })
@@ -23,7 +23,7 @@ fn env_to_path(env_var: &str) -> Option<Utf8PathBuf> {
 #[cfg(unix)]
 fn home_path(dirname: &str) -> Option<Utf8PathBuf> {
     std::env::home_dir()
-        .and_then(|home| Utf8PathBuf::from_path_buf(home).ok())
+        .and_then(|home| Utf8PathBuf::try_from(home).ok())
         .map(|home| home.join(dirname))
 }
 
