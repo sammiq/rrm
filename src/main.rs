@@ -408,8 +408,7 @@ fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::Dat
             BTreeSet::new()
         };
         let dir_files = directory.get_files(&tx)?;
-        let unique_files: BTreeMap<&str, &db::FileRecord> =
-            dir_files.iter().map(|file| (file.name.as_str(), file)).collect();
+        let unique_files: BTreeMap<_, _> = dir_files.iter().map(|file| (file.name.as_str(), file)).collect();
         //delete all the old files in the directory
         directory.delete_files(&tx)?;
         for (_, file) in unique_files {
@@ -575,16 +574,19 @@ fn find_roms(conn: &Connection, dat_id: &db::DatId, name: Option<&str>) -> Resul
     if roms.is_empty() {
         println!("No roms found.");
     } else {
-        let mut roms_by_set: BTreeMap<db::SetId, Vec<db::RomRecord>> = BTreeMap::new();
-        for rom in roms {
-            roms_by_set.entry(rom.set_id.clone()).or_default().push(rom);
-        }
+        let mut roms_by_set: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        roms.iter()
+            .for_each(|rom| roms_by_set.entry(&rom.set_id).or_default().push(rom));
+
+        let all_sets = db::SetRecord::get_by_dat(conn, dat_id)?;
+        let sets_by_id: BTreeMap<_, _> = all_sets.iter().map(|s| (&s.id, s)).collect();
 
         for (set_id, roms) in roms_by_set {
-            let set = db::SetRecord::get_by_id(conn, &set_id)?;
-            println!("{}", set.name);
-            for roms in roms {
-                println!("    {} {} - {}", roms.hash, roms.name, util::human_size(roms.size));
+            if let Some(set) = sets_by_id.get(&set_id) {
+                println!("{}", set.name);
+                for rom in roms {
+                    println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
+                }
             }
         }
     }
@@ -655,10 +657,10 @@ fn scan_directory(
         }
     };
 
-    let existing_dirs = dir.get_children(tx, dat_id)?;
+    let existing_dirs = dir.get_children(tx)?;
     let mut existing_paths: BTreeSet<&str> = existing_dirs.iter().map(|dir| dir.path.as_str()).collect();
     let existing_files = dir.get_files(tx)?;
-    let mut existing_files_by_name: BTreeMap<&str, &db::FileRecord> =
+    let mut existing_files_by_name: BTreeMap<_, _> =
         existing_files.iter().map(|file| (file.name.as_str(), file)).collect();
 
     for entry in scan_path.read_dir_utf8()? {
@@ -949,7 +951,7 @@ fn insert_file_entries(
                 name: file_name.to_string(),
                 size: db::SizeWrapper(file_size),
                 hash: hash.to_string(),
-                status: item.clone(),
+                status: item,
             },
         )?;
     }
@@ -1094,7 +1096,7 @@ fn list_sets(
 ) -> Result<()> {
     let dirs = db::DirRecord::get_by_dat(conn, dat_id)?;
 
-    let mut sets_to_files: BTreeMap<db::SetId, Vec<db::FileRecord>> = BTreeMap::new();
+    let mut sets_to_files: BTreeMap<_, Vec<_>> = BTreeMap::new();
     let mut found_roms: BTreeSet<db::RomId> = BTreeSet::new();
 
     for dir in dirs {
@@ -1107,11 +1109,11 @@ fn list_sets(
         }
     }
 
-    let sets = db::SetRecord::get_by_dat(conn, dat_id)?;
+    let all_sets = db::SetRecord::get_by_dat(conn, dat_id)?;
     if missing {
         println!("--- MISSING SETS ---");
         let status = format_set_indicator(&SetStatus::Missing, term.tty_out);
-        for set in &sets {
+        for set in &all_sets {
             if let Some(partial_name) = partial_name
                 && !set
                     .name
@@ -1122,12 +1124,18 @@ fn list_sets(
             }
             println_if!(!sets_to_files.contains_key(&set.id), "[{status}] {}", set.name);
         }
-        println!("{} / {} sets missing.", sets.len() - sets_to_files.len(), sets.len());
+        println!("{} / {} sets missing.", all_sets.len() - sets_to_files.len(), all_sets.len());
     } else {
+        let all_roms = db::RomRecord::get_by_dat(conn, dat_id)?;
+        let mut roms_by_set: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        all_roms
+            .iter()
+            .for_each(|rom| roms_by_set.entry(&rom.set_id).or_default().push(rom));
+
         println!("--- FOUND SETS ---");
         let partial_status = format_set_indicator(&SetStatus::Partial, term.tty_out);
         let complete_status = format_set_indicator(&SetStatus::Complete, term.tty_out);
-        for set in &sets {
+        for set in &all_sets {
             if let Some(partial_name) = partial_name
                 && !set
                     .name
@@ -1137,9 +1145,10 @@ fn list_sets(
                 continue;
             }
 
-            if let Some(files) = sets_to_files.get(&set.id) {
-                let roms = set.get_roms(conn)?;
-                let roms_by_id: BTreeMap<&db::RomId, &db::RomRecord> = roms.iter().map(|rom| (&rom.id, rom)).collect();
+            if let Some(files) = sets_to_files.get(&set.id)
+                && let Some(roms) = roms_by_set.get(&set.id)
+            {
+                let roms_by_id: BTreeMap<_, _> = roms.iter().map(|&rom| (&rom.id, rom)).collect();
                 if files.len() == roms.len() {
                     println!("[{complete_status}] {}", set.name);
                 } else {
@@ -1172,7 +1181,7 @@ fn list_sets(
                 }
             }
         }
-        println!("{} / {} sets found.", sets_to_files.len(), sets.len());
+        println!("{} / {} sets found.", sets_to_files.len(), all_sets.len());
     }
     Ok(())
 }

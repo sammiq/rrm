@@ -595,8 +595,8 @@ impl DirRecord {
         }
     }
 
-    pub fn get_children(&self, conn: &Connection, dat_id: &DatId) -> Result<Vec<DirRecord>> {
-        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id, parent_id = self.id}, order by "path", Self::from_row)?;
+    pub fn get_children(&self, conn: &Connection) -> Result<Vec<DirRecord>> {
+        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {parent_id = self.id}, order by "path", Self::from_row)?;
         Ok(matches)
     }
 
