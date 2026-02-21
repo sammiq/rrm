@@ -418,9 +418,13 @@ fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::Dat
     }
 
     //relink all directories to the new dat
-    db::DirRecord::relink_dirs(&tx, old_dat_id, &imported.id)?;
+    db::DirRecord::relink_dirs(&tx, &old_dat_id, &imported.id)?;
 
     tx.commit()?;
+
+    //if we successfully updated everything and relinked and the transaction completed, we can now delete the old dat
+    delete_dat(conn, old_dat_id)?;
+
     Ok(imported)
 }
 
@@ -747,8 +751,6 @@ fn scan_directory(
     }
     for (_, existing_files) in existing_files_by_name {
         for existing_file in existing_files {
-            // this is messy as we have the source data in a vector but delete wants to dispose of the id,
-            // so we need to clone here as we are using the reference and not the value.
             if let Err(e) = db::FileRecord::delete_by_id(tx, &existing_file.id) {
                 eprintln!("Failed to remove {}. Error: {e}", existing_file.name);
             }
