@@ -393,9 +393,9 @@ fn list_dat_files(conn: &Connection) -> Result<()> {
 }
 
 fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) -> Result<db::DatRecord> {
-    let imported = import_dat(conn, dat_file)?;
-
     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+
+    let imported = parse_dat_file(&tx, dat_file)?;
 
     for directory in db::DirRecord::get_by_dat(&tx, &old_dat_id)? {
         //check if its a zip file, if so, restrict matches to set name if matched
@@ -425,7 +425,13 @@ fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::Dat
 }
 
 fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result<db::DatRecord> {
-    //TODO check whether name named item exists
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let dat = parse_dat_file(&tx, file_path)?;
+    tx.commit()?;
+    Ok(dat)
+}
+
+fn parse_dat_file<P: AsRef<Utf8Path>>(conn: &Connection, file_path: P) -> Result<db::DatRecord> {
     let df_buffer = std::fs::read_to_string(file_path.as_ref()).context("Unable to read reference dat file")?;
     let df_xml = Document::parse_with_options(
         df_buffer.as_str(),
@@ -435,9 +441,6 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
         },
     )
     .context("Unable to parse reference dat file")?;
-
-    //find header get the mandatory fields, according to
-    // https://github.com/Logiqx/logiqx-dev/blob/master/DatLib/datafile.dtd
     let mut name = None;
     let mut description = None;
     let mut version = None;
@@ -457,9 +460,6 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
             _ => {}
         };
     }
-
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-
     let new_dat = db::NewDat {
         name: name.context("unable to find name attribute in header")?.to_string(),
         description: description
@@ -471,9 +471,7 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
         author: author.context("unable to find author attribute in header")?.to_string(),
         hash_type: "sha1".to_string(),
     };
-
-    let dat = db::DatRecord::insert(&tx, &new_dat)?;
-
+    let dat = db::DatRecord::insert(conn, &new_dat)?;
     for game_node in df_xml
         .root_element()
         .children()
@@ -484,7 +482,7 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
             .context("Unable to read game name in reference dat file")?;
 
         let set = db::SetRecord::insert(
-            &tx,
+            conn,
             &db::NewSet {
                 dat_id: dat.id.clone(),
                 name: game_name.to_string(),
@@ -496,7 +494,7 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
             let rom_size = rom_node.attribute(ATTR_ROM_SIZE).context("Unable to read game size")?;
             let rom_hash = rom_node.attribute(ATTR_ROM_HASH).context("Unable to read game hash")?;
             db::RomRecord::insert(
-                &tx,
+                conn,
                 &db::NewRom {
                     dat_id: dat.id.clone(),
                     set_id: set.id.clone(),
@@ -507,9 +505,6 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
             )?;
         }
     }
-
-    tx.commit()?;
-
     Ok(dat)
 }
 
@@ -526,7 +521,7 @@ fn delete_dat(conn: &mut Connection, dat_id: db::DatId) -> Result<()> {
     db::RomRecord::delete_by_dat(&tx, &dat_id)?;
     db::SetRecord::delete_by_dat(&tx, &dat_id)?;
 
-    db::DatRecord::delete(&tx, dat_id)?;
+    db::DatRecord::delete_by_id(&tx, &dat_id)?;
 
     tx.commit()?;
     Ok(())
@@ -660,8 +655,11 @@ fn scan_directory(
     let existing_dirs = dir.get_children(tx)?;
     let mut existing_paths: BTreeSet<&str> = existing_dirs.iter().map(|dir| dir.path.as_str()).collect();
     let existing_files = dir.get_files(tx)?;
-    let mut existing_files_by_name: BTreeMap<_, _> =
-        existing_files.iter().map(|file| (file.name.as_str(), file)).collect();
+    //there may be multiple matches per filename as the hash might match multiple roms
+    let mut existing_files_by_name: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    existing_files
+        .iter()
+        .for_each(|file| existing_files_by_name.entry(file.name.as_str()).or_default().push(file));
 
     for entry in scan_path.read_dir_utf8()? {
         let entry = entry?;
@@ -735,7 +733,7 @@ fn scan_directory(
                     if let Err(e) = dir.delete_files(tx) {
                         eprintln!("Failed to delete files in {}. Error: {e}", existing_path);
                     }
-                    if let Err(e) = db::DirRecord::delete(tx, dir.id) {
+                    if let Err(e) = db::DirRecord::delete_by_id(tx, &dir.id) {
                         eprintln!("Failed to delete directory {}. Error: {e}", existing_path);
                     }
                 } else {
@@ -747,11 +745,13 @@ fn scan_directory(
             }
         }
     }
-    for (_, existing_file) in existing_files_by_name {
-        // this is messy as we have the source data in a vector but delete wants to dispose of the id,
-        // so we need to clone here as we are using the reference and not the value.
-        if let Err(e) = db::FileRecord::delete(tx, existing_file.id.clone()) {
-            eprintln!("Failed to remove {}. Error: {e}", existing_file.name);
+    for (_, existing_files) in existing_files_by_name {
+        for existing_file in existing_files {
+            // this is messy as we have the source data in a vector but delete wants to dispose of the id,
+            // so we need to clone here as we are using the reference and not the value.
+            if let Err(e) = db::FileRecord::delete_by_id(tx, &existing_file.id) {
+                eprintln!("Failed to remove {}. Error: {e}", existing_file.name);
+            }
         }
     }
     Ok(())
