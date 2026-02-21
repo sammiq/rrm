@@ -146,8 +146,6 @@ pub trait Queryable: Sized {
 }
 
 pub trait Deletable: Queryable {
-    // move the id as we are removing the record so the id will no longer
-    // be valid and we want to avoid accidentally using it after deletion
     fn delete_by_id(conn: &Connection, id: &Self::IdType) -> Result<bool> {
         let sql = format!("DELETE FROM {} WHERE id = :id", Self::table_name());
         let num_deleted = conn.execute(&sql, named_params! {":id": id.id()})?;
@@ -612,7 +610,7 @@ impl DirRecord {
         FileRecord::delete_files(conn, &self.id)
     }
 
-    pub fn relink_dirs(conn: &Connection, old_dat_id: DatId, new_dat_id: &DatId) -> Result<usize> {
+    pub fn relink_dirs(conn: &Connection, old_dat_id: &DatId, new_dat_id: &DatId) -> Result<usize> {
         let sql = format!("UPDATE {} SET dat_id = :new_dat_id WHERE dat_id = :old_dat_id", Self::table_name());
         let num_updated = conn.execute(
             &sql,
