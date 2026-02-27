@@ -849,9 +849,14 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_matches_rom_id ON matches(rom_id);
             CREATE INDEX IF NOT EXISTS idx_matches_dat_id ON matches(dat_id);
 
+            CREATE TEMP TABLE id_map AS
+                SELECT f.id AS old_id, MIN(f.id) OVER (PARTITION BY f.dir_id, f.name) AS new_id
+                FROM files f
+
             INSERT INTO matches (file_id, set_id, rom_id, status, dat_id)
-                SELECT f.id, f.set_id, f.rom_id, f.status, s.dat_id FROM files f
+                SELECT i.new_id, f.set_id, f.rom_id, f.status, s.dat_id FROM files f
                 JOIN sets s ON f.set_id = s.id
+                JOIN id_map i ON f.id = i.old_id
                 WHERE f.status != 'none';
 
             CREATE TABLE IF NOT EXISTS files_new (
@@ -867,8 +872,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             );
 
             INSERT INTO files_new (id, dat_id, dir_id, name, size, hash)
-                SELECT DISTINCT f.id, d.dat_id, f.dir_id, f.name, f.size, f.hash FROM files f
-                JOIN dirs d ON f.dir_id = d.id;
+                SELECT MIN(f.id), d.dat_id, f.dir_id, f.name, f.size, f.hash FROM files f
+                JOIN dirs d ON f.dir_id = d.id
+                GROUP BY f.dir_id, f.name;
 
             DROP TABLE files;
 
