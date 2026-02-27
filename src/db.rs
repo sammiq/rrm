@@ -851,7 +851,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
             CREATE TEMP TABLE id_map AS
                 SELECT f.id AS old_id, MIN(f.id) OVER (PARTITION BY f.dir_id, f.name) AS new_id
-                FROM files f
+                FROM files f;
 
             INSERT INTO matches (file_id, set_id, rom_id, status, dat_id)
                 SELECT i.new_id, f.set_id, f.rom_id, f.status, s.dat_id FROM files f
