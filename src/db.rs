@@ -284,6 +284,7 @@ pub type SetId = Id<SetRecord>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SetRecord {
     pub id: SetId,
+
     pub dat_id: DatId,
     pub name: String,
 }
@@ -337,7 +338,9 @@ pub type RomId = Id<RomRecord>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RomRecord {
     pub id: RomId,
-    pub dat_id: DatId,
+
+    pub dat_id: DatId, //denormalized to avoid N+1 queries
+
     pub set_id: SetId,
     pub name: String,
     pub size: u64,
@@ -373,7 +376,8 @@ impl FindableByName for RomRecord {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NewRom {
-    pub dat_id: DatId,
+    pub dat_id: DatId, //denormalized to avoid N+1 queries
+
     pub set_id: SetId,
     pub name: String,
     pub size: SizeWrapper,
@@ -402,6 +406,7 @@ pub type DirId = Id<DirRecord>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DirRecord {
     pub id: DirId,
+
     pub dat_id: DatId,
     pub path: String,
     pub parent_id: Option<DirId>,
@@ -459,11 +464,13 @@ pub type FileId = Id<FileRecord>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileRecord {
     pub id: FileId,
+
+    pub dat_id: DatId, //denormalized to avoid N+1 queries
+
     pub dir_id: DirId,
     pub name: String,
     pub size: u64,
     pub hash: String,
-    pub status: MatchStatus,
 }
 
 impl Queryable for FileRecord {
@@ -474,73 +481,148 @@ impl Queryable for FileRecord {
     }
 
     fn fields() -> &'static str {
-        "id, dir_id, name, size, hash, status, set_id, rom_id"
+        "id, dat_id, dir_id, name, size, hash"
     }
 
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        let status = match row.get::<_, String>("status")?.as_ref() {
-            "hash" => MatchStatus::Hash {
-                set_id: row.get("set_id")?,
-                rom_id: row.get("rom_id")?,
-            },
-            "name" => MatchStatus::Name {
-                set_id: row.get("set_id")?,
-                rom_id: row.get("rom_id")?,
-            },
-            "match" => MatchStatus::Match {
-                set_id: row.get("set_id")?,
-                rom_id: row.get("rom_id")?,
-            },
-            _ => MatchStatus::None,
-        };
         Ok(FileRecord {
             id: row.get("id")?,
+            dat_id: row.get("dat_id")?,
             dir_id: row.get("dir_id")?,
             name: row.get("name")?,
             size: row.get::<_, SizeWrapper>("size")?.0,
             hash: row.get("hash")?,
-            status,
         })
     }
 }
 
 impl Deletable for FileRecord {}
+impl QueryableByDat for FileRecord {}
+impl DeletableByDat for FileRecord {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NewFile {
+    pub dat_id: DatId, //denormalized to avoid N+1 queries
+
     pub dir_id: DirId,
     pub name: String,
     pub size: SizeWrapper,
     pub hash: String,
-    // cannot make this bindable as it maps to multiple columns and the values depend on the match status
+}
+
+impl Bindable for NewFile {
+    fn bind_params(&self) -> Vec<(&'static str, &dyn rusqlite::ToSql)> {
+        named_params! {
+            ":dat_id": self.dat_id,
+            ":dir_id": self.dir_id,
+            ":name": self.name,
+            ":size": self.size,
+            ":hash": self.hash,
+        }
+        .to_vec()
+    }
+}
+
+impl Insertable for FileRecord {
+    type NewType = NewFile;
+}
+
+pub type MatchId = Id<MatchRecord>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MatchRecord {
+    pub id: MatchId,
+    pub dat_id: DatId, //denormalized to avoid N+1 queries
+
+    pub file_id: FileId,
     pub status: MatchStatus,
+    pub set_id: SetId,
+    pub rom_id: RomId,
+}
+
+impl Queryable for MatchRecord {
+    type IdType = MatchId;
+
+    fn table_name() -> &'static str {
+        "matches"
+    }
+
+    fn fields() -> &'static str {
+        "id, dat_id, file_id, status, set_id, rom_id"
+    }
+
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(MatchRecord {
+            id: row.get("id")?,
+            dat_id: row.get("dat_id")?,
+            file_id: row.get("file_id")?,
+
+            status: row.get("status")?,
+            set_id: row.get("set_id")?,
+            rom_id: row.get("rom_id")?,
+        })
+    }
+}
+
+impl Deletable for MatchRecord {}
+impl QueryableByDat for MatchRecord {}
+impl DeletableByDat for MatchRecord {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NewMatch {
+    pub dat_id: DatId, //denormalized to avoid N+1 queries
+
+    pub file_id: FileId,
+    pub status: MatchStatus,
+    pub set_id: SetId,
+    pub rom_id: RomId,
+}
+
+impl Bindable for NewMatch {
+    fn bind_params(&self) -> Vec<(&'static str, &dyn rusqlite::ToSql)> {
+        named_params! {
+            ":dat_id": self.dat_id,
+            ":file_id": self.file_id,
+
+            ":status": self.status,
+            ":set_id": self.set_id,
+            ":rom_id": self.rom_id,
+        }
+        .to_vec()
+    }
+}
+
+impl Insertable for MatchRecord {
+    type NewType = NewMatch;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MatchStatus {
-    None,
-    Hash { set_id: SetId, rom_id: RomId },
-    Name { set_id: SetId, rom_id: RomId },
-    Match { set_id: SetId, rom_id: RomId },
+    Hash,
+    Name,
+    Match,
 }
 
-impl MatchStatus {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::None => "none",
-            Self::Hash { .. } => "hash",
-            Self::Name { .. } => "name",
-            Self::Match { .. } => "match",
-        }
+impl rusqlite::types::FromSql for MatchStatus {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        value.as_str().and_then(|s| match s {
+            "hash" => Ok(MatchStatus::Hash),
+            "name" => Ok(MatchStatus::Name),
+            "match" => Ok(MatchStatus::Match),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
+        })
     }
+}
 
-    pub fn ids(&self) -> Option<(SetId, RomId)> {
-        match self {
-            Self::None => None,
-            Self::Hash { set_id, rom_id } | Self::Name { set_id, rom_id } | Self::Match { set_id, rom_id } => {
-                Some((set_id.clone(), rom_id.clone()))
-            }
-        }
+impl rusqlite::ToSql for MatchStatus {
+    #[inline]
+    fn to_sql(&self) -> Result<rusqlite::types::ToSqlOutput<'_>, rusqlite::Error> {
+        let str_value = match self {
+            MatchStatus::Hash => "hash",
+            MatchStatus::Name => "name",
+            MatchStatus::Match => "match",
+        };
+        Ok(rusqlite::types::ToSqlOutput::from(str_value))
     }
 }
 
@@ -566,8 +648,7 @@ impl SetRecord {
 
 impl RomRecord {
     fn get_by_set(conn: &Connection, set_id: &SetId) -> Result<Vec<Self>> {
-        let matches =
-            sql_query!(conn, Self::table_name(), Self::fields(), where {set_id}, Self::from_row)?;
+        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {set_id}, Self::from_row)?;
         Ok(matches)
     }
 
@@ -624,31 +705,6 @@ impl DirRecord {
 }
 
 impl FileRecord {
-    //manual implentation due to complexity in mapping MatchStatus
-    pub fn insert(conn: &Connection, new: &NewFile) -> Result<Self> {
-        let (set_id, rom_id) = match new.status.ids() {
-            Some((set_id, rom_id)) => (Some(set_id), Some(rom_id)),
-            None => (None, None),
-        };
-
-        let sql = format!(
-            "INSERT INTO {} (dir_id, name, size, hash, status, set_id, rom_id) VALUES (:dir_id, :name, :size, :hash, :status, :set_id, :rom_id)",
-            Self::table_name()
-        );
-        let params = named_params! {
-            ":dir_id": new.dir_id,
-            ":name": new.name.as_str(),
-            ":size": new.size,
-            ":hash": new.hash.as_str(),
-            ":status": new.status.as_str(),
-            ":set_id": set_id,
-            ":rom_id": rom_id,
-        };
-        conn.execute(&sql, params)?;
-        let id = conn.last_insert_rowid();
-        Self::get_by_id(conn, &FileId::from(id))
-    }
-
     fn get_by_dir(conn: &Connection, dir_id: &DirId) -> Result<Vec<Self>> {
         let matches =
             sql_query!(conn, Self::table_name(), Self::fields(), where {dir_id}, order by "name", Self::from_row)?;
@@ -679,44 +735,42 @@ impl FileRecord {
         let num_deleted = conn.execute(&sql, named_params! {":dir_id": dir_id})?;
         Ok(num_deleted)
     }
+}
 
-    pub fn update(&self, conn: &Connection, name: &str, status: &MatchStatus) -> Result<Self> {
-        let (set_id, rom_id) = match status.ids() {
-            Some((set_id, rom_id)) => (Some(set_id), Some(rom_id)),
-            None => (None, None),
-        };
+impl MatchRecord {
+    pub fn get_by_file(conn: &Connection, file_id: &FileId) -> Result<Vec<Self>> {
+        let matches =
+            sql_query!(conn, Self::table_name(), Self::fields(), where {file_id}, order by "id", Self::from_row)?;
+        Ok(matches)
+    }
 
-        let sql = format!(
-            "UPDATE {} SET name = :name, status = :status, set_id = :set_id, rom_id = :rom_id WHERE id = :id",
-            Self::table_name()
-        );
-        let num_updated = conn.execute(
+    pub fn get_by_file_status(conn: &Connection, file_id: &FileId, status: &str) -> Result<Vec<Self>> {
+        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {file_id, status}, order by "id", Self::from_row)?;
+        Ok(matches)
+    }
+
+    pub fn update(&self, conn: &Connection, status: &MatchStatus) -> Result<Self> {
+        let sql = format!("UPDATE {} SET status = :status WHERE id = :id", Self::table_name());
+        conn.execute(
             &sql,
             named_params! {
                 ":id": self.id,
-                ":name": name,
-                ":status": status.as_str(),
-                ":set_id": set_id,
-                ":rom_id": rom_id,
+                ":status": status,
             },
         )?;
-        if num_updated != 0 {
-            Ok(Self {
-                id: self.id.clone(),
-                dir_id: self.dir_id.clone(),
-                name: name.to_string(),
-                size: self.size,
-                hash: self.hash.clone(),
-                status: status.clone(),
-            })
-        } else {
-            Err(anyhow::anyhow!("Failed to update file record with id {}", self.id.id()))
-        }
+        Ok(Self {
+            id: self.id.clone(),
+            dat_id: self.dat_id.clone(),
+            file_id: self.file_id.clone(),
+            status: status.clone(),
+            set_id: self.set_id.clone(),
+            rom_id: self.rom_id.clone(),
+        })
     }
 }
 
 pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
-    const CREATE_STATEMENTS: [&str; 14] = [
+    const CREATE_STATEMENTS: [&str; 15] = [
         /* dat file */
         "CREATE TABLE IF NOT EXISTS dats ( id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, description VARCHAR NOT NULL, \
         version VARCHAR NOT NULL, author VARCHAR NOT NULL, hash_type VARCHAR NOT NULL);",
@@ -742,14 +796,96 @@ pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_dat_dirs_path ON dirs(dat_id, path);",
         "CREATE INDEX IF NOT EXISTS idx_dir_files ON files(dir_id);",
         "CREATE INDEX IF NOT EXISTS idx_dir_files_name ON files(dir_id, name);",
+        /* versioning */
+        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
     ];
 
-    let conn = Connection::open(db_path.as_ref())?;
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let mut conn = Connection::open(db_path.as_ref())?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
 
     for stmt in CREATE_STATEMENTS {
         conn.execute(stmt, ())?;
     }
 
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+    run_migrations(&tx)?;
+    tx.commit()?;
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(conn)
+}
+
+fn run_migrations(conn: &Connection) -> Result<()> {
+    let result: std::result::Result<Option<i64>, rusqlite::Error> =
+        conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0));
+    let version: Option<i64> = match result {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => bail!(e),
+    };
+
+    if version.is_none() {
+        // Migration 1: Move matches from duplicating files to a new table referenced by the file record.
+        // This stops having the need for multiple file entries for the same file when it matches multiple roms
+        // as well as allowing us to ditch the none status.
+        // NOTE: SQLite does not support altering FK references in ALTER statements, which makes copying the entire
+        // table necessary, this is actually useful here as we need to deduplicate the files table
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS matches (
+                id INTEGER PRIMARY KEY,
+                dat_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                status VARCHAR NOT NULL,
+                set_id INTEGER NOT NULL,
+                rom_id INTEGER NOT NULL,
+                FOREIGN KEY (dat_id) REFERENCES dats(id),
+                FOREIGN KEY (file_id) REFERENCES files(id),
+                FOREIGN KEY (rom_id) REFERENCES roms(id),
+                FOREIGN KEY (set_id) REFERENCES sets(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_matches_file_id ON matches(file_id);
+            CREATE INDEX IF NOT EXISTS idx_matches_set_id ON matches(set_id);
+            CREATE INDEX IF NOT EXISTS idx_matches_rom_id ON matches(rom_id);
+            CREATE INDEX IF NOT EXISTS idx_matches_dat_id ON matches(dat_id);
+
+            CREATE TEMP TABLE id_map AS
+                SELECT f.id AS old_id, MIN(f.id) OVER (PARTITION BY f.dir_id, f.name) AS new_id
+                FROM files f;
+
+            INSERT INTO matches (file_id, set_id, rom_id, status, dat_id)
+                SELECT i.new_id, f.set_id, f.rom_id, f.status, s.dat_id FROM files f
+                JOIN sets s ON f.set_id = s.id
+                JOIN id_map i ON f.id = i.old_id
+                WHERE f.status != 'none';
+
+            CREATE TABLE IF NOT EXISTS files_new (
+                id INTEGER PRIMARY KEY,
+                dat_id INTEGER NOT NULL,
+                dir_id INTEGER NOT NULL,
+                name VARCHAR NOT NULL,
+                size VARCHAR NOT NULL,
+                hash VARCHAR NOT NULL,
+                FOREIGN KEY (dat_id) REFERENCES dats(id),
+                FOREIGN KEY (dir_id) REFERENCES dirs(id),
+                UNIQUE(dir_id, name)
+            );
+
+            INSERT INTO files_new (id, dat_id, dir_id, name, size, hash)
+                SELECT MIN(f.id), d.dat_id, f.dir_id, f.name, f.size, f.hash FROM files f
+                JOIN dirs d ON f.dir_id = d.id
+                GROUP BY f.dir_id, f.name;
+
+            DROP TABLE files;
+
+            ALTER TABLE files_new RENAME TO files;
+            CREATE INDEX IF NOT EXISTS idx_dir_files ON files(dir_id);
+            CREATE INDEX IF NOT EXISTS idx_dir_files_name ON files(dir_id, name);
+            "#,
+        )?;
+        //if that migration runs, then we need to set the schema version to 1, so that it doesn't run again.
+        conn.execute("INSERT INTO schema_version (version) VALUES (1)", [])?;
+    }
+
+    Ok(())
 }
