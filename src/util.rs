@@ -49,8 +49,19 @@ pub fn is_hidden_file<P: AsRef<Utf8Path>>(file: P) -> bool {
 pub fn is_hidden_file<P: AsRef<Utf8Path>>(file: P) -> bool {
     file.as_ref()
         .file_name()
-        .map(|filename| filename.starts_with('.'))
-        .unwrap_or_default()
+        .is_some_and(|filename| filename.starts_with('.'))
+}
+
+pub fn is_zip_file<P: AsRef<Utf8Path>>(file: P) -> bool {
+    file.as_ref()
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+}
+
+pub fn has_extension<P: AsRef<Utf8Path>, S: AsRef<str>>(file: P, extensions: &[S]) -> bool {
+    file.as_ref()
+        .extension()
+        .is_some_and(|ext| extensions.iter().any(|e| ext.eq_ignore_ascii_case(e.as_ref())))
 }
 
 pub fn human_size(size: u64) -> String {

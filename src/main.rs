@@ -449,15 +449,15 @@ fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::Dat
 
     for directory in db::DirRecord::get_by_dat(&tx, &old_dat_id)? {
         //check if its a zip file, if so, restrict matches to set name if matched
-        if Utf8Path::new(&directory.path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-        {
-            let matched_sets = match_sets(&tx, &imported.id, &directory.path)?;
-            for file in directory.get_files(&tx)? {
-                //rematch using existing information, but link to the new dat
-                insert_matches(&tx, &imported.id, &file, &matched_sets)?;
-            }
+        let matched_sets = if util::is_zip_file(&directory.path) {
+            match_sets(&tx, &imported.id, &directory.path)?
+        } else {
+            BTreeSet::new()
+        };
+
+        for file in directory.get_files(&tx)? {
+            //rematch using existing information, but link to the new dat
+            insert_matches(&tx, &imported.id, &file, &matched_sets)?;
         }
     }
 
@@ -718,14 +718,10 @@ fn scan_directory(
             scan_directory(tx, dat_id, term, path, exclude, recursive, incremental, Some(&dir.id), file_count)?;
             existing_paths.remove(path.as_str());
         } else if path.is_file() {
-            if path
-                .extension()
-                .map(|ext| exclude.iter().any(|e| ext.eq_ignore_ascii_case(e)))
-                .unwrap_or_default()
-            {
+            if util::has_extension(path, exclude) {
                 continue;
             }
-            if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
+            if util::is_zip_file(path) {
                 //for zip files we need to rollback the entire directory and files if it failed to scan properly
                 let mut sp = tx.savepoint()?;
                 match scan_zip_file(&sp, dat_id, path, incremental, exclude, &dir.id) {
@@ -846,11 +842,7 @@ fn scan_zip_file(
         match zip.by_index(i) {
             Ok(mut inner_file) => {
                 if inner_file.is_file() {
-                    if Utf8Path::new(inner_file.name())
-                        .extension()
-                        .map(|ext| exclude.iter().any(|e| ext.eq_ignore_ascii_case(e)))
-                        .unwrap_or_default()
-                    {
+                    if util::has_extension(inner_file.name(), exclude) {
                         continue;
                     }
 
@@ -1284,10 +1276,7 @@ fn list_sets(
 fn rename_files(conn: &mut Connection, dat_id: &db::DatId, term: &TermInfo) -> Result<()> {
     let mut tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
     for directory in db::DirRecord::get_by_dat(&tx, dat_id)? {
-        if Utf8Path::new(&directory.path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-        {
+        if util::is_zip_file(&directory.path) {
             continue;
         }
 
