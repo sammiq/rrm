@@ -735,6 +735,18 @@ impl FileRecord {
         let num_deleted = conn.execute(&sql, named_params! {":dir_id": dir_id})?;
         Ok(num_deleted)
     }
+
+    pub fn relink_files(conn: &Connection, old_dat_id: &DatId, new_dat_id: &DatId) -> Result<usize> {
+        let sql = format!("UPDATE {} SET dat_id = :new_dat_id WHERE dat_id = :old_dat_id", Self::table_name());
+        let num_updated = conn.execute(
+            &sql,
+            named_params! {
+                ":new_dat_id": new_dat_id.id(),
+                ":old_dat_id": old_dat_id.id(),
+            },
+        )?;
+        Ok(num_updated)
+    }
 }
 
 impl MatchRecord {
