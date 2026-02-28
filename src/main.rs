@@ -464,6 +464,9 @@ fn update_dat(conn: &mut Connection, dat_file: &Utf8PathBuf, old_dat_id: db::Dat
     //relink all directories to the new dat
     db::DirRecord::relink_dirs(&tx, &old_dat_id, &imported.id)?;
 
+    //relink all files to the new dat
+    db::FileRecord::relink_files(&tx, &old_dat_id, &imported.id)?;
+
     tx.commit()?;
 
     //if we successfully updated everything and relinked and the transaction completed, we can now delete the old dat
