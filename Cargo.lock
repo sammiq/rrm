@@ -618,6 +618,7 @@ dependencies = [
  "camino",
  "clap",
  "digest",
+ "fallible-iterator",
  "log",
  "roxmltree",
  "rusqlite",

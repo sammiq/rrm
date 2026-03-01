@@ -820,14 +820,14 @@ pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
     }
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
-    run_migrations(&tx)?;
+    run_migrations(&tx, db_path.as_ref())?;
     tx.commit()?;
 
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(conn)
 }
 
-fn run_migrations(conn: &Connection) -> Result<()> {
+fn run_migrations(conn: &Connection, db_path: &Utf8Path) -> Result<()> {
     let result: std::result::Result<Option<i64>, rusqlite::Error> =
         conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0));
     let version: Option<i64> = match result {
@@ -837,6 +837,10 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     };
 
     if version.is_none() {
+        //before we run any migrations, we should backup the database, just in case something goes wrong.
+        let backup_file = db_path.with_extension("v0.bak");
+        std::fs::copy(db_path, &backup_file)?;
+
         // Migration 1: Move matches from duplicating files to a new table referenced by the file record.
         // This stops having the need for multiple file entries for the same file when it matches multiple roms
         // as well as allowing us to ditch the none status.
