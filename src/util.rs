@@ -5,6 +5,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 #[cfg(windows)]
 use std::os::windows::prelude::*;
+use std::path::Path;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn data_dir() -> Option<Utf8PathBuf> {
@@ -13,11 +14,7 @@ pub fn data_dir() -> Option<Utf8PathBuf> {
 
 #[cfg(not(target_os = "macos"))]
 fn env_to_path(env_var: &str) -> Option<Utf8PathBuf> {
-    std::env::var_os(env_var).and_then(|opath| {
-        Utf8PathBuf::try_from(opath)
-            .ok()
-            .and_then(|path| path.canonicalize_utf8().ok())
-    })
+    std::env::var_os(env_var).and_then(canonical_path)
 }
 
 #[cfg(unix)]
@@ -43,6 +40,13 @@ pub fn is_hidden_file<P: AsRef<Utf8Path>>(file: P) -> bool {
         .metadata()
         .map(|metadata| metadata.file_attributes() & 0x00000002 != 0)
         .unwrap_or_default()
+}
+
+pub fn canonical_path<P: AsRef<Path>>(path: P) -> Option<Utf8PathBuf> {
+    path.as_ref()
+        .canonicalize()
+        .ok()
+        .and_then(|path| Utf8PathBuf::try_from(path).ok())
 }
 
 #[cfg(not(windows))]
