@@ -1,3 +1,4 @@
+mod completion;
 mod db;
 mod util;
 
@@ -7,12 +8,20 @@ use std::io::{BufReader, IsTerminal, Write};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use fallible_iterator::FallibleIterator;
 use roxmltree::Document;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::MemHistory;
+use rustyline::validate::Validator;
+use rustyline::{Config, Editor, Helper};
 
-use crate::db::{DatId, Deletable, DeletableByDat, FindableByName, Insertable, Queryable, QueryableByDat};
+use crate::completion::{TreeNode, build_completions, complete};
+use crate::db::{Deletable, DeletableByDat, FindableByName, Insertable, Queryable, QueryableByDat};
 
 const APP_NAME: &str = "rrm";
 
@@ -195,18 +204,37 @@ enum DataCommands {
     },
 }
 
-fn readline() -> Result<String> {
-    write!(std::io::stdout(), "$ ")?;
-    std::io::stdout().flush()?;
-    let mut buffer = String::new();
-    std::io::stdin().read_line(&mut buffer)?;
-    Ok(buffer)
-}
-
 struct TermInfo {
     tty_in: bool,
     tty_out: bool,
 }
+
+
+
+struct CompletionHelper<'a> {
+    node: TreeNode<'a>,
+}
+
+impl Completer for CompletionHelper<'_> {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let line = &line[..pos];
+        let completions = complete(&self.node, line);
+        Ok((pos, completions))
+    }
+}
+impl Hinter for CompletionHelper<'_> {
+    type Hint = String;
+}
+impl Highlighter for CompletionHelper<'_> {}
+impl Validator for CompletionHelper<'_> {}
+impl Helper for CompletionHelper<'_> {}
 
 fn main() -> Result<()> {
     let data_path = util::data_dir()
@@ -241,6 +269,10 @@ fn main() -> Result<()> {
         dat_id = select_dat_from_path(&conn);
     }
 
+    let command = Cli::command();
+    let base_node = build_completions(&command);
+    println!("{:?}", base_node);
+
     let interactive = if let Some(command) = args.command {
         do_command(&mut conn, &mut dat_id, &command, &term)?;
         args.interactive
@@ -249,35 +281,52 @@ fn main() -> Result<()> {
     };
 
     if interactive && term.tty_in {
-        loop {
-            let line = readline()?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        let helper = CompletionHelper { node: base_node };
 
-            if let Some(args) = shlex::split(line) {
-                match Cli::try_parse_from(args) {
-                    Ok(cli) => match do_command(&mut conn, &mut dat_id, &cli.command, &term) {
-                        Ok(exit) => {
-                            if exit {
-                                break;
-                            }
+        let completions =
+            helper.complete("data im", 7, &rustyline::Context::new(&rustyline::history::MemHistory::new()))?;
+        println!("completions: {:?}", completions);
+        let mut rl = Editor::with_config(
+            Config::builder()
+                .completion_type(rustyline::CompletionType::List)
+                .build(),
+        )?;
+        rl.set_helper(Some(helper));
+        loop {
+            match rl.readline(">> ") {
+                Ok(line) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    rl.add_history_entry(line)?;
+
+                    if let Some(args) = shlex::split(line) {
+                        match Cli::try_parse_from(args) {
+                            Ok(cli) => match do_command(&mut conn, &mut dat_id, &cli.command, &term) {
+                                Ok(exit) => {
+                                    if exit {
+                                        break;
+                                    }
+                                }
+                                Err(e) => eprintln!("Error: Unable to perform command, {e}"),
+                            },
+                            Err(e) => e.print()?,
                         }
-                        Err(e) => eprintln!("Unable to perform command, {e}"),
-                    },
-                    Err(e) => e.print()?,
-                };
-            } else {
-                eprintln!("error: Invalid quoting");
+                    } else {
+                        eprintln!("Error: Invalid quoting");
+                    };
+                }
+                Err(ReadlineError::Interrupted) => continue,
+                Err(ReadlineError::Eof) => break,
+                Err(err) => eprintln!("Error: {}", err),
             }
         }
     }
     Ok(())
 }
 
-#[allow(clippy::collapsible_if)] //becomes an unreadable mess
-fn select_dat_from_path(conn: &Connection) -> Option<DatId> {
+fn select_dat_from_path(conn: &Connection) -> Option<db::DatId> {
     // as this method is best effort, don't bother complaining loudly about errors.
     if let Some(current_path) = std::env::current_dir().ok().and_then(util::canonical_path) {
         if let Ok(paths) = db::DirRecord::get_by_path(conn, current_path.as_str())
