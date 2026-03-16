@@ -1,3 +1,4 @@
+mod completion;
 mod db;
 mod util;
 
@@ -7,12 +8,20 @@ use std::io::{BufReader, IsTerminal, Write};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use fallible_iterator::FallibleIterator;
 use roxmltree::Document;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{Config, Editor, Helper};
 
-use crate::db::{DatId, Deletable, DeletableByDat, FindableByName, Insertable, Queryable, QueryableByDat};
+use crate::completion::{TreeNode, build_completions, complete};
+use crate::db::{Deletable, DeletableByDat, FindableByName, Insertable, Queryable, QueryableByDat};
+use crate::util::{OptionIf, ResultIf};
 
 const APP_NAME: &str = "rrm";
 
@@ -101,10 +110,10 @@ enum FileCommands {
         #[arg(long, value_delimiter = ',', default_value = "m3u,dat,txt")]
         exclude: Vec<String>,
         /// scan recursively each directory found
-        #[arg(short('R'), long, default_value_t = false)]
+        #[arg(short('R'), long)]
         recursive: bool,
         /// re-scan existing files in the directory and not just new files
-        #[arg(long, default_value_t = false)]
+        #[arg(long)]
         full: bool,
         /// the path to use for scanning files
         #[arg(default_value=".", value_hint = clap::ValueHint::DirPath)]
@@ -131,7 +140,7 @@ enum FileCommands {
     /// list all sets matched by scanned files
     Sets {
         /// show missing sets instead of matches
-        #[arg(long, default_value_t = false)]
+        #[arg(long)]
         missing: bool,
         /// show only sets partially matching this name
         partial_name: Option<String>,
@@ -195,18 +204,37 @@ enum DataCommands {
     },
 }
 
-fn readline() -> Result<String> {
-    write!(std::io::stdout(), "$ ")?;
-    std::io::stdout().flush()?;
-    let mut buffer = String::new();
-    std::io::stdin().read_line(&mut buffer)?;
-    Ok(buffer)
-}
-
 struct TermInfo {
     tty_in: bool,
     tty_out: bool,
+    interactive: bool,
 }
+
+struct CompletionHelper<'a> {
+    node: TreeNode<'a>,
+}
+
+impl Completer for CompletionHelper<'_> {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let line = &line[..pos];
+        let (trailing, completions) = complete(&self.node, line);
+        let offset = line.len() - trailing;
+        Ok((offset, completions))
+    }
+}
+impl Hinter for CompletionHelper<'_> {
+    type Hint = String;
+}
+impl Highlighter for CompletionHelper<'_> {}
+impl Validator for CompletionHelper<'_> {}
+impl Helper for CompletionHelper<'_> {}
 
 fn main() -> Result<()> {
     let data_path = util::data_dir()
@@ -222,12 +250,14 @@ fn main() -> Result<()> {
     let mut conn = db::open_or_create(&db_path)?;
     let mut dat_id = None;
 
+    let args = Args::parse();
+
     let term = TermInfo {
         tty_in: std::io::stdin().is_terminal(),
         tty_out: std::io::stdout().is_terminal(),
+        interactive: args.command.is_none() || args.interactive,
     };
 
-    let args = Args::parse();
     if let Some(index) = args.select {
         do_command(
             &mut conn,
@@ -241,43 +271,53 @@ fn main() -> Result<()> {
         dat_id = select_dat_from_path(&conn);
     }
 
-    let interactive = if let Some(command) = args.command {
+    if let Some(command) = args.command {
         do_command(&mut conn, &mut dat_id, &command, &term)?;
-        args.interactive
-    } else {
-        true
-    };
+    }
 
-    if interactive && term.tty_in {
+    if term.interactive && term.tty_in {
+        let command = Cli::command();
+        let base_node = build_completions(&command);
+
+        let helper = CompletionHelper { node: base_node };
+        let mut rl = Editor::with_config(
+            Config::builder()
+                .completion_type(rustyline::CompletionType::List)
+                .build(),
+        )?;
+        rl.set_helper(Some(helper));
         loop {
-            let line = readline()?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+            match rl.readline(">> ") {
+                Ok(line) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    rl.add_history_entry(line)?;
 
-            if let Some(args) = shlex::split(line) {
-                match Cli::try_parse_from(args) {
-                    Ok(cli) => match do_command(&mut conn, &mut dat_id, &cli.command, &term) {
-                        Ok(exit) => {
-                            if exit {
-                                break;
-                            }
+                    if let Some(args) = shlex::split(line) {
+                        match Cli::try_parse_from(args) {
+                            Ok(cli) => match do_command(&mut conn, &mut dat_id, &cli.command, &term) {
+                                Ok(true) => break,
+                                Ok(false) => continue,
+                                Err(e) => eprintln!("Error: Unable to perform command, {e}"),
+                            },
+                            Err(e) => e.print()?,
                         }
-                        Err(e) => eprintln!("Unable to perform command, {e}"),
-                    },
-                    Err(e) => e.print()?,
-                };
-            } else {
-                eprintln!("error: Invalid quoting");
+                    } else {
+                        eprintln!("Error: Invalid quoting");
+                    };
+                }
+                Err(ReadlineError::Interrupted) => continue,
+                Err(ReadlineError::Eof) => break,
+                Err(err) => eprintln!("Error: {}", err),
             }
         }
     }
     Ok(())
 }
 
-#[allow(clippy::collapsible_if)] //becomes an unreadable mess
-fn select_dat_from_path(conn: &Connection) -> Option<DatId> {
+fn select_dat_from_path(conn: &Connection) -> Option<db::DatId> {
     // as this method is best effort, don't bother complaining loudly about errors.
     if let Some(current_path) = std::env::current_dir().ok().and_then(util::canonical_path) {
         if let Ok(paths) = db::DirRecord::get_by_path(conn, current_path.as_str())
@@ -302,18 +342,16 @@ fn do_command(
     match command {
         Commands::Data { data } => {
             handle_data_commands(conn, dat_id, term, data)?;
-            Ok(false)
         }
         Commands::Files { files } => {
             handle_file_commands(conn, dat_id.as_ref(), term, files)?;
-            Ok(false)
         }
         Commands::Select { index } => {
             handle_data_commands(conn, dat_id, term, &DataCommands::Select { index: *index })?;
-            Ok(false)
         }
-        Commands::Exit => Ok(true),
-    }
+        Commands::Exit => return Ok(true),
+    };
+    Ok(false)
 }
 
 fn handle_data_commands(
@@ -327,8 +365,12 @@ fn handle_data_commands(
             ensure!(dat_file.is_file(), "`{}` is not a valid file", dat_file);
 
             import_dat(conn, dat_file).map(|imported| {
-                println!("dat file `{}` imported and selected.", imported.name);
-                *dat_id = Some(imported.id);
+                if term.interactive {
+                    println!("dat file `{}` imported and selected.", imported.name);
+                    *dat_id = Some(imported.id);
+                } else {
+                    println!("dat file `{}` imported.", imported.name);
+                }
             })
         }
         DataCommands::Update { dat_file, yes } => {
@@ -384,10 +426,9 @@ fn ask_for_confirmation(term: &TermInfo, prompt: &str, skip: bool) -> Result<boo
         let mut buffer = String::new();
         std::io::stdin().read_line(&mut buffer)?;
         let buffer = buffer.trim();
-        Ok(buffer.eq_ignore_ascii_case("y"))
-    } else {
-        Ok(skip)
+        return Ok(buffer.eq_ignore_ascii_case("y"));
     }
+    Ok(skip)
 }
 
 fn handle_file_commands(
@@ -639,12 +680,11 @@ fn list_roms(conn: &Connection, dat_id: &db::DatId, name: Option<&str>) -> Resul
         let sets_by_id: BTreeMap<_, _> = all_sets.iter().map(|s| (&s.id, s)).collect();
 
         for (set_id, roms) in roms_by_set {
-            if let Some(set) = sets_by_id.get(&set_id) {
+            sets_by_id.get(&set_id).if_some(|set| {
                 println!("{}", set.name);
-                for rom in roms {
-                    println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
-                }
-            }
+                roms.iter()
+                    .for_each(|rom| println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size)));
+            });
         }
     }
     Ok(())
@@ -784,12 +824,9 @@ fn scan_directory(
             match db::DirRecord::get_by_dat_path(tx, dat_id, existing_path) {
                 Ok(dir) => {
                     if let Some(dir) = dir {
-                        if let Err(e) = dir
-                            .delete_files(tx)
+                        dir.delete_files(tx)
                             .and_then(|_| db::DirRecord::delete_by_id(tx, &dir.id))
-                        {
-                            eprintln!("Failed to delete directory {}. Error: {e}", existing_path);
-                        }
+                            .if_err(|e| eprintln!("Failed to delete directory {}. Error: {e}", existing_path));
                     } else {
                         eprintln!("Failed to find directory entry {}.", existing_path);
                     }
@@ -800,9 +837,8 @@ fn scan_directory(
             }
         }
         for (_, existing_file) in files_by_name {
-            if let Err(e) = db::FileRecord::delete_by_id(tx, &existing_file.id) {
-                eprintln!("Failed to remove {}. Error: {e}", existing_file.name);
-            }
+            db::FileRecord::delete_by_id(tx, &existing_file.id)
+                .if_err(|e| eprintln!("Failed to remove {}. Error: {e}", existing_file.name));
         }
     }
 

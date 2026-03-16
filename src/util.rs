@@ -86,3 +86,53 @@ pub fn calc_hash<R: std::io::Read + ?Sized>(reader: &mut R) -> Result<(String, u
     let hash = base16ct::lower::encode_string(&digest);
     Ok((hash, size))
 }
+
+/// This trait allows inline inspection of parts of a result.
+/// This is similar to the unstable Result::inspect and Result::inspect_err
+/// except that it destructs the result, and takes ownership of the value or error.
+/// This is by design as it eases readability of code using the construct, and
+/// forces users to use match statements where appropriate.
+#[allow(dead_code)]
+pub trait ResultIf<T, E> {
+    fn if_ok<F: FnOnce(T)>(self, op: F);
+    fn if_err<F: FnOnce(E)>(self, op: F);
+}
+
+impl<T, E> ResultIf<T, E> for std::result::Result<T, E> {
+    fn if_ok<F: FnOnce(T)>(self, op: F) {
+        if let Ok(t) = self {
+            op(t);
+        }
+    }
+
+    fn if_err<F: FnOnce(E)>(self, op: F) {
+        if let Err(e) = self {
+            op(e);
+        }
+    }
+}
+
+/// This trait allows inline inspection of parts of an option.
+/// This is similar to the unstable Option::inspect
+/// except that it destructs the Option, and takes ownership of the value.
+/// This is by design as it eases readability of code using the construct, and
+/// forces users to use match statements where appropriate.
+#[allow(dead_code)]
+pub trait OptionIf<T> {
+    fn if_some<F: FnOnce(T)>(self, op: F);
+    fn if_none<F: FnOnce()>(self, op: F);
+}
+
+impl<T> OptionIf<T> for std::option::Option<T> {
+    fn if_some<F: FnOnce(T)>(self, op: F) {
+        if let Some(t) = self {
+            op(t);
+        }
+    }
+
+    fn if_none<F: FnOnce()>(self, op: F) {
+        if self.is_none() {
+            op();
+        }
+    }
+}
