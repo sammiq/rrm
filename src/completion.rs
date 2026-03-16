@@ -89,9 +89,9 @@ pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
             }
             //positional args matching names is irrelevant
             Some(TreeNode::Positional(_)) | None => {
-                if current_children.iter().any(|c| matches!(c, TreeNode::Positional(_))) && token_iter.peek().is_some()
-                {
-                    token_iter.next();
+                if current_children.iter().any(|c| matches!(c, TreeNode::Positional(_))) {
+                    //current token is positional, lets continue matching tokens
+                    continue;
                 } else {
                     return (0, Vec::new());
                 }
