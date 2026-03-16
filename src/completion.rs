@@ -1,6 +1,5 @@
 use camino::Utf8Path;
 use clap::{Arg, Command, ValueHint};
-use shlex::Shlex;
 
 #[derive(Debug)]
 pub enum TreeNode<'a> {
@@ -10,19 +9,22 @@ pub enum TreeNode<'a> {
 }
 
 impl TreeNode<'_> {
-    pub fn name(&self) -> String {
+    pub fn names(&self) -> Vec<String> {
         match self {
-            TreeNode::Branch(name, _) => name.clone(),
+            TreeNode::Branch(name, _) => vec![name.clone()],
             TreeNode::Option(arg) => {
+                //we assume here that anything without a long or short option
+                //is actually a positional
+                let mut names = Vec::new();
                 if let Some(long) = arg.get_long() {
-                    format!("--{long}")
-                } else if let Some(short) = arg.get_short() {
-                    format!("-{short}")
-                } else {
-                    unreachable!()
+                    names.push(format!("--{long}"));
                 }
+                if let Some(short) = arg.get_short() {
+                    names.push(format!("-{short}"));
+                }
+                names
             }
-            TreeNode::Positional(arg) => arg.get_id().to_string(),
+            TreeNode::Positional(arg) => vec![arg.get_id().to_string()],
         }
     }
 }
@@ -58,7 +60,7 @@ pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
 
     if tokens.is_empty() || (tokens.len() == 1 && !trailing_space) {
         let partial = tokens.first().map(String::as_str).unwrap_or("");
-        return (partial.len(), candidates_matching(children, partial, false));
+        return (partial.len(), candidates_matching(children, partial));
     }
 
     let (walk_tokens, final_token) = if trailing_space {
@@ -75,21 +77,29 @@ pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
             Some(TreeNode::Branch(_, next_children)) => {
                 current_children = next_children;
             }
-            Some(TreeNode::Option(arg)) | Some(TreeNode::Positional(arg)) => {
+            Some(TreeNode::Option(arg)) => {
                 for _ in 0..num_arg_values(arg) {
                     if token_iter.peek().is_none() {
                         // Ran out of tokens while consuming values — we're completing
                         // this option's value, not a new token
-                        return (final_token.len(), candidates_matching(current_children, final_token, true));
+                        return (final_token.len(), match_arg_value(arg, final_token));
                     }
                     token_iter.next();
                 }
             }
-            None => return (0, vec![]),
+            //positional args matching names is irrelevant
+            Some(TreeNode::Positional(_)) | None => {
+                if current_children.iter().any(|c| matches!(c, TreeNode::Positional(_))) && token_iter.peek().is_some()
+                {
+                    token_iter.next();
+                } else {
+                    return (0, Vec::new());
+                }
+            }
         }
     }
 
-    (final_token.len(), candidates_matching(current_children, final_token, false))
+    (final_token.len(), candidates_matching(current_children, final_token))
 }
 
 fn num_arg_values(arg: &Arg) -> usize {
@@ -101,37 +111,48 @@ fn num_arg_values(arg: &Arg) -> usize {
 
 /// Find the first node whose name exactly equals `token`.
 fn find_exact<'a, 'b>(nodes: &'a [TreeNode<'b>], token: &str) -> Option<&'a TreeNode<'b>> {
-    nodes.iter().find(|n| n.name() == token)
+    nodes.iter().find(|n| n.names().iter().any(|name| name == token))
 }
 
-fn candidates_matching<'a>(nodes: &'a [TreeNode<'a>], partial: &str, is_arg: bool) -> Vec<String> {
+/// Simple name-based prefix match used for Branch and Option nodes,
+/// and Positional nodes without a path hint.
+fn find_partial(node: &TreeNode, partial: &str) -> Vec<String> {
+    node.names()
+        .into_iter()
+        .filter(|name| name.starts_with(partial))
+        .collect()
+}
+
+fn candidates_matching<'a>(nodes: &'a [TreeNode<'a>], partial: &str) -> Vec<String> {
     nodes
         .iter()
         .flat_map(|n| match n {
-            TreeNode::Positional(arg) if !is_arg => match arg.get_value_hint() {
-                ValueHint::FilePath | ValueHint::AnyPath => fs_candidates(partial, false),
-                ValueHint::DirPath => fs_candidates(partial, true),
-                _ => prefix_candidate(n, partial),
-            },
-            TreeNode::Option(arg) | TreeNode::Positional(arg) if is_arg => {
-                let possible: Vec<String> = arg
-                    .get_possible_values()
-                    .iter()
-                    .filter(|v| !v.is_hide_set())
-                    .map(|v| v.get_name().to_owned())
-                    .filter(|name| name.starts_with(partial))
-                    .collect();
-
+            TreeNode::Option(arg) | TreeNode::Positional(arg) => {
+                let possible = match_arg_value(arg, partial);
                 if possible.is_empty() {
                     // No enum values — fall back to name-based match (the flag itself)
-                    prefix_candidate(n, partial)
+                    find_partial(n, partial)
                 } else {
                     possible
                 }
             }
-            _ => prefix_candidate(n, partial),
+            _ => find_partial(n, partial),
         })
         .collect()
+}
+
+fn match_arg_value(arg: &Arg, partial: &str) -> Vec<String> {
+    match arg.get_value_hint() {
+        ValueHint::FilePath | ValueHint::AnyPath => fs_candidates(partial, false),
+        ValueHint::DirPath => fs_candidates(partial, true),
+        _ => arg
+            .get_possible_values()
+            .iter()
+            .filter(|v| !v.is_hide_set())
+            .map(|v| v.get_name().to_owned())
+            .filter(|name| name.starts_with(partial))
+            .collect(),
+    }
 }
 
 /// Return filesystem candidates for the given partial path.
@@ -146,8 +167,13 @@ fn fs_candidates(partial: &str, dirs_only: bool) -> Vec<String> {
             // e.g. "src/" — list inside that dir with no prefix filter
             (p, "")
         } else {
-            // e.g. "src/ma" — list "src/" filtering by "ma"
-            (p.parent().unwrap_or(Utf8Path::new(".")), p.file_name().unwrap_or_default())
+            //p.parent() can return an empty path (which seems wrong), so if the partial is the first,
+            //default to the current directory
+            if p.iter().next() == Some(partial) {
+                (Utf8Path::new("."), partial)
+            } else {
+                (p.parent().unwrap_or(Utf8Path::new(".")), p.file_name().unwrap_or(partial))
+            }
         }
     };
 
@@ -184,13 +210,6 @@ fn fs_candidates(partial: &str, dirs_only: bool) -> Vec<String> {
             Some(candidate)
         })
         .collect()
-}
-
-/// Simple name-based prefix match used for Branch and Option nodes,
-/// and Positional nodes without a path hint.
-fn prefix_candidate(node: &TreeNode, partial: &str) -> Vec<String> {
-    let name = node.name();
-    if name.starts_with(partial) { vec![name.to_owned()] } else { vec![] }
 }
 
 #[cfg(test)]
