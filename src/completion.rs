@@ -48,7 +48,7 @@ fn build_branch<'a>(command: &'a Command) -> TreeNode<'a> {
 
 /// Returns (length of partial, candidates).
 pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
-    let tokens: Vec<String> = Shlex::new(line).collect();
+    let tokens = shlex::split(line).unwrap_or_default();
     let trailing_space = line.ends_with(' ') || line.is_empty();
 
     let children = match root_node {

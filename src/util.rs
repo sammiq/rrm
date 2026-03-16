@@ -5,7 +5,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 #[cfg(windows)]
 use std::os::windows::prelude::*;
-use std::{io::Write, path::Path};
+use std::path::Path;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn data_dir() -> Option<Utf8PathBuf> {
