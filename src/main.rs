@@ -86,8 +86,6 @@ enum Commands {
         /// the index of the dat file to select, as seen in list
         index: usize,
     },
-    /// exit from interactive mode
-    Exit,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -296,12 +294,16 @@ fn main() -> Result<()> {
                     rl.add_history_entry(line)?;
 
                     if let Some(args) = shlex::split(line) {
+                        if args.is_empty() {
+                            continue;
+                        }
+                        //if the first argument is exit or quit, exit the REPL
+                        if args[0].eq_ignore_ascii_case("exit") || args[0].eq_ignore_ascii_case("quit") {
+                            break;
+                        }
                         match Cli::try_parse_from(args) {
-                            Ok(cli) => match do_command(&mut conn, &mut dat_id, &cli.command, &term) {
-                                Ok(true) => break,
-                                Ok(false) => continue,
-                                Err(e) => eprintln!("Error: Unable to perform command, {e}"),
-                            },
+                            Ok(cli) => do_command(&mut conn, &mut dat_id, &cli.command, &term)
+                                .if_err(|e| eprintln!("Error: Unable to perform command, {e}")),
                             Err(e) => e.print()?,
                         }
                     } else {
@@ -319,18 +321,25 @@ fn main() -> Result<()> {
 
 fn select_dat_from_path(conn: &Connection) -> Option<db::DatId> {
     // as this method is best effort, don't bother complaining loudly about errors.
-    if let Some(current_path) = std::env::current_dir().ok().and_then(util::canonical_path) {
-        if let Ok(paths) = db::DirRecord::get_by_path(conn, current_path.as_str())
-            && !paths.is_empty()
-        {
-            if let Ok(dat) = db::DatRecord::get_by_id(conn, &paths[0].dat_id) {
-                println!("dat file `{}` selected.", dat.name);
-                return Some(dat.id);
-            }
+    let current_path = std::env::current_dir().ok().and_then(util::canonical_path)?;
+    let paths = db::DirRecord::get_by_path(conn, current_path.as_str()).ok()?;
+
+    if paths.is_empty() {
+        // Only warn if dats are actually installed; silence the message on a fresh install.
+        if db::DatRecord::get_all(conn).is_ok_and(|dats| !dats.is_empty()) {
+            eprintln!("No default dat file for current path.");
         }
+        return None;
     }
-    eprintln!("No default dat file for current path.");
-    None
+
+    if paths.len() > 1 {
+        eprintln!("Warning: current path matches {} dat files, selecting the first.", paths.len());
+    }
+
+    db::DatRecord::get_by_id(conn, &paths[0].dat_id).ok().map(|dat| {
+        println!("dat file `{}` selected.", dat.name);
+        dat.id
+    })
 }
 
 fn do_command(
@@ -338,20 +347,12 @@ fn do_command(
     dat_id: &mut Option<db::DatId>,
     command: &Commands,
     term: &TermInfo,
-) -> Result<bool> {
+) -> Result<()> {
     match command {
-        Commands::Data { data } => {
-            handle_data_commands(conn, dat_id, term, data)?;
-        }
-        Commands::Files { files } => {
-            handle_file_commands(conn, dat_id.as_ref(), term, files)?;
-        }
-        Commands::Select { index } => {
-            handle_data_commands(conn, dat_id, term, &DataCommands::Select { index: *index })?;
-        }
-        Commands::Exit => return Ok(true),
-    };
-    Ok(false)
+        Commands::Data { data } => handle_data_commands(conn, dat_id, term, data),
+        Commands::Files { files } => handle_file_commands(conn, dat_id.as_ref(), term, files),
+        Commands::Select { index } => handle_data_commands(conn, dat_id, term, &DataCommands::Select { index: *index }),
+    }
 }
 
 fn handle_data_commands(
@@ -455,13 +456,17 @@ fn handle_file_commands(
             list_scanned_files(conn, dat_id, term, mode, partial_name.as_deref())
         }
         FileCommands::Sets { missing, partial_name } => {
-            list_scanned_sets(conn, dat_id, term, *missing, partial_name.as_deref())
+            if *missing {
+                list_missing_sets(conn, dat_id, term, partial_name.as_deref())
+            } else {
+                list_found_sets(conn, dat_id, term, partial_name.as_deref())
+            }
         }
         FileCommands::Rename => rename_files(conn, dat_id, term),
         FileCommands::Matched { partial_name } => {
             list_scanned_files(conn, dat_id, term, &ListMode::Matched, partial_name.as_deref())
         }
-        FileCommands::Missing { partial_name } => list_scanned_sets(conn, dat_id, term, true, partial_name.as_deref()),
+        FileCommands::Missing { partial_name } => list_missing_sets(conn, dat_id, term, partial_name.as_deref()),
         FileCommands::Unmatched { partial_name } => {
             list_scanned_files(conn, dat_id, term, &ListMode::Unmatched, partial_name.as_deref())
         }
@@ -529,7 +534,6 @@ fn import_dat<P: AsRef<Utf8Path>>(conn: &mut Connection, file_path: P) -> Result
 
 fn parse_dat_file<P: AsRef<Utf8Path>>(conn: &Connection, file_path: P) -> Result<db::DatRecord> {
     let mut df_buffer = std::fs::read_to_string(file_path.as_ref()).context("Unable to read reference dat file")?;
-
     //so we can turn off dtd-processing, we need to remove any declaration, in most files its unused and is a security issue.
     if let Some(start) = df_buffer.find("<!DOCTYPE")
         && let Some(len) = df_buffer[start..].find(">")
@@ -537,7 +541,11 @@ fn parse_dat_file<P: AsRef<Utf8Path>>(conn: &Connection, file_path: P) -> Result
         //this is quite naive but appears to be fine for this use-case
         df_buffer.replace_range(start..=start + len, "");
     }
-    let df_xml = Document::parse(df_buffer.as_str()).context("Unable to parse reference dat file")?;
+    parse_dat(conn, &df_buffer)
+}
+
+fn parse_dat(conn: &Connection, df_buffer: &str) -> Result<db::DatRecord> {
+    let df_xml = Document::parse(df_buffer).context("Unable to parse reference dat file")?;
     let new_dat = parse_dat_info(&df_xml)?;
     let dat = db::DatRecord::insert(conn, &new_dat)?;
 
@@ -916,7 +924,7 @@ fn scan_file(conn: &Connection, dat_id: &db::DatId, dir_id: &db::DirId, path: &U
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FileMatch {
+struct FileMatch {
     pub status: db::MatchStatus,
     pub set_id: db::SetId,
     pub rom_id: db::RomId,
@@ -1155,30 +1163,29 @@ fn format_set_indicator(status: &SetStatus, is_tty: bool) -> &str {
     }
 }
 
-fn list_scanned_sets(
-    conn: &mut Connection,
-    dat_id: &db::DatId,
-    term: &TermInfo,
-    missing: bool,
-    partial_name: Option<&str>,
-) -> Result<()> {
-    //get these in bulk to avoid doing a query per file when we display them
-    let matches = db::MatchRecord::get_by_dat(conn, dat_id)?;
+/// Indexes matched file records and found ROM ids by set, for bulk display.
+/// Returns (sets_to_files, found_roms) where:
+///   sets_to_files maps each matched set id to the (file, match) pairs for that set.
+///   found_roms maps each matched set id to the set of unique matched rom ids.
+fn collect_set_matches<'a>(
+    matches: &'a [db::MatchRecord],
+    all_files: &'a [db::FileRecord],
+) -> (
+    BTreeMap<db::SetId, Vec<(&'a db::FileRecord, &'a db::MatchRecord)>>,
+    BTreeMap<db::SetId, BTreeSet<db::RomId>>,
+) {
     let matches_by_file: BTreeMap<_, Vec<_>> = matches.iter().fold(BTreeMap::new(), |mut acc, m| {
         acc.entry(&m.file_id).or_default().push(m);
         acc
     });
 
-    let all_files = db::FileRecord::get_by_dat(conn, dat_id)?;
-
     let mut sets_to_files: BTreeMap<_, Vec<_>> = BTreeMap::new();
     let mut found_roms: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
 
-    for file in &all_files {
+    for file in all_files {
         if let Some(file_matches) = matches_by_file.get(&file.id) {
-            for fm in file_matches {
-                //FIXME: avoid cloning if possible
-                sets_to_files.entry(fm.set_id.clone()).or_default().push((file, *fm));
+            for &fm in file_matches {
+                sets_to_files.entry(fm.set_id.clone()).or_default().push((file, fm));
                 found_roms
                     .entry(fm.set_id.clone())
                     .or_default()
@@ -1187,88 +1194,102 @@ fn list_scanned_sets(
         }
     }
 
+    (sets_to_files, found_roms)
+}
+
+fn list_missing_sets(conn: &Connection, dat_id: &db::DatId, term: &TermInfo, partial_name: Option<&str>) -> Result<()> {
+    let matches = db::MatchRecord::get_by_dat(conn, dat_id)?;
+    let all_files = db::FileRecord::get_by_dat(conn, dat_id)?;
+    let (sets_to_files, _) = collect_set_matches(&matches, &all_files);
+
     let all_sets = db::SetRecord::get_by_dat(conn, dat_id)?;
-    if missing {
-        println!("--- MISSING SETS ---");
-        let status = format_set_indicator(&SetStatus::Missing, term.tty_out);
-        for set in &all_sets {
-            if let Some(partial_name) = partial_name
-                && !set
-                    .name
-                    .to_ascii_lowercase()
-                    .contains(&partial_name.to_ascii_lowercase())
-            {
-                continue;
-            }
-            println_if!(!sets_to_files.contains_key(&set.id), "[{status}] {}", set.name);
+    println!("--- MISSING SETS ---");
+    let status = format_set_indicator(&SetStatus::Missing, term.tty_out);
+    for set in &all_sets {
+        if let Some(partial_name) = partial_name
+            && !set
+                .name
+                .to_ascii_lowercase()
+                .contains(&partial_name.to_ascii_lowercase())
+        {
+            continue;
         }
-        println!("{} / {} sets missing.", all_sets.len() - sets_to_files.len(), all_sets.len());
-    } else {
-        let all_roms = db::RomRecord::get_by_dat(conn, dat_id)?;
-        let mut roms_by_set: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        all_roms
-            .iter()
-            .for_each(|rom| roms_by_set.entry(&rom.set_id).or_default().push(rom));
+        println_if!(!sets_to_files.contains_key(&set.id), "[{status}] {}", set.name);
+    }
+    println!("{} / {} sets missing.", all_sets.len() - sets_to_files.len(), all_sets.len());
+    Ok(())
+}
 
-        println!("--- FOUND SETS ---");
-        let partial_status = format_set_indicator(&SetStatus::Partial, term.tty_out);
-        let complete_status = format_set_indicator(&SetStatus::Complete, term.tty_out);
-        for set in &all_sets {
-            if let Some(partial_name) = partial_name
-                && !set
-                    .name
-                    .to_ascii_lowercase()
-                    .contains(&partial_name.to_ascii_lowercase())
-            {
-                continue;
+fn list_found_sets(conn: &Connection, dat_id: &db::DatId, term: &TermInfo, partial_name: Option<&str>) -> Result<()> {
+    let matches = db::MatchRecord::get_by_dat(conn, dat_id)?;
+    let all_files = db::FileRecord::get_by_dat(conn, dat_id)?;
+    let (sets_to_files, found_roms) = collect_set_matches(&matches, &all_files);
+
+    let all_roms = db::RomRecord::get_by_dat(conn, dat_id)?;
+    let mut roms_by_set: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    all_roms
+        .iter()
+        .for_each(|rom| roms_by_set.entry(&rom.set_id).or_default().push(rom));
+
+    let all_sets = db::SetRecord::get_by_dat(conn, dat_id)?;
+    println!("--- FOUND SETS ---");
+    let partial_status = format_set_indicator(&SetStatus::Partial, term.tty_out);
+    let complete_status = format_set_indicator(&SetStatus::Complete, term.tty_out);
+    for set in &all_sets {
+        if let Some(partial_name) = partial_name
+            && !set
+                .name
+                .to_ascii_lowercase()
+                .contains(&partial_name.to_ascii_lowercase())
+        {
+            continue;
+        }
+
+        if let Some(files) = sets_to_files.get(&set.id)
+            && let Some(roms) = roms_by_set.get(&set.id)
+        {
+            //iterate through the file matches and check if we have all the roms in the set matched, if so its complete, otherwise its partial
+            let roms_by_id: BTreeMap<_, _> = roms.iter().map(|&rom| (&rom.id, rom)).collect();
+            if found_roms.get(&set.id).is_some_and(|s| s.len() >= roms.len()) {
+                //we found the same number (or more) of unique roms that are in the set
+                println!("[{complete_status}] {}", set.name);
+            } else {
+                println!("[{partial_status}] {}, set has missing roms", set.name);
             }
 
-            if let Some(files) = sets_to_files.get(&set.id)
-                && let Some(roms) = roms_by_set.get(&set.id)
-            {
-                //iterate through the file matches and check if we have all the roms in the set matched, if so its complete, otherwise its partial
-                let roms_by_id: BTreeMap<_, _> = roms.iter().map(|&rom| (&rom.id, rom)).collect();
-                if found_roms.get(&set.id).is_some_and(|s| s.len() >= roms.len()) {
-                    //we found the same number (or more) of unique roms that are in the set
-                    println!("[{complete_status}] {}", set.name);
-                } else {
-                    println!("[{partial_status}] {}, set has missing roms", set.name);
-                }
-
-                for (file, fm) in files {
-                    let indicator = format_file_indicator(Some(&fm.status), term.tty_out);
-                    match fm.status {
-                        db::MatchStatus::Hash => {
-                            println!(
-                                " {indicator}  {} {}, should be named {}",
-                                file.hash, file.name, roms_by_id[&fm.rom_id].name
-                            );
-                        }
-                        db::MatchStatus::Name => {
-                            println!(
-                                "  {indicator}  {} {}, should have hash {}",
-                                file.hash, file.name, roms_by_id[&fm.rom_id].hash
-                            );
-                        }
-                        db::MatchStatus::Match => {
-                            println!(" {indicator}  {} {}", file.hash, file.name);
-                        }
+            for (file, fm) in files {
+                let indicator = format_file_indicator(Some(&fm.status), term.tty_out);
+                match fm.status {
+                    db::MatchStatus::Hash => {
+                        println!(
+                            " {indicator}  {} {}, should be named {}",
+                            file.hash, file.name, roms_by_id[&fm.rom_id].name
+                        );
+                    }
+                    db::MatchStatus::Name => {
+                        println!(
+                            "  {indicator}  {} {}, should have hash {}",
+                            file.hash, file.name, roms_by_id[&fm.rom_id].hash
+                        );
+                    }
+                    db::MatchStatus::Match => {
+                        println!(" {indicator}  {} {}", file.hash, file.name);
                     }
                 }
+            }
 
-                let missing_indicator = format_file_indicator(None, term.tty_out);
-                for rom in roms {
-                    println_if!(
-                        !found_roms.get(&set.id).is_some_and(|s| s.contains(&rom.id)),
-                        " {missing_indicator}  {} {} missing",
-                        rom.hash,
-                        rom.name
-                    );
-                }
+            let missing_indicator = format_file_indicator(None, term.tty_out);
+            for rom in roms {
+                println_if!(
+                    !found_roms.get(&set.id).is_some_and(|s| s.contains(&rom.id)),
+                    " {missing_indicator}  {} {} missing",
+                    rom.hash,
+                    rom.name
+                );
             }
         }
-        println!("{} / {} sets found.", sets_to_files.len(), all_sets.len());
     }
+    println!("{} / {} sets found.", sets_to_files.len(), all_sets.len());
     Ok(())
 }
 
