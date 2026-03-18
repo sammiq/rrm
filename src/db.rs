@@ -158,6 +158,9 @@ pub trait Queryable: Sized {
         for<'a> &'a I: IntoIterator<Item = &'a Self::IdType>,
     {
         let ids: Vec<_> = ids.into_iter().collect();
+        if ids.is_empty() {
+            return Ok(Vec::new())
+        }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql =
             format!("SELECT {} FROM {} WHERE id IN ({}) ORDER BY id", Self::fields(), Self::table_name(), placeholders);
@@ -744,6 +747,10 @@ impl DirRecord {
         FileRecord::find_by_name_in_dir(conn, &self.id, name, exact)
     }
 
+    pub fn delete_matches(&self, conn: &Connection) -> Result<usize> {
+        MatchRecord::delete_by_dir_id(conn, &self.id)
+    }
+
     pub fn delete_files(&self, conn: &Connection) -> Result<usize> {
         FileRecord::delete_files(conn, &self.id)
     }
@@ -823,9 +830,29 @@ impl FileRecord {
             hash: self.hash.clone(),
         })
     }
+
+    pub fn delete_matches(&self, conn: &Connection) -> Result<usize> {
+        MatchRecord::delete_by_file_id(conn, &self.id)
+    }
 }
 
 impl MatchRecord {
+    pub fn delete_by_file_id(conn: &Connection, file_id: &FileId) -> Result<usize> {
+        let sql = format!("DELETE FROM {} WHERE file_id = :file_id", Self::table_name());
+        let num_deleted = conn.execute(&sql, named_params! {":file_id": file_id})?;
+        Ok(num_deleted)
+    }
+
+    pub fn delete_by_dir_id(conn: &Connection, dir_id: &DirId) -> Result<usize> {
+        let sql = format!(
+            "DELETE FROM {matches} WHERE file_id IN (SELECT id FROM {files} WHERE dir_id = :dir_id)",
+            matches = Self::table_name(),
+            files = FileRecord::table_name(),
+        );
+        let num_deleted = conn.execute(&sql, named_params! {":dir_id": dir_id})?;
+        Ok(num_deleted)
+    }
+
     pub fn find_by_status_for_file(conn: &Connection, file_id: &FileId, status: &MatchStatus) -> Result<Vec<Self>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {file_id, status}, order by "id", Self::from_row)?;
         Ok(matches)

@@ -42,25 +42,49 @@ pub fn build_completions<'a>(command: &'a Command) -> TreeNode<'a> {
 
 /// Returns (length of partial, candidates).
 pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
-    let tokens = shlex::split(line).unwrap_or_default();
-    let trailing_space = line.ends_with(' ') || line.is_empty();
+    // Collect tokens via the Shlex iterator so we can inspect had_error afterwards.
+    // If had_error is true, the line ended inside an unclosed quote: the partial token
+    // was discarded by shlex, so we recover it by finding the opening quote in the original line.
+    let mut lex = shlex::Shlex::new(line);
+    let tokens: Vec<String> = lex.by_ref().collect();
+    let partial_override: Option<String> = if lex.had_error {
+        line.rfind(|c| c == '\'' || c == '"').map(|pos| line[pos + 1..].to_owned())
+    } else {
+        None
+    };
+    let trailing_space = partial_override.is_none() && (line.ends_with(' ') || line.is_empty());
 
     let children = match root_node {
         TreeNode::Branch(_, children) => children,
         _ => return (0, vec![]),
     };
 
-    if tokens.is_empty() || (tokens.len() == 1 && !trailing_space) {
+    // Determine (walk_tokens, final_token):
+    // - walk_tokens: the already-complete tokens used to navigate the tree
+    // - final_token: the partial string being completed
+    //
+    // For unclosed-quote case: all tokens are navigation tokens, partial is raw string after quote.
+    // For normal case: split last token off as partial (unless trailing space).
+    let final_token_storage: String;
+    let (walk_tokens, final_token): (&[String], &str) = if let Some(ref raw_partial) = partial_override {
+        if tokens.is_empty() {
+            // e.g. `"partial` at top level — no navigation needed
+            return (raw_partial.len() + 1, candidates_matching(children, raw_partial, true));
+        }
+        (tokens.as_slice(), raw_partial.as_str())
+    } else if tokens.is_empty() || (tokens.len() == 1 && !trailing_space) {
         let partial = tokens.first().map(String::as_str).unwrap_or("");
-        return (partial.len(), candidates_matching(children, partial));
-    }
-
-    let (walk_tokens, final_token) = if trailing_space {
+        return (partial.len(), candidates_matching(children, partial, false));
+    } else if trailing_space {
         (tokens.as_slice(), "")
     } else {
         let (last, rest) = tokens.split_last().unwrap();
-        (rest, last.as_str())
+        final_token_storage = last.clone();
+        (rest, final_token_storage.as_str())
     };
+
+    // When replacing the partial in the line, we need to cover the opening quote too
+    let partial_replace_len = final_token.len() + if partial_override.is_some() { 1 } else { 0 };
 
     let mut current_children: &[TreeNode] = children;
     let mut token_iter = walk_tokens.iter().peekable();
@@ -74,7 +98,7 @@ pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
                     if token_iter.peek().is_none() {
                         // Ran out of tokens while consuming values — we're completing
                         // this option's value, not a new token
-                        return (final_token.len(), match_arg_value(arg, final_token));
+                        return (partial_replace_len, match_arg_value(arg, final_token, partial_override.is_some()));
                     }
                     token_iter.next();
                 }
@@ -91,7 +115,7 @@ pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
         }
     }
 
-    (final_token.len(), candidates_matching(current_children, final_token))
+    (partial_replace_len, candidates_matching(current_children, final_token, partial_override.is_some()))
 }
 
 fn num_arg_values(arg: &Arg) -> usize {
@@ -112,28 +136,28 @@ fn find_partial(node: &TreeNode, partial: &str) -> Vec<String> {
     node.names().filter(|name| name.starts_with(partial)).collect()
 }
 
-fn candidates_matching<'a>(nodes: &'a [TreeNode<'a>], partial: &str) -> Vec<String> {
+fn candidates_matching<'a>(nodes: &'a [TreeNode<'a>], partial: &str, in_quote: bool) -> Vec<String> {
     nodes
         .iter()
         .flat_map(|n| match n {
             TreeNode::Option(arg) => {
                 let name_matches = find_partial(n, partial);
                 // prefer flag name match; only fall back to arg value match if no flag matches partial
-                if name_matches.is_empty() { match_arg_value(arg, partial) } else { name_matches }
+                if name_matches.is_empty() { match_arg_value(arg, partial, in_quote) } else { name_matches }
             }
             TreeNode::Positional(arg) => {
                 // Don't fall back in this case onto the name itself
-                match_arg_value(arg, partial)
+                match_arg_value(arg, partial, in_quote)
             }
             _ => find_partial(n, partial),
         })
         .collect()
 }
 
-fn match_arg_value(arg: &Arg, partial: &str) -> Vec<String> {
+fn match_arg_value(arg: &Arg, partial: &str, in_quote: bool) -> Vec<String> {
     match arg.get_value_hint() {
-        ValueHint::FilePath | ValueHint::AnyPath => fs_candidates(partial, false),
-        ValueHint::DirPath => fs_candidates(partial, true),
+        ValueHint::FilePath | ValueHint::AnyPath => fs_candidates(partial, false, in_quote),
+        ValueHint::DirPath => fs_candidates(partial, true, in_quote),
         _ => arg
             .get_possible_values()
             .iter()
@@ -146,7 +170,10 @@ fn match_arg_value(arg: &Arg, partial: &str) -> Vec<String> {
 
 /// Return filesystem candidates for the given partial path.
 /// If `dirs_only` is true, only directories are returned.
-fn fs_candidates(partial: &str, dirs_only: bool) -> Vec<String> {
+/// If `in_quote` is true, the partial is inside an unclosed quote: directory candidates are
+/// returned unquoted (the caller's open quote stays open for further completion), while file
+/// candidates get a closing `'` appended so the argument is properly terminated.
+fn fs_candidates(partial: &str, dirs_only: bool, in_quote: bool) -> Vec<String> {
     // Split partial into the directory to list and the filename prefix to filter by
     let (dir, prefix) = if partial.is_empty() {
         (Utf8Path::new("."), "")
@@ -196,7 +223,19 @@ fn fs_candidates(partial: &str, dirs_only: bool) -> Vec<String> {
                 };
                 format!("{}{}{}", dir_prefix, name, suffix)
             };
-            Some(shlex::try_quote(&candidate).expect("file paths do not contain null bytes").into_owned())
+            // Quote rules:
+            // - in_quote: replacement starts at the existing opening quote, so re-emit it.
+            //   directory: `'path/to/dir/`  — quote left open for further typing
+            //   file:      `'path/to/file'` — quote closed, argument complete
+            // - not in_quote: use shlex quoting, but for directories strip the trailing `'`
+            //   so the quote stays open (e.g. `'dir with spaces/` not `'dir with spaces/'`)
+            let quoted = if in_quote {
+                if is_dir { format!("'{}", candidate) } else { format!("'{}'", candidate) }
+            } else {
+                let s = shlex::try_quote(&candidate).expect("file paths do not contain null bytes").into_owned();
+                if is_dir { s.strip_suffix('\'').unwrap_or(&s).to_owned() } else { s }
+            };
+            Some(quoted)
         })
         .collect()
 }
@@ -467,7 +506,7 @@ mod tests {
     fn empty_partial_lists_all() {
         let dir = setup(&["alpha.txt", "beta.txt", "/gamma"]);
         let partial = format!("{}/", dir.path().to_str().unwrap());
-        let mut result = fs_candidates(&partial, false);
+        let mut result = fs_candidates(&partial, false, false);
         result.sort();
         assert_eq!(result, sorted(prefixed(&dir, &["alpha.txt", "beta.txt", "gamma/"])));
     }
@@ -478,7 +517,7 @@ mod tests {
     fn partial_filters_by_prefix() {
         let dir = setup(&["main.rs", "mod.rs", "lib.rs"]);
         let base = dir.path().to_str().unwrap();
-        let result = sorted(fs_candidates(&format!("{}/m", base), false));
+        let result = sorted(fs_candidates(&format!("{}/m", base), false, false));
         assert_eq!(result, sorted(prefixed(&dir, &["main.rs", "mod.rs"])));
     }
 
@@ -486,7 +525,7 @@ mod tests {
     fn partial_no_match_returns_empty() {
         let dir = setup(&["main.rs", "lib.rs"]);
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/z", base), false);
+        let result = fs_candidates(&format!("{}/z", base), false, false);
         assert!(result.is_empty());
     }
 
@@ -494,7 +533,7 @@ mod tests {
     fn exact_prefix_match_returns_single() {
         let dir = setup(&["unique.rs", "other.rs"]);
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/uni", base), false);
+        let result = fs_candidates(&format!("{}/uni", base), false, false);
         assert_eq!(result, prefixed(&dir, &["unique.rs"]));
     }
 
@@ -504,7 +543,7 @@ mod tests {
     fn directories_get_trailing_slash() {
         let dir = setup(&["/subdir"]);
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/sub", base), false);
+        let result = fs_candidates(&format!("{}/sub", base), false, false);
         assert_eq!(result, prefixed(&dir, &["subdir/"]));
     }
 
@@ -512,7 +551,7 @@ mod tests {
     fn files_do_not_get_trailing_slash() {
         let dir = setup(&["readme.md"]);
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/read", base), false);
+        let result = fs_candidates(&format!("{}/read", base), false, false);
         assert_eq!(result, prefixed(&dir, &["readme.md"]));
     }
 
@@ -522,7 +561,7 @@ mod tests {
     fn dirs_only_excludes_files() {
         let dir = setup(&["file.txt", "/subdir"]);
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/", base), true);
+        let result = fs_candidates(&format!("{}/", base), true, false);
         assert_eq!(result, prefixed(&dir, &["subdir/"]));
     }
 
@@ -530,7 +569,7 @@ mod tests {
     fn dirs_only_empty_when_no_dirs() {
         let dir = setup(&["file.txt", "other.txt"]);
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/", base), true);
+        let result = fs_candidates(&format!("{}/", base), true, false);
         assert!(result.is_empty());
     }
 
@@ -542,7 +581,7 @@ mod tests {
         let base = dir.path().to_str().unwrap();
         // Simulate typing e.g. "/med" where the root is our temp dir
         let partial = format!("{}/med", base);
-        let result = fs_candidates(&partial, false);
+        let result = fs_candidates(&partial, false, false);
         assert_eq!(result, vec![format!("{}/media.txt", base)]);
         // Crucially: no double slash anywhere
         assert!(result.iter().all(|s| !s.contains("//")));
@@ -553,7 +592,7 @@ mod tests {
         let dir = setup(&["/src"]);
         fs::File::create(dir.path().join("src/main.rs")).unwrap();
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/src/", base), false);
+        let result = fs_candidates(&format!("{}/src/", base), false, false);
         assert_eq!(result, vec![format!("{}/src/main.rs", base)]);
     }
 
@@ -561,8 +600,72 @@ mod tests {
 
     #[test]
     fn nonexistent_dir_returns_empty() {
-        let result = fs_candidates("/nonexistent/path/xyz", false);
+        let result = fs_candidates("/nonexistent/path/xyz", false, false);
         assert!(result.is_empty());
+    }
+
+    // --- unclosed quote in complete() ---
+
+    fn make_file_command() -> Command {
+        Command::new("open")
+            .disable_help_flag(true)
+            .arg(Arg::new("file").value_hint(ValueHint::FilePath))
+    }
+
+    #[test]
+    fn unclosed_double_quote_completes_partial_path() {
+        let dir = setup(&["my rom.zip", "other.zip"]);
+        let base = dir.path().to_str().unwrap();
+        let cmd = make_file_command();
+        let tree = build_completions(&cmd);
+        // User typed: open "/tmp/.../my
+        let partial_raw = format!("{}/my", base);
+        let line = format!("open \"{}", partial_raw);
+        let (len, candidates) = complete(&tree, &line);
+        // len covers: opening quote + partial_raw contents
+        assert_eq!(len, 1 + partial_raw.len());
+        // in-quote file: replacement starts at the quote, so candidate includes opening + closing quote
+        assert_eq!(candidates, vec![format!("'{}/my rom.zip'", base)]);
+    }
+
+    #[test]
+    fn unclosed_single_quote_completes_partial_path() {
+        let dir = setup(&["my rom.zip", "other.zip"]);
+        let base = dir.path().to_str().unwrap();
+        let cmd = make_file_command();
+        let tree = build_completions(&cmd);
+        let partial_raw = format!("{}/my", base);
+        let line = format!("open '{}", partial_raw);
+        let (len, candidates) = complete(&tree, &line);
+        assert_eq!(len, 1 + partial_raw.len());
+        assert_eq!(candidates, vec![format!("'{}/my rom.zip'", base)]);
+    }
+
+    #[test]
+    fn unclosed_quote_with_no_prefix_tokens() {
+        let dir = setup(&["my rom.zip", "other.zip"]);
+        let base = dir.path().to_str().unwrap();
+        let cmd = make_file_command();
+        let tree = build_completions(&cmd);
+        // Single-token command where the only token is a quoted partial (no subcommand navigation)
+        // This simulates the case where there is just the open command and the quoted arg
+        let line = format!("\"{}/my", base);
+        // The tree root is "open", single token won't match, but should not panic
+        let (_len, _candidates) = complete(&tree, &line);
+        // Just verify it doesn't panic and returns reasonably
+    }
+
+    #[test]
+    fn unclosed_quote_dir_candidate_leaves_quote_open() {
+        let dir = setup(&["/my roms"]);
+        let base = dir.path().to_str().unwrap();
+        let cmd = make_file_command();
+        let tree = build_completions(&cmd);
+        let partial_raw = format!("{}/my", base);
+        let line = format!("open '{}", partial_raw);
+        let (_, candidates) = complete(&tree, &line);
+        // Directory: replacement starts at the quote, candidate re-emits it but leaves it open
+        assert_eq!(candidates, vec![format!("'{}/my roms/", base)]);
     }
 
     // --- quoting ---
@@ -571,7 +674,7 @@ mod tests {
     fn file_with_spaces_is_quoted() {
         let dir = setup(&["my rom.zip", "other.zip"]);
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/my", base), false);
+        let result = fs_candidates(&format!("{}/my", base), false, false);
         assert_eq!(result, vec![format!("'{}/my rom.zip'", base)]);
     }
 
@@ -579,7 +682,8 @@ mod tests {
     fn directory_with_spaces_is_quoted() {
         let dir = setup(&["/my roms"]);
         let base = dir.path().to_str().unwrap();
-        let result = fs_candidates(&format!("{}/my", base), false);
-        assert_eq!(result, vec![format!("'{}/my roms/'", base)]);
+        let result = fs_candidates(&format!("{}/my", base), false, false);
+        // Directory with spaces: opening quote only, no closing quote — stays open for further typing
+        assert_eq!(result, vec![format!("'{}/my roms/", base)]);
     }
 }

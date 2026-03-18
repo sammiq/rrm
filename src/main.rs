@@ -548,8 +548,14 @@ fn strip_doctype(s: &mut String) {
     let Some(start) = s.find("<!DOCTYPE") else { return };
     let mut depth = 0usize;
     let end = s[start..].char_indices().find(|(_, c)| match c {
-        '[' => { depth += 1; false }
-        ']' => { depth = depth.saturating_sub(1); false }
+        '[' => {
+            depth += 1;
+            false
+        }
+        ']' => {
+            depth = depth.saturating_sub(1);
+            false
+        }
         '>' if depth == 0 => true,
         _ => false,
     });
@@ -875,7 +881,8 @@ fn remove_stale_entries<'a>(
         }
         match db::DirRecord::find_by_path_in_dat(ctx.conn, ctx.dat_id, existing_path) {
             Ok(Some(dir)) => {
-                dir.delete_files(ctx.conn)
+                dir.delete_matches(ctx.conn)
+                    .and_then(|_| dir.delete_files(ctx.conn))
                     .and_then(|_| db::DirRecord::delete_by_id(ctx.conn, &dir.id))
                     .if_err(|e| eprintln!("Failed to delete directory {}. Error: {e}", existing_path));
             }
@@ -884,7 +891,8 @@ fn remove_stale_entries<'a>(
         }
     }
     for (_, existing_file) in stale_files {
-        db::FileRecord::delete_by_id(ctx.conn, &existing_file.id)
+        existing_file.delete_matches(ctx.conn)
+            .and_then(|_| db::FileRecord::delete_by_id(ctx.conn, &existing_file.id))
             .if_err(|e| eprintln!("Failed to remove {}. Error: {e}", existing_file.name));
     }
 }
