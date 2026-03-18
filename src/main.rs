@@ -278,46 +278,51 @@ fn main() -> Result<()> {
     }
 
     if term.interactive && term.tty_in {
-        let command = Cli::command();
-        let base_node = build_completions(&command);
+        run_repl(&mut conn, &mut dat_id, &term)?;
+    }
+    Ok(())
+}
 
-        let helper = CompletionHelper { node: base_node };
-        let mut rl = Editor::with_config(
-            Config::builder()
-                .completion_type(rustyline::CompletionType::List)
-                .build(),
-        )?;
-        rl.set_helper(Some(helper));
-        loop {
-            match rl.readline(">> ") {
-                Ok(line) => {
-                    let line = line.trim();
-                    if line.is_empty() {
+fn run_repl(conn: &mut Connection, dat_id: &mut Option<db::DatId>, term: &TermInfo) -> Result<()> {
+    let command = Cli::command();
+    let base_node = build_completions(&command);
+
+    let helper = CompletionHelper { node: base_node };
+    let mut rl = Editor::with_config(
+        Config::builder()
+            .completion_type(rustyline::CompletionType::List)
+            .build(),
+    )?;
+    rl.set_helper(Some(helper));
+    loop {
+        match rl.readline(">> ") {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                rl.add_history_entry(line)?;
+
+                if let Some(args) = shlex::split(line) {
+                    if args.is_empty() {
                         continue;
                     }
-                    rl.add_history_entry(line)?;
-
-                    if let Some(args) = shlex::split(line) {
-                        if args.is_empty() {
-                            continue;
-                        }
-                        //if the first argument is exit or quit, exit the REPL
-                        if args[0].eq_ignore_ascii_case("exit") || args[0].eq_ignore_ascii_case("quit") {
-                            break;
-                        }
-                        match Cli::try_parse_from(args) {
-                            Ok(cli) => do_command(&mut conn, &mut dat_id, &term, &cli.command)
-                                .if_err(|e| eprintln!("Error: Unable to perform command, {e}")),
-                            Err(e) => e.print()?,
-                        }
-                    } else {
-                        eprintln!("Error: Invalid quoting");
-                    };
-                }
-                Err(ReadlineError::Interrupted) => continue,
-                Err(ReadlineError::Eof) => break,
-                Err(err) => eprintln!("Error: {}", err),
+                    //if the first argument is exit or quit, exit the REPL
+                    if args[0].eq_ignore_ascii_case("exit") || args[0].eq_ignore_ascii_case("quit") {
+                        break;
+                    }
+                    match Cli::try_parse_from(args) {
+                        Ok(cli) => do_command(conn, dat_id, term, &cli.command)
+                            .if_err(|e| eprintln!("Error: Unable to perform command, {e}")),
+                        Err(e) => e.print()?,
+                    }
+                } else {
+                    eprintln!("Error: Invalid quoting");
+                };
             }
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(err) => eprintln!("Error: {}", err),
         }
     }
     Ok(())
@@ -539,15 +544,24 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     Ok(imported)
 }
 
+fn strip_doctype(s: &mut String) {
+    let Some(start) = s.find("<!DOCTYPE") else { return };
+    let mut depth = 0usize;
+    let end = s[start..].char_indices().find(|(_, c)| match c {
+        '[' => { depth += 1; false }
+        ']' => { depth = depth.saturating_sub(1); false }
+        '>' if depth == 0 => true,
+        _ => false,
+    });
+    if let Some((len, _)) = end {
+        s.replace_range(start..=start + len, "");
+    }
+}
+
 fn import_dat<P: AsRef<Utf8Path>>(conn: &Connection, file_path: P) -> Result<db::DatRecord> {
     let mut df_buffer = std::fs::read_to_string(file_path.as_ref()).context("Unable to read reference dat file")?;
     //so we can turn off dtd-processing, we need to remove any declaration, in most files its unused and is a security issue.
-    if let Some(start) = df_buffer.find("<!DOCTYPE")
-        && let Some(len) = df_buffer[start..].find(">")
-    {
-        //this is quite naive but appears to be fine for this use-case
-        df_buffer.replace_range(start..=start + len, "");
-    }
+    strip_doctype(&mut df_buffer);
     parse_dat(conn, &df_buffer)
 }
 
@@ -945,6 +959,31 @@ struct FileMatch {
     pub rom_id: db::RomId,
 }
 
+fn resolve_match(
+    file_size: u64,
+    hash: &str,
+    matched_sets: &BTreeSet<db::SetId>,
+    named_roms: &[db::RomRecord],
+    hash_roms: &[db::RomRecord],
+) -> Option<Vec<FileMatch>> {
+    // Step 1: if something is named the same, check for exact matches and return if so.
+    if !named_roms.is_empty() {
+        let exact_matches = match_exact(file_size, hash, matched_sets, named_roms);
+        if exact_matches.is_some() {
+            return exact_matches;
+        }
+    }
+    // Step 2: if something is named the same, but the hash doesn't match,
+    // check whether we got hash only matches if we ignore the filename.
+    // If so, then treat it as a hash match, otherwise return the name only matches,
+    // if there are any.
+    if hash_roms.is_empty() {
+        match_names(matched_sets, named_roms)
+    } else {
+        match_hashes(matched_sets, hash_roms)
+    }
+}
+
 fn match_roms(
     ctx: &DatContext<'_>,
     filename: &str,
@@ -952,25 +991,9 @@ fn match_roms(
     hash: &str,
     matched_sets: &BTreeSet<db::SetId>,
 ) -> Result<Option<Vec<FileMatch>>> {
-    // Step 1: is there any roms called the same as the filename?
     let named_roms = db::RomRecord::find_by_name(ctx.conn, ctx.dat_id, filename, true)?;
-    if !named_roms.is_empty() {
-        //Step 2: if something is named the same, check for exact matches with those items, and return if so.
-        let exact_matches = match_exact(file_size, hash, matched_sets, &named_roms);
-        if exact_matches.is_some() {
-            return Ok(exact_matches);
-        }
-    }
-    // Step 3: if something is named the same, but the hash doesn't match,
-    // check whether we got hash only matches if we ignore the filename.
-    // If so, then treat it as a hash match, otherwise return the name only matches,
-    // if there are any.
     let hash_roms = db::RomRecord::find_by_hash_in_dat(ctx.conn, ctx.dat_id, hash)?;
-    if hash_roms.is_empty() {
-        Ok(match_names(matched_sets, &named_roms))
-    } else {
-        Ok(match_hashes(matched_sets, &hash_roms))
-    }
+    Ok(resolve_match(file_size, hash, matched_sets, &named_roms, &hash_roms))
 }
 
 fn match_exact(
@@ -1171,10 +1194,23 @@ fn list_scanned_files(
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
 enum SetStatus {
     Missing,
     Partial,
     Complete,
+}
+
+fn calculate_set_status(set_roms: &[db::RomRecord], set_matches: &[db::MatchRecord]) -> SetStatus {
+    if set_matches.is_empty() {
+        return SetStatus::Missing;
+    }
+    let matched_rom_ids: BTreeSet<_> = set_matches.iter().map(|m| m.rom_id).collect();
+    if set_roms.iter().all(|rom| matched_rom_ids.contains(&rom.id)) {
+        SetStatus::Complete
+    } else {
+        SetStatus::Partial
+    }
 }
 
 #[rustfmt::skip] //single line match arms are more readable
@@ -1248,8 +1284,7 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
             let roms_by_romid: BTreeMap<_, _> = set_roms.iter().map(|rom| (&rom.id, rom)).collect();
             let matches_by_romid: BTreeMap<_, _> = set_matches.iter().map(|fmatch| (&fmatch.rom_id, fmatch)).collect();
 
-            if roms_by_romid.keys().all(|id| matches_by_romid.contains_key(id)) {
-                //we found the same all of the unique roms that are in the set
+            if calculate_set_status(set_roms, set_matches) == SetStatus::Complete {
                 println!("[{complete_status}] {}", set.name);
             } else {
                 println!("[{partial_status}] {}, set has missing roms", set.name);
@@ -1325,4 +1360,356 @@ fn rename_files(tx: &mut Transaction, dat_id: &db::DatId, term: &TermInfo) -> Re
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stripped(input: &str) -> String {
+        let mut s = input.to_string();
+        strip_doctype(&mut s);
+        s
+    }
+
+    #[test]
+    fn strip_doctype_no_doctype() {
+        let xml = r#"<?xml version="1.0"?><root/>"#;
+        assert_eq!(stripped(xml), xml);
+    }
+
+    #[test]
+    fn strip_doctype_simple() {
+        let xml = r#"<?xml version="1.0"?><!DOCTYPE foo SYSTEM "foo.dtd"><root/>"#;
+        assert_eq!(stripped(xml), r#"<?xml version="1.0"?><root/>"#);
+    }
+
+    #[test]
+    fn strip_doctype_with_internal_subset() {
+        let xml = r#"<!DOCTYPE foo [<!ELEMENT bar (baz)><!ELEMENT baz (#PCDATA)>]><root/>"#;
+        assert_eq!(stripped(xml), "<root/>");
+    }
+
+    #[test]
+    fn strip_doctype_internal_subset_gt_not_confused() {
+        // The > inside the internal subset must not terminate the search early
+        let xml = r#"<!DOCTYPE foo [<!ENTITY gt ">">]><root/>"#;
+        assert_eq!(stripped(xml), "<root/>");
+    }
+
+    // --- parse_dat_info ---
+
+    fn parse_info(xml: &str) -> Result<db::NewDat> {
+        let doc = Document::parse(xml).unwrap();
+        parse_dat_info(&doc)
+    }
+
+    #[test]
+    fn parse_dat_info_valid() {
+        let xml = r#"<datafile>
+            <header>
+                <name>My DAT</name>
+                <description>A test dat</description>
+                <version>1.0</version>
+                <author>tester</author>
+            </header>
+        </datafile>"#;
+        let dat = parse_info(xml).unwrap();
+        assert_eq!(dat.name, "My DAT");
+        assert_eq!(dat.description, "A test dat");
+        assert_eq!(dat.version, "1.0");
+        assert_eq!(dat.author, "tester");
+        assert_eq!(dat.hash_type, "sha1");
+    }
+
+    #[test]
+    fn parse_dat_info_missing_header() {
+        let xml = r#"<datafile><name>My DAT</name></datafile>"#;
+        assert!(parse_info(xml).is_err());
+    }
+
+    #[test]
+    fn parse_dat_info_missing_name() {
+        let xml = r#"<datafile><header>
+            <description>desc</description><version>1.0</version><author>auth</author>
+        </header></datafile>"#;
+        assert!(parse_info(xml).is_err());
+    }
+
+    #[test]
+    fn parse_dat_info_missing_description() {
+        let xml = r#"<datafile><header>
+            <name>n</name><version>1.0</version><author>auth</author>
+        </header></datafile>"#;
+        assert!(parse_info(xml).is_err());
+    }
+
+    #[test]
+    fn parse_dat_info_missing_version() {
+        let xml = r#"<datafile><header>
+            <name>n</name><description>d</description><author>auth</author>
+        </header></datafile>"#;
+        assert!(parse_info(xml).is_err());
+    }
+
+    #[test]
+    fn parse_dat_info_missing_author() {
+        let xml = r#"<datafile><header>
+            <name>n</name><description>d</description><version>1.0</version>
+        </header></datafile>"#;
+        assert!(parse_info(xml).is_err());
+    }
+
+    #[test]
+    fn parse_dat_info_ignores_unknown_elements() {
+        let xml = r#"<datafile><header>
+            <name>n</name><description>d</description><version>1.0</version>
+            <author>auth</author><unknown>ignored</unknown>
+        </header></datafile>"#;
+        assert!(parse_info(xml).is_ok());
+    }
+
+    // --- helpers ---
+
+    fn make_rom(id: i64, dat_id: i64, set_id: i64, size: u64, hash: &str) -> db::RomRecord {
+        db::RomRecord {
+            id: id.into(),
+            dat_id: dat_id.into(),
+            set_id: set_id.into(),
+            name: format!("rom_{id}"),
+            size,
+            hash: hash.to_string(),
+        }
+    }
+
+    // --- match_exact ---
+
+    #[test]
+    fn match_exact_empty_roms() {
+        assert!(match_exact(100, "abc", &BTreeSet::new(), &[]).is_none());
+    }
+
+    #[test]
+    fn match_exact_no_match_wrong_size() {
+        let roms = [make_rom(1, 1, 1, 200, "abc")];
+        assert!(match_exact(100, "abc", &BTreeSet::new(), &roms).is_none());
+    }
+
+    #[test]
+    fn match_exact_no_match_wrong_hash() {
+        let roms = [make_rom(1, 1, 1, 100, "xyz")];
+        assert!(match_exact(100, "abc", &BTreeSet::new(), &roms).is_none());
+    }
+
+    #[test]
+    fn match_exact_single_match() {
+        let roms = [make_rom(1, 1, 1, 100, "abc")];
+        let result = match_exact(100, "abc", &BTreeSet::new(), &roms).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].status, db::MatchStatus::Match);
+        assert_eq!(result[0].set_id, 1i64.into());
+        assert_eq!(result[0].rom_id, 1i64.into());
+    }
+
+    #[test]
+    fn match_exact_multiple_matches() {
+        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 100, "abc")];
+        let result = match_exact(100, "abc", &BTreeSet::new(), &roms).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn match_exact_set_filter_includes() {
+        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 100, "abc")];
+        let filter = BTreeSet::from([1i64.into()]);
+        let result = match_exact(100, "abc", &filter, &roms).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].set_id, 1i64.into());
+    }
+
+    #[test]
+    fn match_exact_set_filter_excludes_all() {
+        let roms = [make_rom(1, 1, 1, 100, "abc")];
+        let filter = BTreeSet::from([99i64.into()]);
+        assert!(match_exact(100, "abc", &filter, &roms).is_none());
+    }
+
+    // --- match_names ---
+
+    #[test]
+    fn match_names_empty_roms() {
+        assert!(match_names(&BTreeSet::new(), &[]).is_none());
+    }
+
+    #[test]
+    fn match_names_returns_all_unfiltered() {
+        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 200, "def")];
+        let result = match_names(&BTreeSet::new(), &roms).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|m| m.status == db::MatchStatus::Name));
+    }
+
+    #[test]
+    fn match_names_set_filter() {
+        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 200, "def")];
+        let filter = BTreeSet::from([2i64.into()]);
+        let result = match_names(&filter, &roms).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].set_id, 2i64.into());
+    }
+
+    #[test]
+    fn match_names_set_filter_excludes_all() {
+        let roms = [make_rom(1, 1, 1, 100, "abc")];
+        let filter = BTreeSet::from([99i64.into()]);
+        assert!(match_names(&filter, &roms).is_none());
+    }
+
+    // --- match_hashes ---
+
+    #[test]
+    fn match_hashes_empty_roms() {
+        assert!(match_hashes(&BTreeSet::new(), &[]).is_none());
+    }
+
+    #[test]
+    fn match_hashes_returns_all_unfiltered() {
+        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 200, "def")];
+        let result = match_hashes(&BTreeSet::new(), &roms).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|m| m.status == db::MatchStatus::Hash));
+    }
+
+    #[test]
+    fn match_hashes_set_filter() {
+        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 200, "def")];
+        let filter = BTreeSet::from([1i64.into()]);
+        let result = match_hashes(&filter, &roms).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].set_id, 1i64.into());
+    }
+
+    #[test]
+    fn match_hashes_set_filter_excludes_all() {
+        let roms = [make_rom(1, 1, 1, 100, "abc")];
+        let filter = BTreeSet::from([99i64.into()]);
+        assert!(match_hashes(&filter, &roms).is_none());
+    }
+
+    // --- should_display_file_status ---
+
+    #[test]
+    fn display_status_unmatched_file() {
+        assert!(should_display_file_status(None, &ListMode::Unmatched));
+        assert!(should_display_file_status(None, &ListMode::All));
+        assert!(!should_display_file_status(None, &ListMode::Warning));
+        assert!(!should_display_file_status(None, &ListMode::Matched));
+    }
+
+    #[test]
+    fn display_status_hash_match() {
+        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), &ListMode::Warning));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), &ListMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), &ListMode::Matched));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), &ListMode::Unmatched));
+    }
+
+    #[test]
+    fn display_status_name_match() {
+        assert!(should_display_file_status(Some(&db::MatchStatus::Name), &ListMode::Warning));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Name), &ListMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), &ListMode::Matched));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), &ListMode::Unmatched));
+    }
+
+    #[test]
+    fn display_status_full_match() {
+        assert!(should_display_file_status(Some(&db::MatchStatus::Match), &ListMode::Matched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Match), &ListMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), &ListMode::Warning));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), &ListMode::Unmatched));
+    }
+
+    // --- resolve_match ---
+
+    fn make_match_record(id: i64, set_id: i64, rom_id: i64) -> db::MatchRecord {
+        db::MatchRecord {
+            id: id.into(),
+            dat_id: 1i64.into(),
+            file_id: id.into(),
+            status: db::MatchStatus::Match,
+            set_id: set_id.into(),
+            rom_id: rom_id.into(),
+        }
+    }
+
+    #[test]
+    fn resolve_match_exact_when_name_and_hash_match() {
+        let named = [make_rom(1, 1, 1, 100, "abc")];
+        let hash = [make_rom(1, 1, 1, 100, "abc")];
+        let result = resolve_match(100, "abc", &BTreeSet::new(), &named, &hash).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].status, db::MatchStatus::Match);
+    }
+
+    #[test]
+    fn resolve_match_hash_match_beats_name_only() {
+        // name matches but hash is wrong; a different rom matches by hash — expect Hash status
+        let named = [make_rom(1, 1, 1, 100, "xyz")];
+        let hash_roms = [make_rom(2, 1, 2, 999, "abc")];
+        let result = resolve_match(100, "abc", &BTreeSet::new(), &named, &hash_roms).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].status, db::MatchStatus::Hash);
+        assert_eq!(result[0].rom_id, 2i64.into());
+    }
+
+    #[test]
+    fn resolve_match_name_only_when_no_hash_match() {
+        // name matches but hash is wrong, and no hash-only match exists — expect Name status
+        let named = [make_rom(1, 1, 1, 100, "xyz")];
+        let result = resolve_match(100, "abc", &BTreeSet::new(), &named, &[]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].status, db::MatchStatus::Name);
+    }
+
+    #[test]
+    fn resolve_match_none_when_no_named_and_no_hash() {
+        assert!(resolve_match(100, "abc", &BTreeSet::new(), &[], &[]).is_none());
+    }
+
+    #[test]
+    fn resolve_match_none_when_no_named_and_hash_filtered_out() {
+        let hash_roms = [make_rom(2, 1, 2, 999, "abc")];
+        let filter = BTreeSet::from([99i64.into()]);
+        assert!(resolve_match(100, "abc", &filter, &[], &hash_roms).is_none());
+    }
+
+    // --- calculate_set_status ---
+
+    #[test]
+    fn set_status_complete_when_all_roms_matched() {
+        let roms = [make_rom(1, 1, 1, 100, "a"), make_rom(2, 1, 1, 200, "b")];
+        let matches = [make_match_record(1, 1, 1), make_match_record(2, 1, 2)];
+        assert_eq!(calculate_set_status(&roms, &matches), SetStatus::Complete);
+    }
+
+    #[test]
+    fn set_status_partial_when_some_roms_unmatched() {
+        let roms = [make_rom(1, 1, 1, 100, "a"), make_rom(2, 1, 1, 200, "b")];
+        let matches = [make_match_record(1, 1, 1)]; // only rom 1 matched
+        assert_eq!(calculate_set_status(&roms, &matches), SetStatus::Partial);
+    }
+
+    #[test]
+    fn set_status_missing_when_no_matches() {
+        let roms = [make_rom(1, 1, 1, 100, "a")];
+        assert_eq!(calculate_set_status(&roms, &[]), SetStatus::Missing);
+    }
+
+    #[test]
+    fn set_status_complete_with_single_rom() {
+        let roms = [make_rom(1, 1, 1, 100, "a")];
+        let matches = [make_match_record(1, 1, 1)];
+        assert_eq!(calculate_set_status(&roms, &matches), SetStatus::Complete);
+    }
 }
