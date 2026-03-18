@@ -48,7 +48,7 @@ pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
     let mut lex = shlex::Shlex::new(line);
     let tokens: Vec<String> = lex.by_ref().collect();
     let partial_override: Option<String> = if lex.had_error {
-        line.rfind(|c| c == '\'' || c == '"').map(|pos| line[pos + 1..].to_owned())
+        line.rfind(['\'', '"']).map(|pos| line[pos + 1..].to_owned())
     } else {
         None
     };
@@ -230,7 +230,8 @@ fn fs_candidates(partial: &str, dirs_only: bool, in_quote: bool) -> Vec<String> 
             // - not in_quote: use shlex quoting, but for directories strip the trailing `'`
             //   so the quote stays open (e.g. `'dir with spaces/` not `'dir with spaces/'`)
             let quoted = if in_quote {
-                if is_dir { format!("'{}", candidate) } else { format!("'{}'", candidate) }
+                let escaped = candidate.replace("'", "'\\''");
+                if is_dir { format!("'{}", escaped) } else { format!("'{}'", escaped) }
             } else {
                 let s = shlex::try_quote(&candidate).expect("file paths do not contain null bytes").into_owned();
                 if is_dir { s.strip_suffix('\'').unwrap_or(&s).to_owned() } else { s }
@@ -666,6 +667,32 @@ mod tests {
         let (_, candidates) = complete(&tree, &line);
         // Directory: replacement starts at the quote, candidate re-emits it but leaves it open
         assert_eq!(candidates, vec![format!("'{}/my roms/", base)]);
+    }
+
+    #[test]
+    fn unclosed_quote_file_with_embedded_single_quote() {
+        let dir = setup(&["it's a file.zip"]);
+        let base = dir.path().to_str().unwrap();
+        let cmd = make_file_command();
+        let tree = build_completions(&cmd);
+        let partial_raw = format!("{}/it", base);
+        let line = format!("open '{}", partial_raw);
+        let (_, candidates) = complete(&tree, &line);
+        // Embedded quote must be escaped as '\'' so the shell sees a valid token
+        assert_eq!(candidates, vec![format!("'{}/it'\\''s a file.zip'", base)]);
+    }
+
+    #[test]
+    fn unclosed_quote_dir_with_embedded_single_quote() {
+        let dir = setup(&["/it's a dir"]);
+        let base = dir.path().to_str().unwrap();
+        let cmd = make_file_command();
+        let tree = build_completions(&cmd);
+        let partial_raw = format!("{}/it", base);
+        let line = format!("open '{}", partial_raw);
+        let (_, candidates) = complete(&tree, &line);
+        // Directory with embedded quote: escaped, quote left open
+        assert_eq!(candidates, vec![format!("'{}/it'\\''s a dir/", base)]);
     }
 
     // --- quoting ---

@@ -821,8 +821,9 @@ fn scan_directory(
                 continue;
             }
             subdirs_by_path.remove(path.as_str());
-            file_count =
+            let subdir_count =
                 scan_directory(tx, dat_id, path, options, &|count| progress_fn(file_count + count))?;
+            file_count += subdir_count;
         } else if path.is_file() {
             if util::has_extension(path, options.exclude) {
                 continue;
