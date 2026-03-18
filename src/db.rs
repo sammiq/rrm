@@ -1,9 +1,9 @@
-#![allow(dead_code)]
+use std::collections::HashMap;
 
 use camino::Utf8Path;
 
 use anyhow::{Result, bail};
-use rusqlite::{Connection, named_params, params};
+use rusqlite::{Connection, Savepoint, Transaction, named_params, params, params_from_iter};
 
 //macro that generates a select statement
 macro_rules! sql_query_one {
@@ -55,9 +55,10 @@ macro_rules! sql_query {
 
 // Id type that is generic but bound to a type to prevent accidentally using
 // the wrong id and causing unintended consequences. Has Traits to allow it
-// to be used in rusqlite transparently.
+// to be used in rusqlite transparently and is copy as it boild down to copying
+// the captive integer.
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id<T>(i64, std::marker::PhantomData<T>);
 
 impl<T> Id<T> {
@@ -65,6 +66,14 @@ impl<T> Id<T> {
         Self(id, std::marker::PhantomData)
     }
 }
+
+impl<T> Clone for Id<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Id<T> {}
 
 pub trait HasId {
     fn id(&self) -> i64;
@@ -104,9 +113,9 @@ impl<T> rusqlite::types::FromSql for Id<T> {
 // because of the rules rust has around orphan traits which prevent
 // implementing ToSql and FromSql directly on u64. :(
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SizeWrapper(pub u64);
+pub struct StoredU64(pub u64);
 
-impl rusqlite::ToSql for SizeWrapper {
+impl rusqlite::ToSql for StoredU64 {
     #[inline]
     fn to_sql(&self) -> Result<rusqlite::types::ToSqlOutput<'_>, rusqlite::Error> {
         let str_value = self.0.to_string();
@@ -114,18 +123,18 @@ impl rusqlite::ToSql for SizeWrapper {
     }
 }
 
-impl rusqlite::types::FromSql for SizeWrapper {
+impl rusqlite::types::FromSql for StoredU64 {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         value.as_str().and_then(|s| {
             s.parse::<u64>()
-                .map(SizeWrapper)
+                .map(StoredU64)
                 .map_err(|_| rusqlite::types::FromSqlError::InvalidType)
         })
     }
 }
 
 pub trait Queryable: Sized {
-    type IdType: HasId;
+    type IdType: HasId + rusqlite::ToSql;
 
     fn table_name() -> &'static str;
     fn fields() -> &'static str;
@@ -140,6 +149,21 @@ pub trait Queryable: Sized {
         let mut stmt = conn.prepare(format!("SELECT {} FROM {}", Self::fields(), Self::table_name()).as_str())?;
         let matches = stmt
             .query_map(params![], Self::from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(matches)
+    }
+
+    fn get_by_ids<I>(conn: &Connection, ids: &I) -> Result<Vec<Self>>
+    where
+        for<'a> &'a I: IntoIterator<Item = &'a Self::IdType>,
+    {
+        let ids: Vec<_> = ids.into_iter().collect();
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql =
+            format!("SELECT {} FROM {} WHERE id IN ({}) ORDER BY id", Self::fields(), Self::table_name(), placeholders);
+        let mut stmt = conn.prepare(&sql)?;
+        let matches = stmt
+            .query_map(params_from_iter(ids), Self::from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(matches)
     }
@@ -158,6 +182,12 @@ pub trait QueryableByDat: Queryable {
         let matches =
             sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id = dat_id.id()}, Self::from_row)?;
         Ok(matches)
+    }
+
+    fn get_num_by_dat(conn: &Connection, dat_id: &DatId) -> Result<usize> {
+        let sql = format!("SELECT COUNT(*) FROM {} WHERE dat_id = :dat_id", Self::table_name());
+        let count: i64 = conn.query_row(&sql, named_params! {":dat_id": dat_id.id()}, |row| row.get(0))?;
+        Ok(count as usize)
     }
 }
 
@@ -364,7 +394,7 @@ impl Queryable for RomRecord {
             dat_id: row.get("dat_id")?,
             set_id: row.get("set_id")?,
             name: row.get("name")?,
-            size: row.get::<_, SizeWrapper>("size")?.0,
+            size: row.get::<_, StoredU64>("size")?.0,
             hash: row.get("hash")?,
         })
     }
@@ -380,7 +410,7 @@ pub struct NewRom {
 
     pub set_id: SetId,
     pub name: String,
-    pub size: SizeWrapper,
+    pub size: StoredU64,
     pub hash: String,
 }
 
@@ -490,7 +520,7 @@ impl Queryable for FileRecord {
             dat_id: row.get("dat_id")?,
             dir_id: row.get("dir_id")?,
             name: row.get("name")?,
-            size: row.get::<_, SizeWrapper>("size")?.0,
+            size: row.get::<_, StoredU64>("size")?.0,
             hash: row.get("hash")?,
         })
     }
@@ -506,7 +536,7 @@ pub struct NewFile {
 
     pub dir_id: DirId,
     pub name: String,
-    pub size: SizeWrapper,
+    pub size: StoredU64,
     pub hash: String,
 }
 
@@ -626,6 +656,7 @@ impl rusqlite::ToSql for MatchStatus {
     }
 }
 
+#[allow(dead_code)]
 impl DatRecord {
     pub fn get_sets(&self, conn: &Connection) -> Result<Vec<SetRecord>> {
         SetRecord::get_by_dat(conn, &self.id)
@@ -652,9 +683,35 @@ impl RomRecord {
         Ok(matches)
     }
 
-    pub fn get_by_hash(conn: &Connection, dat_id: &DatId, hash: &str) -> Result<Vec<RomRecord>> {
+    pub fn find_by_hash_in_dat(conn: &Connection, dat_id: &DatId, hash: &str) -> Result<Vec<RomRecord>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id, hash}, Self::from_row)?;
         Ok(matches)
+    }
+
+    pub fn get_by_sets<I>(conn: &Connection, set_ids: &I) -> Result<HashMap<SetId, Vec<Self>>>
+    where
+        for<'a> &'a I: IntoIterator<Item = &'a SetId>,
+    {
+        let set_ids: Vec<_> = set_ids.into_iter().collect();
+        let mut map: HashMap<SetId, Vec<Self>> = HashMap::new();
+        if set_ids.is_empty() {
+            return Ok(map);
+        }
+        let placeholders = set_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT {} FROM {} WHERE set_id IN ({}) ORDER BY id",
+            Self::fields(),
+            Self::table_name(),
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let matches = stmt
+            .query_map(params_from_iter(set_ids), Self::from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        for m in matches {
+            map.entry(m.set_id).or_default().push(m);
+        }
+        Ok(map)
     }
 }
 
@@ -665,7 +722,7 @@ impl DirRecord {
         Ok(matches)
     }
 
-    pub fn get_by_dat_path(conn: &Connection, dat_id: &DatId, path: &str) -> Result<Option<DirRecord>> {
+    pub fn find_by_path_in_dat(conn: &Connection, dat_id: &DatId, path: &str) -> Result<Option<DirRecord>> {
         match sql_query_one!(conn, Self::table_name(), Self::fields(), where {path, dat_id}, Self::from_row
         ) {
             Ok(dir) => Ok(Some(dir)),
@@ -684,7 +741,7 @@ impl DirRecord {
     }
 
     pub fn find_files(&self, conn: &Connection, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
-        FileRecord::find_by_name(conn, &self.id, name, exact)
+        FileRecord::find_by_name_in_dir(conn, &self.id, name, exact)
     }
 
     pub fn delete_files(&self, conn: &Connection) -> Result<usize> {
@@ -711,7 +768,7 @@ impl FileRecord {
         Ok(matches)
     }
 
-    pub fn find_by_name(conn: &Connection, dir_id: &DirId, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
+    pub fn find_by_name_in_dir(conn: &Connection, dir_id: &DirId, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
         let matches = if exact {
             sql_query!(conn, Self::table_name(), FileRecord::fields(), where {dir_id, name}, order by "name", Self::from_row)
         } else {
@@ -747,16 +804,29 @@ impl FileRecord {
         )?;
         Ok(num_updated)
     }
+
+    pub fn update_name(&self, conn: &Connection, name: &str) -> Result<Self> {
+        let sql = format!("UPDATE {} SET name = :name WHERE id = :id", Self::table_name());
+        conn.execute(
+            &sql,
+            named_params! {
+                ":id": self.id,
+                ":name": name,
+            },
+        )?;
+        Ok(Self {
+            id: self.id,
+            dat_id: self.dat_id,
+            dir_id: self.dir_id,
+            name: name.to_string(),
+            size: self.size,
+            hash: self.hash.clone(),
+        })
+    }
 }
 
 impl MatchRecord {
-    pub fn get_by_file(conn: &Connection, file_id: &FileId) -> Result<Vec<Self>> {
-        let matches =
-            sql_query!(conn, Self::table_name(), Self::fields(), where {file_id}, order by "id", Self::from_row)?;
-        Ok(matches)
-    }
-
-    pub fn get_by_file_status(conn: &Connection, file_id: &FileId, status: &str) -> Result<Vec<Self>> {
+    pub fn find_by_status_for_file(conn: &Connection, file_id: &FileId, status: &MatchStatus) -> Result<Vec<Self>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {file_id, status}, order by "id", Self::from_row)?;
         Ok(matches)
     }
@@ -771,12 +841,12 @@ impl MatchRecord {
             },
         )?;
         Ok(Self {
-            id: self.id.clone(),
-            dat_id: self.dat_id.clone(),
-            file_id: self.file_id.clone(),
+            id: self.id,
+            dat_id: self.dat_id,
+            file_id: self.file_id,
             status: status.clone(),
-            set_id: self.set_id.clone(),
-            rom_id: self.rom_id.clone(),
+            set_id: self.set_id,
+            rom_id: self.rom_id,
         })
     }
 }
@@ -904,4 +974,25 @@ fn run_migrations(conn: &Connection, db_path: &Utf8Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn with_transaction<T, F: FnOnce(&Transaction) -> Result<T>>(conn: &mut Connection, op: F) -> Result<T> {
+    let tx = conn.transaction()?;
+    let result = op(&tx)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+pub fn with_transaction_mut<T, F: FnOnce(&mut Transaction) -> Result<T>>(conn: &mut Connection, op: F) -> Result<T> {
+    let mut tx = conn.transaction()?;
+    let result = op(&mut tx)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+pub fn with_savepoint<T, F: FnOnce(&Savepoint) -> Result<T>>(conn: &mut Transaction, op: F) -> Result<T> {
+    let mut sp = conn.savepoint()?;
+    let result = op(&mut sp)?;
+    sp.commit()?;
+    Ok(result)
 }

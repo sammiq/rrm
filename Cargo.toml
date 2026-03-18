@@ -25,3 +25,4 @@ tempfile = "3.27.0"
 
 [lints.clippy]
 collapsible_if = "allow"
+type_complexity = "allow" # false positives in 1.63

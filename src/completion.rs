@@ -9,31 +9,23 @@ pub enum TreeNode<'a> {
 }
 
 impl TreeNode<'_> {
-    pub fn names(&self) -> Vec<String> {
+    pub fn names(&self) -> Box<dyn Iterator<Item = String> + '_> {
         match self {
-            TreeNode::Branch(name, _) => vec![name.clone()],
-            TreeNode::Option(arg) => {
+            TreeNode::Branch(name, _) => Box::new(std::iter::once(name.clone())),
+            TreeNode::Option(arg) => Box::new(
                 //we assume here that anything without a long or short option
                 //is actually a positional
-                let mut names = Vec::new();
-                if let Some(long) = arg.get_long() {
-                    names.push(format!("--{long}"));
-                }
-                if let Some(short) = arg.get_short() {
-                    names.push(format!("-{short}"));
-                }
-                names
-            }
-            TreeNode::Positional(arg) => vec![arg.get_id().to_string()],
+                arg.get_long()
+                    .map(|long| format!("--{long}"))
+                    .into_iter()
+                    .chain(arg.get_short().map(|short| format!("-{short}"))),
+            ),
+            TreeNode::Positional(arg) => Box::new(std::iter::once(arg.get_id().to_string())),
         }
     }
 }
 
 pub fn build_completions<'a>(command: &'a Command) -> TreeNode<'a> {
-    build_branch(command)
-}
-
-fn build_branch<'a>(command: &'a Command) -> TreeNode<'a> {
     let mut arg_vec = Vec::new();
     for arg in command.get_arguments() {
         if arg.is_positional() {
@@ -43,7 +35,7 @@ fn build_branch<'a>(command: &'a Command) -> TreeNode<'a> {
         }
     }
     for sub in command.get_subcommands() {
-        arg_vec.push(build_branch(sub))
+        arg_vec.push(build_completions(sub))
     }
     TreeNode::Branch(command.get_name().to_string(), arg_vec)
 }
@@ -111,30 +103,27 @@ fn num_arg_values(arg: &Arg) -> usize {
 
 /// Find the first node whose name exactly equals `token`.
 fn find_exact<'a, 'b>(nodes: &'a [TreeNode<'b>], token: &str) -> Option<&'a TreeNode<'b>> {
-    nodes.iter().find(|n| n.names().iter().any(|name| name == token))
+    nodes.iter().find(|n| n.names().any(|name| name == token))
 }
 
 /// Simple name-based prefix match used for Branch and Option nodes,
 /// and Positional nodes without a path hint.
 fn find_partial(node: &TreeNode, partial: &str) -> Vec<String> {
-    node.names()
-        .into_iter()
-        .filter(|name| name.starts_with(partial))
-        .collect()
+    node.names().filter(|name| name.starts_with(partial)).collect()
 }
 
 fn candidates_matching<'a>(nodes: &'a [TreeNode<'a>], partial: &str) -> Vec<String> {
     nodes
         .iter()
         .flat_map(|n| match n {
-            TreeNode::Option(arg) | TreeNode::Positional(arg) => {
+            TreeNode::Option(arg) => {
                 let possible = match_arg_value(arg, partial);
-                if possible.is_empty() {
-                    // No enum values — fall back to name-based match (the flag itself)
-                    find_partial(n, partial)
-                } else {
-                    possible
-                }
+                // if there are enum values — fall back to name-based match (the flag itself)
+                if possible.is_empty() { find_partial(n, partial) } else { possible }
+            }
+            TreeNode::Positional(arg) => {
+                // Don't fall back in this case onto the name itself
+                match_arg_value(arg, partial)
             }
             _ => find_partial(n, partial),
         })
@@ -207,7 +196,7 @@ fn fs_candidates(partial: &str, dirs_only: bool) -> Vec<String> {
                 };
                 format!("{}{}{}", dir_prefix, name, suffix)
             };
-            Some(candidate)
+            Some(shlex::try_quote(&candidate).expect("file paths do not contain null bytes").into_owned())
         })
         .collect()
 }
@@ -345,5 +334,23 @@ mod tests {
     fn nonexistent_dir_returns_empty() {
         let result = fs_candidates("/nonexistent/path/xyz", false);
         assert!(result.is_empty());
+    }
+
+    // --- quoting ---
+
+    #[test]
+    fn file_with_spaces_is_quoted() {
+        let dir = setup(&["my rom.zip", "other.zip"]);
+        let base = dir.path().to_str().unwrap();
+        let result = fs_candidates(&format!("{}/my", base), false);
+        assert_eq!(result, vec![format!("'{}/my rom.zip'", base)]);
+    }
+
+    #[test]
+    fn directory_with_spaces_is_quoted() {
+        let dir = setup(&["/my roms"]);
+        let base = dir.path().to_str().unwrap();
+        let result = fs_candidates(&format!("{}/my", base), false);
+        assert_eq!(result, vec![format!("'{}/my roms/'", base)]);
     }
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn data_dir() -> Option<Utf8PathBuf> {
-    env_to_path("XDG_CONFIG_HOME").or_else(|| home_path(".local/share"))
+    env_to_path("XDG_DATA_HOME").or_else(|| home_path(".local/share"))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -68,6 +68,7 @@ pub fn has_extension<P: AsRef<Utf8Path>, S: AsRef<str>>(file: P, extensions: &[S
         .is_some_and(|ext| extensions.iter().any(|e| ext.eq_ignore_ascii_case(e.as_ref())))
 }
 
+/// Print the size of a value, prefixing with K, M, G or T if required.
 pub fn human_size(size: u64) -> String {
     let mut h_size = size;
     for unit in ["", "K", "M", "G"] {
