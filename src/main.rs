@@ -759,7 +759,7 @@ fn scan_files(
     }
 
     let options = ScanOptions { exclude, recursive };
-    let file_count = scan_directory(tx, dat_id, scan_path, &options, None, &|count| {
+    let file_count = scan_directory(tx, dat_id, scan_path, &options, &|count| {
         report_progress(term, count);
     })?;
 
@@ -783,7 +783,6 @@ fn scan_directory(
     dat_id: &db::DatId,
     scan_path: &Utf8Path,
     options: &ScanOptions<'_>,
-    parent_id: Option<&db::DirId>,
     progress_fn: &dyn Fn(u64),
 ) -> Result<u64> {
     let (dir, incremental) = match db::DirRecord::find_by_path_in_dat(tx, dat_id, scan_path.as_str())? {
@@ -795,7 +794,6 @@ fn scan_directory(
                 &db::NewDir {
                     dat_id: *dat_id,
                     path: scan_path.to_string(),
-                    parent_id: parent_id.cloned(),
                 },
             )?;
             (dir, false)
@@ -824,7 +822,7 @@ fn scan_directory(
             }
             subdirs_by_path.remove(path.as_str());
             file_count =
-                scan_directory(tx, dat_id, path, options, Some(&dir.id), &|count| progress_fn(file_count + count))?;
+                scan_directory(tx, dat_id, path, options, &|count| progress_fn(file_count + count))?;
         } else if path.is_file() {
             if util::has_extension(path, options.exclude) {
                 continue;
@@ -834,7 +832,7 @@ fn scan_directory(
                 subdirs_by_path.remove(path.as_str());
                 //for zip files we need to rollback the entire directory and files if it failed to scan properly
                 match db::with_savepoint(tx, |sp| {
-                    scan_zip_file(&DatContext::new(sp, dat_id), path, options.exclude, &dir.id)
+                    scan_zip_file(&DatContext::new(sp, dat_id), path, options.exclude)
                 }) {
                     Ok(files_scanned) => {
                         file_count += files_scanned;
@@ -897,7 +895,7 @@ fn remove_stale_entries<'a>(
     }
 }
 
-fn scan_zip_file(ctx: &DatContext<'_>, path: &Utf8Path, exclude: &[String], parent_id: &db::DirId) -> Result<u64> {
+fn scan_zip_file(ctx: &DatContext<'_>, path: &Utf8Path, exclude: &[String]) -> Result<u64> {
     let maybe_dir = db::DirRecord::find_by_path_in_dat(ctx.conn, ctx.dat_id, path.as_str())?;
     if maybe_dir.is_some() {
         //if we have scanned this zip file before, skip it during an incremental scan
@@ -909,7 +907,6 @@ fn scan_zip_file(ctx: &DatContext<'_>, path: &Utf8Path, exclude: &[String], pare
         &db::NewDir {
             dat_id: *ctx.dat_id,
             path: path.to_string(),
-            parent_id: Some(*parent_id),
         },
     )?;
 

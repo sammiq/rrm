@@ -159,7 +159,7 @@ pub trait Queryable: Sized {
     {
         let ids: Vec<_> = ids.into_iter().collect();
         if ids.is_empty() {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql =
@@ -442,7 +442,6 @@ pub struct DirRecord {
 
     pub dat_id: DatId,
     pub path: String,
-    pub parent_id: Option<DirId>,
 }
 
 impl Queryable for DirRecord {
@@ -453,7 +452,7 @@ impl Queryable for DirRecord {
     }
 
     fn fields() -> &'static str {
-        "id, dat_id, path, parent_id"
+        "id, dat_id, path"
     }
 
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -461,7 +460,6 @@ impl Queryable for DirRecord {
             id: row.get("id")?,
             dat_id: row.get("dat_id")?,
             path: row.get("path")?,
-            parent_id: row.get("parent_id")?,
         })
     }
 }
@@ -474,7 +472,6 @@ impl DeletableByDat for DirRecord {}
 pub struct NewDir {
     pub dat_id: DatId,
     pub path: String,
-    pub parent_id: Option<DirId>,
 }
 
 impl Bindable for NewDir {
@@ -482,7 +479,6 @@ impl Bindable for NewDir {
         named_params! {
             ":dat_id": self.dat_id,
             ":path": self.path,
-            ":parent_id": self.parent_id,
         }
         .to_vec()
     }
@@ -735,8 +731,17 @@ impl DirRecord {
     }
 
     pub fn get_children(&self, conn: &Connection) -> Result<Vec<DirRecord>> {
-        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {parent_id = self.id}, order by "path", Self::from_row)?;
-        Ok(matches)
+        let sql = format!(
+            "SELECT {} FROM {} WHERE dat_id = :dat_id AND path LIKE :prefix ORDER BY path",
+            Self::fields(),
+            Self::table_name(),
+        );
+        let prefix = format!("{}/%", self.path);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(named_params! { ":dat_id": self.dat_id, ":prefix": prefix }, Self::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn get_files(&self, conn: &Connection) -> Result<Vec<FileRecord>> {
@@ -878,63 +883,109 @@ impl MatchRecord {
     }
 }
 
-pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
-    const CREATE_STATEMENTS: [&str; 15] = [
-        /* dat file */
-        "CREATE TABLE IF NOT EXISTS dats ( id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, description VARCHAR NOT NULL, \
-        version VARCHAR NOT NULL, author VARCHAR NOT NULL, hash_type VARCHAR NOT NULL);",
-        "CREATE TABLE IF NOT EXISTS sets ( id INTEGER PRIMARY KEY, dat_id INTEGER NOT NULL, name VARCHAR NOT NULL, \
-        FOREIGN KEY (dat_id) REFERENCES dats(id) );",
-        "CREATE TABLE IF NOT EXISTS roms ( id INTEGER PRIMARY KEY, dat_id INTEGER NOT NULL, set_id INTEGER NOT NULL, \
-        name VARCHAR NOT NULL, size VARCHAR NOT NULL, hash VARCHAR NOT NULL, \
-        FOREIGN KEY (dat_id) REFERENCES dats(id), FOREIGN KEY (set_id) REFERENCES sets(id) );",
-        /* file system */
-        "CREATE TABLE IF NOT EXISTS dirs ( id INTEGER PRIMARY KEY, dat_id INTEGER NOT NULL, path VARCHAR NOT NULL, \
-        parent_id INTEGER, FOREIGN KEY (dat_id) REFERENCES dats(id), FOREIGN KEY (parent_id) REFERENCES dirs(id), UNIQUE(path, dat_id) );",
-        "CREATE TABLE IF NOT EXISTS files ( id INTEGER PRIMARY KEY, dir_id INTEGER NOT NULL, name VARCHAR NOT NULL, \
-        size VARCHAR NOT NULL, hash VARCHAR NOT NULL, status VARCHAR NOT NULL, set_id INTEGER, rom_id INTEGER, \
-        FOREIGN KEY (dir_id) REFERENCES dirs(id),  FOREIGN KEY (set_id) REFERENCES sets(id), \
-        FOREIGN KEY (rom_id) REFERENCES roms(id) );",
-        /* indices */
-        "CREATE INDEX IF NOT EXISTS idx_dat_sets ON sets(dat_id);",
-        "CREATE INDEX IF NOT EXISTS idx_dat_sets_name ON sets(dat_id, name);",
-        "CREATE INDEX IF NOT EXISTS idx_set_roms ON roms(set_id);",
-        "CREATE INDEX IF NOT EXISTS idx_dat_roms_name ON roms(dat_id, name);",
-        "CREATE INDEX IF NOT EXISTS idx_dat_roms_hash ON roms(dat_id, hash);",
-        "CREATE INDEX IF NOT EXISTS idx_dat_dirs ON dirs(dat_id);",
-        "CREATE INDEX IF NOT EXISTS idx_dat_dirs_path ON dirs(dat_id, path);",
-        "CREATE INDEX IF NOT EXISTS idx_dir_files ON files(dir_id);",
-        "CREATE INDEX IF NOT EXISTS idx_dir_files_name ON files(dir_id, name);",
-        /* versioning */
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
-    ];
+const SCHEMA_VERSION: i64 = 2;
 
+pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
     let mut conn = Connection::open(db_path.as_ref())?;
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
 
-    for stmt in CREATE_STATEMENTS {
-        conn.execute(stmt, ())?;
-    }
+    // Create the schema_version table first so we can detect a fresh database.
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);", ())?;
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
-    run_migrations(&tx, db_path.as_ref())?;
-    tx.commit()?;
+    let version: Option<i64> =
+        tx.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))?;
 
+    if version.is_none() {
+        create_schema(&tx)?;
+    } else {
+        run_migrations(&tx, db_path.as_ref(), version.unwrap())?;
+    }
+
+    tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(conn)
 }
 
-fn run_migrations(conn: &Connection, db_path: &Utf8Path) -> Result<()> {
-    let result: std::result::Result<Option<i64>, rusqlite::Error> =
-        conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0));
-    let version: Option<i64> = match result {
-        Ok(value) => value,
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => bail!(e),
-    };
+fn create_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE dats (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            description VARCHAR NOT NULL,
+            version VARCHAR NOT NULL,
+            author VARCHAR NOT NULL,
+            hash_type VARCHAR NOT NULL
+        );
+        CREATE TABLE sets (
+            id INTEGER PRIMARY KEY,
+            dat_id INTEGER NOT NULL,
+            name VARCHAR NOT NULL,
+            FOREIGN KEY (dat_id) REFERENCES dats(id)
+        );
+        CREATE TABLE roms (
+            id INTEGER PRIMARY KEY,
+            dat_id INTEGER NOT NULL,
+            set_id INTEGER NOT NULL,
+            name VARCHAR NOT NULL,
+            size VARCHAR NOT NULL,
+            hash VARCHAR NOT NULL,
+            FOREIGN KEY (dat_id) REFERENCES dats(id),
+            FOREIGN KEY (set_id) REFERENCES sets(id)
+        );
+        CREATE TABLE dirs (
+            id INTEGER PRIMARY KEY,
+            dat_id INTEGER NOT NULL,
+            path VARCHAR NOT NULL,
+            FOREIGN KEY (dat_id) REFERENCES dats(id),
+            UNIQUE(path, dat_id)
+        );
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY,
+            dat_id INTEGER NOT NULL,
+            dir_id INTEGER NOT NULL,
+            name VARCHAR NOT NULL,
+            size VARCHAR NOT NULL,
+            hash VARCHAR NOT NULL,
+            FOREIGN KEY (dat_id) REFERENCES dats(id),
+            FOREIGN KEY (dir_id) REFERENCES dirs(id),
+            UNIQUE(dir_id, name)
+        );
+        CREATE TABLE matches (
+            id INTEGER PRIMARY KEY,
+            dat_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            status VARCHAR NOT NULL,
+            set_id INTEGER NOT NULL,
+            rom_id INTEGER NOT NULL,
+            FOREIGN KEY (dat_id) REFERENCES dats(id),
+            FOREIGN KEY (file_id) REFERENCES files(id),
+            FOREIGN KEY (set_id) REFERENCES sets(id),
+            FOREIGN KEY (rom_id) REFERENCES roms(id)
+        );
+        CREATE INDEX idx_dat_sets ON sets(dat_id);
+        CREATE INDEX idx_dat_sets_name ON sets(dat_id, name);
+        CREATE INDEX idx_set_roms ON roms(set_id);
+        CREATE INDEX idx_dat_roms_name ON roms(dat_id, name);
+        CREATE INDEX idx_dat_roms_hash ON roms(dat_id, hash);
+        CREATE INDEX idx_dat_dirs ON dirs(dat_id);
+        CREATE INDEX idx_dat_dirs_path ON dirs(dat_id, path);
+        CREATE INDEX idx_dir_files ON files(dir_id);
+        CREATE INDEX idx_dir_files_name ON files(dir_id, name);
+        CREATE INDEX idx_matches_file_id ON matches(file_id);
+        CREATE INDEX idx_matches_set_id ON matches(set_id);
+        CREATE INDEX idx_matches_rom_id ON matches(rom_id);
+        CREATE INDEX idx_matches_dat_id ON matches(dat_id);
+        "#,
+    )?;
+    conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [SCHEMA_VERSION])?;
+    Ok(())
+}
 
-    if version.is_none() {
-        //before we run any migrations, we should backup the database, just in case something goes wrong.
+fn run_migrations(conn: &Connection, db_path: &Utf8Path, version: i64) -> Result<()> {
+    if version < 1 {
+        // Before running any migrations, back up the database just in case.
         let backup_file = db_path.with_extension("v0.bak");
         std::fs::copy(db_path, &backup_file)?;
 
@@ -996,8 +1047,33 @@ fn run_migrations(conn: &Connection, db_path: &Utf8Path) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_dir_files_name ON files(dir_id, name);
             "#,
         )?;
-        //if that migration runs, then we need to set the schema version to 1, so that it doesn't run again.
         conn.execute("INSERT INTO schema_version (version) VALUES (1)", [])?;
+    }
+
+    if version < 2 {
+        // Migration 2: Drop parent_id from dirs. The self-referential FK caused constraint
+        // violations when stale parent dirs were deleted without first deleting child dirs.
+        // parent_id was only used to find children, which is now done by path-prefix query.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE dirs_new (
+                id INTEGER PRIMARY KEY,
+                dat_id INTEGER NOT NULL,
+                path VARCHAR NOT NULL,
+                FOREIGN KEY (dat_id) REFERENCES dats(id),
+                UNIQUE(path, dat_id)
+            );
+
+            INSERT INTO dirs_new (id, dat_id, path)
+                SELECT id, dat_id, path FROM dirs;
+
+            DROP TABLE dirs;
+
+            ALTER TABLE dirs_new RENAME TO dirs;
+            CREATE INDEX IF NOT EXISTS idx_dirs_dat_id ON dirs(dat_id);
+            "#,
+        )?;
+        conn.execute("INSERT INTO schema_version (version) VALUES (2)", [])?;
     }
 
     Ok(())
