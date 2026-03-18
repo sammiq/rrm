@@ -117,9 +117,9 @@ fn candidates_matching<'a>(nodes: &'a [TreeNode<'a>], partial: &str) -> Vec<Stri
         .iter()
         .flat_map(|n| match n {
             TreeNode::Option(arg) => {
-                let possible = match_arg_value(arg, partial);
-                // if there are enum values — fall back to name-based match (the flag itself)
-                if possible.is_empty() { find_partial(n, partial) } else { possible }
+                let name_matches = find_partial(n, partial);
+                // prefer flag name match; only fall back to arg value match if no flag matches partial
+                if name_matches.is_empty() { match_arg_value(arg, partial) } else { name_matches }
             }
             TreeNode::Positional(arg) => {
                 // Don't fall back in this case onto the name itself
@@ -204,8 +204,237 @@ fn fs_candidates(partial: &str, dirs_only: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ArgAction;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Build a test command with a mix of flags, enum-valued options, subcommands,
+    /// and positional args. Help/version flags are disabled so tests have a fixed set.
+    fn make_command() -> Command {
+        Command::new("cmd")
+            .disable_help_flag(true)
+            .disable_version_flag(true)
+            .arg(
+                Arg::new("format")
+                    .long("format")
+                    .value_parser(["json", "table", "plain"])
+                    .num_args(1),
+            )
+            .arg(Arg::new("verbose").long("verbose").short('v').action(ArgAction::SetTrue))
+            .subcommand(
+                Command::new("install")
+                    .disable_help_flag(true)
+                    .arg(Arg::new("package").value_parser(["pkg-a", "pkg-b", "pkg-c"]).num_args(1))
+                    .arg(Arg::new("force").long("force").action(ArgAction::SetTrue)),
+            )
+            .subcommand(Command::new("remove").disable_help_flag(true))
+    }
+
+    // --- TreeNode::names() ---
+
+    #[test]
+    fn branch_names_returns_its_name() {
+        let node: TreeNode = TreeNode::Branch("foo".into(), vec![]);
+        assert_eq!(node.names().collect::<Vec<_>>(), vec!["foo"]);
+    }
+
+    #[test]
+    fn option_names_long_and_short() {
+        let cmd = make_command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "verbose").unwrap();
+        let node = TreeNode::Option(arg);
+        let names = node.names().collect::<Vec<_>>();
+        // long name is yielded before short per names() iterator order
+        assert_eq!(names, vec!["--verbose", "-v"]);
+    }
+
+    #[test]
+    fn option_names_long_only() {
+        let cmd = make_command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "format").unwrap();
+        let node = TreeNode::Option(arg);
+        assert_eq!(node.names().collect::<Vec<_>>(), vec!["--format"]);
+    }
+
+    #[test]
+    fn positional_names_returns_id() {
+        let cmd = make_command();
+        let subcmd = cmd.get_subcommands().find(|s| s.get_name() == "install").unwrap();
+        let arg = subcmd.get_arguments().find(|a| a.get_id() == "package").unwrap();
+        let node = TreeNode::Positional(arg);
+        assert_eq!(node.names().collect::<Vec<_>>(), vec!["package"]);
+    }
+
+    // --- build_completions ---
+
+    #[test]
+    fn build_completions_creates_branch_for_root() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        assert!(matches!(tree, TreeNode::Branch(ref name, _) if name == "cmd"));
+    }
+
+    #[test]
+    fn build_completions_includes_subcommands_and_args() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let TreeNode::Branch(_, children) = &tree else { panic!("expected Branch") };
+        let all_names: Vec<String> = children.iter().flat_map(|n| n.names()).collect();
+        assert!(all_names.contains(&"--format".to_string()));
+        assert!(all_names.contains(&"--verbose".to_string()));
+        assert!(all_names.contains(&"install".to_string()));
+        assert!(all_names.contains(&"remove".to_string()));
+    }
+
+    // --- complete(): top-level ---
+
+    #[test]
+    fn complete_empty_line_returns_all_top_level() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, mut candidates) = complete(&tree, "");
+        candidates.sort();
+        assert_eq!(len, 0);
+        assert_eq!(candidates, vec!["--format", "--verbose", "-v", "install", "remove"]);
+    }
+
+    #[test]
+    fn complete_partial_subcommand_filters_and_returns_length() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, candidates) = complete(&tree, "ins");
+        assert_eq!(len, 3);
+        assert_eq!(candidates, vec!["install"]);
+    }
+
+    #[test]
+    fn complete_partial_option_name_filters() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, candidates) = complete(&tree, "--fo");
+        assert_eq!(len, 4);
+        assert_eq!(candidates, vec!["--format"]);
+    }
+
+    #[test]
+    fn complete_no_match_returns_empty() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (_, candidates) = complete(&tree, "xyz");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn complete_non_branch_root_returns_empty() {
+        let cmd = make_command();
+        let arg = cmd.get_arguments().next().unwrap();
+        let node = TreeNode::Option(arg);
+        let (len, candidates) = complete(&node, "");
+        assert_eq!(len, 0);
+        assert!(candidates.is_empty());
+    }
+
+    // --- complete(): subcommand navigation ---
+
+    #[test]
+    fn complete_after_subcommand_with_trailing_space() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, mut candidates) = complete(&tree, "install ");
+        candidates.sort();
+        assert_eq!(len, 0);
+        assert!(candidates.contains(&"--force".to_string()));
+    }
+
+    #[test]
+    fn complete_partial_option_inside_subcommand() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, candidates) = complete(&tree, "install --fo");
+        assert_eq!(len, 4);
+        assert_eq!(candidates, vec!["--force"]);
+    }
+
+    #[test]
+    fn complete_unknown_subcommand_returns_empty() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (_, candidates) = complete(&tree, "unknown ");
+        assert!(candidates.is_empty());
+    }
+
+    // --- complete(): option value completion ---
+
+    #[test]
+    fn complete_option_enum_value_empty_partial() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, mut candidates) = complete(&tree, "--format ");
+        candidates.sort();
+        assert_eq!(len, 0);
+        assert_eq!(candidates, vec!["json", "plain", "table"]);
+    }
+
+    #[test]
+    fn complete_option_enum_value_partial() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, candidates) = complete(&tree, "--format ta");
+        assert_eq!(len, 2);
+        assert_eq!(candidates, vec!["table"]);
+    }
+
+    #[test]
+    fn complete_option_enum_value_no_match_returns_empty() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (_, candidates) = complete(&tree, "--format xyz");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn complete_after_option_and_value_consumed_shows_next_flags() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, mut candidates) = complete(&tree, "--format json ");
+        candidates.sort();
+        assert_eq!(len, 0);
+        assert!(candidates.contains(&"--verbose".to_string()));
+        assert!(candidates.contains(&"-v".to_string()));
+    }
+
+    #[test]
+    fn complete_option_value_fallback_when_partial_does_not_match_flag() {
+        // "j" does not match any flag name, so falls back to matching enum values
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, candidates) = complete(&tree, "j");
+        assert_eq!(len, 1);
+        assert_eq!(candidates, vec!["json"]);
+    }
+
+    // --- complete(): positional completion ---
+
+    #[test]
+    fn complete_positional_enum_partial() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, mut candidates) = complete(&tree, "install pkg-");
+        candidates.sort();
+        assert_eq!(len, 4);
+        assert_eq!(candidates, vec!["pkg-a", "pkg-b", "pkg-c"]);
+    }
+
+    #[test]
+    fn complete_positional_enum_empty_partial() {
+        let cmd = make_command();
+        let tree = build_completions(&cmd);
+        let (len, mut candidates) = complete(&tree, "install ");
+        candidates.sort();
+        assert_eq!(len, 0);
+        assert!(candidates.contains(&"pkg-a".to_string()));
+        assert!(candidates.contains(&"pkg-b".to_string()));
+    }
 
     /// Create a temp dir with a given set of files and subdirectories.
     /// Prefix entries with "/" to create directories.

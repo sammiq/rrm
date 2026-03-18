@@ -89,7 +89,7 @@ pub fn calc_hash<R: std::io::Read + ?Sized>(reader: &mut R) -> Result<(String, u
 }
 
 /// This trait allows inline inspection of parts of a result.
-/// This is similar to the unstable Result::inspect and Result::inspect_err
+/// This is similar to  Result::inspect and Result::inspect_err
 /// except that it destructs the result, and takes ownership of the value or error.
 /// This is by design as it eases readability of code using the construct, and
 /// forces users to use match statements where appropriate.
@@ -114,14 +114,12 @@ impl<T, E> ResultIf<T, E> for std::result::Result<T, E> {
 }
 
 /// This trait allows inline inspection of parts of an option.
-/// This is similar to the unstable Option::inspect
-/// except that it destructs the Option, and takes ownership of the value.
+/// This is similar to Option::inspect except that it destructs the Option,
+/// and takes ownership of the value.
 /// This is by design as it eases readability of code using the construct, and
 /// forces users to use match statements where appropriate.
-#[allow(dead_code)]
 pub trait OptionIf<T> {
     fn if_some<F: FnOnce(T)>(self, op: F);
-    fn if_none<F: FnOnce()>(self, op: F);
 }
 
 impl<T> OptionIf<T> for std::option::Option<T> {
@@ -130,10 +128,195 @@ impl<T> OptionIf<T> for std::option::Option<T> {
             op(t);
         }
     }
+}
 
-    fn if_none<F: FnOnce()>(self, op: F) {
-        if self.is_none() {
-            op();
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_hidden_file ---
+
+    #[cfg(not(windows))]
+    #[test]
+    fn hidden_file_dotfile_is_hidden() {
+        assert!(is_hidden_file(".bashrc"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn hidden_file_regular_file_is_not_hidden() {
+        assert!(!is_hidden_file("readme.txt"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn hidden_file_dotfile_in_subdir_is_not_hidden() {
+        // the file name component ("foo") doesn't start with '.'
+        assert!(!is_hidden_file(".config/foo"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn hidden_file_dotdir_itself_is_hidden() {
+        assert!(is_hidden_file(".config"));
+    }
+
+    // --- is_zip_file ---
+
+    #[test]
+    fn zip_file_lowercase_extension() {
+        assert!(is_zip_file("archive.zip"));
+    }
+
+    #[test]
+    fn zip_file_uppercase_extension() {
+        assert!(is_zip_file("archive.ZIP"));
+    }
+
+    #[test]
+    fn zip_file_mixed_case_extension() {
+        assert!(is_zip_file("archive.Zip"));
+    }
+
+    #[test]
+    fn zip_file_no_extension() {
+        assert!(!is_zip_file("archive"));
+    }
+
+    #[test]
+    fn zip_file_different_extension() {
+        assert!(!is_zip_file("archive.tar"));
+    }
+
+    // --- has_extension ---
+
+    #[test]
+    fn has_extension_match() {
+        assert!(has_extension("photo.jpg", &["jpg", "jpeg", "png"]));
+    }
+
+    #[test]
+    fn has_extension_case_insensitive() {
+        assert!(has_extension("photo.JPG", &["jpg", "jpeg", "png"]));
+    }
+
+    #[test]
+    fn has_extension_no_match() {
+        assert!(!has_extension("photo.gif", &["jpg", "jpeg", "png"]));
+    }
+
+    #[test]
+    fn has_extension_no_extension() {
+        assert!(!has_extension("photo", &["jpg"]));
+    }
+
+    // --- human_size ---
+
+    #[test]
+    fn human_size_bytes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn human_size_kilobytes() {
+        assert_eq!(human_size(1024), "1 KB");
+        assert_eq!(human_size(2048), "2 KB");
+    }
+
+    #[test]
+    fn human_size_megabytes() {
+        assert_eq!(human_size(1024 * 1024), "1 MB");
+    }
+
+    #[test]
+    fn human_size_gigabytes() {
+        assert_eq!(human_size(1024 * 1024 * 1024), "1 GB");
+    }
+
+    #[test]
+    fn human_size_terabytes() {
+        assert_eq!(human_size(1024u64 * 1024 * 1024 * 1024), "1 TB");
+    }
+
+    // --- calc_hash ---
+
+    #[test]
+    fn calc_hash_known_value() {
+        // SHA1("") == da39a3ee5e6b4b0d3255bfef95601890afd80709
+        let mut input: &[u8] = b"";
+        let (hash, size) = calc_hash(&mut input).unwrap();
+        assert_eq!(hash, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn calc_hash_hello_world() {
+        let mut input: &[u8] = b"hello world";
+        let (hash, size) = calc_hash(&mut input).unwrap();
+        assert_eq!(hash, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
+        assert_eq!(size, 11);
+    }
+
+    // --- ResultIf ---
+
+    #[test]
+    fn result_if_ok_calls_closure_on_ok() {
+        let mut called = false;
+        let r: Result<i32, &str> = Ok(42);
+        r.if_ok(|v| {
+            assert_eq!(v, 42);
+            called = true;
+        });
+        assert!(called);
+    }
+
+    #[test]
+    fn result_if_ok_does_not_call_closure_on_err() {
+        let mut called = false;
+        let r: Result<i32, &str> = Err("oops");
+        r.if_ok(|_| called = true);
+        assert!(!called);
+    }
+
+    #[test]
+    fn result_if_err_calls_closure_on_err() {
+        let mut called = false;
+        let r: Result<i32, &str> = Err("oops");
+        r.if_err(|e| {
+            assert_eq!(e, "oops");
+            called = true;
+        });
+        assert!(called);
+    }
+
+    #[test]
+    fn result_if_err_does_not_call_closure_on_ok() {
+        let mut called = false;
+        let r: Result<i32, &str> = Ok(1);
+        r.if_err(|_| called = true);
+        assert!(!called);
+    }
+
+    // --- OptionIf ---
+
+    #[test]
+    fn option_if_some_calls_closure_on_some() {
+        let mut called = false;
+        let o: Option<i32> = Some(7);
+        o.if_some(|v| {
+            assert_eq!(v, 7);
+            called = true;
+        });
+        assert!(called);
+    }
+
+    #[test]
+    fn option_if_some_does_not_call_closure_on_none() {
+        let mut called = false;
+        let o: Option<i32> = None;
+        o.if_some(|_| called = true);
+        assert!(!called);
     }
 }
