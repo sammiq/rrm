@@ -184,6 +184,9 @@ enum DataCommands {
         /// don't ask for confirmation, and perform the action
         #[arg(long)]
         yes: bool,
+
+        /// the index of the dat file to select, as seen in list
+        index: Option<usize>,
     },
     /// List dat files in the system
     List,
@@ -252,7 +255,7 @@ fn main() -> Result<()> {
     let mut conn = db::open_or_create(&db_path)?;
     let mut dat_id = None;
 
-    let args = Args::parse();
+    let args = Args::parse_from(wild::args_os());
 
     let term = TermInfo {
         tty_in: std::io::stdin().is_terminal(),
@@ -261,14 +264,7 @@ fn main() -> Result<()> {
     };
 
     if let Some(index) = args.select {
-        do_command(
-            &mut conn,
-            &mut dat_id,
-            &term,
-            &Commands::Data {
-                data: DataCommands::Select { index },
-            },
-        )?;
+        select_dat(&conn, &mut dat_id, index)?;
     } else {
         dat_id = select_dat_from_path(&conn);
     }
@@ -360,7 +356,7 @@ fn do_command(
     match command {
         Commands::Data { data } => handle_data_commands(conn, dat_id, term, data),
         Commands::Files { files } => handle_file_commands(conn, dat_id.as_ref(), term, files),
-        Commands::Select { index } => handle_data_commands(conn, dat_id, term, &DataCommands::Select { index: *index }),
+        Commands::Select { index } => select_dat(conn, dat_id, *index),
     }
 }
 
@@ -373,6 +369,7 @@ fn handle_data_commands(
     match data {
         DataCommands::Import { dat_file } => {
             ensure!(dat_file.is_file(), "`{}` is not a valid file", dat_file);
+
             db::with_transaction(conn, |tx| {
                 import_dat(tx, dat_file).map(|imported| {
                     if term.interactive {
@@ -398,11 +395,17 @@ fn handle_data_commands(
             }
             Ok(())
         }
-        DataCommands::Remove { yes } => {
-            ensure!(dat_id.is_some(), "No dat file selected");
+        DataCommands::Remove { yes, index } => {
+            let (old_dat_id, prompt) = if let Some(index) = index {
+                let dat = get_dat_by_index(conn, *index)?;
+                (dat.id, format!("dat file `{}`", dat.name))
+            } else if let Some(select_id) = *dat_id {
+                (select_id, "the current dat file".to_string())
+            } else {
+                bail!("No dat file selected");
+            };
 
-            if ask_for_confirmation(term, "Are you sure you want to remove the current dat file? (y/N): ", *yes)? {
-                let old_dat_id = dat_id.take().expect("Option should contain data");
+            if ask_for_confirmation(term, &format!("Are you sure you want to remove {}? (y/N): ", prompt), *yes)? {
                 db::with_transaction(conn, |tx| {
                     delete_dat(tx, old_dat_id).map(|_| {
                         println!("dat file removed.");
@@ -413,12 +416,7 @@ fn handle_data_commands(
             Ok(())
         }
         DataCommands::List => list_dat_files(conn),
-        DataCommands::Select { index } => db::DatRecord::get_all(conn).and_then(|dats| {
-            let dat = dats.get(*index).ok_or_else(|| anyhow!("Invalid dat file selection."))?;
-            println!("dat file `{}` selected.", dat.name);
-            *dat_id = Some(dat.id);
-            Ok(())
-        }),
+        DataCommands::Select { index } => select_dat(conn, dat_id, *index),
         DataCommands::Records => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
             list_dat_records(&DatContext::new(conn, dat_id))
@@ -432,6 +430,24 @@ fn handle_data_commands(
             list_roms(&DatContext::new(conn, dat_id), partial_name.as_deref())
         }
     }
+}
+
+fn get_dat_by_index(conn: &Connection, index: usize) -> Result<db::DatRecord> {
+    db::DatRecord::get_all(conn).and_then(|mut dats| {
+        if index < dats.len() {
+            let dat = dats.swap_remove(index);
+            Ok(dat)
+        } else {
+            bail!("Invalid dat file selection.")
+        }
+    })
+}
+
+fn select_dat(conn: &Connection, dat_id: &mut Option<db::DatId>, index: usize) -> Result<()> {
+    get_dat_by_index(conn, index).map(|dat| {
+        println!("dat file `{}` selected.", dat.name);
+        *dat_id = Some(dat.id);
+    })
 }
 
 fn ask_for_confirmation(term: &TermInfo, prompt: &str, force: bool) -> Result<bool> {
@@ -821,8 +837,7 @@ fn scan_directory(
                 continue;
             }
             subdirs_by_path.remove(path.as_str());
-            let subdir_count =
-                scan_directory(tx, dat_id, path, options, &|count| progress_fn(file_count + count))?;
+            let subdir_count = scan_directory(tx, dat_id, path, options, &|count| progress_fn(file_count + count))?;
             file_count += subdir_count;
         } else if path.is_file() {
             if util::has_extension(path, options.exclude) {
@@ -832,9 +847,7 @@ fn scan_directory(
             if util::is_zip_file(path) {
                 subdirs_by_path.remove(path.as_str());
                 //for zip files we need to rollback the entire directory and files if it failed to scan properly
-                match db::with_savepoint(tx, |sp| {
-                    scan_zip_file(&DatContext::new(sp, dat_id), path, options.exclude)
-                }) {
+                match db::with_savepoint(tx, |sp| scan_zip_file(&DatContext::new(sp, dat_id), path, options.exclude)) {
                     Ok(files_scanned) => {
                         file_count += files_scanned;
                     }
@@ -890,7 +903,8 @@ fn remove_stale_entries<'a>(
         }
     }
     for (_, existing_file) in stale_files {
-        existing_file.delete_matches(ctx.conn)
+        existing_file
+            .delete_matches(ctx.conn)
             .and_then(|_| db::FileRecord::delete_by_id(ctx.conn, &existing_file.id))
             .if_err(|e| eprintln!("Failed to remove {}. Error: {e}", existing_file.name));
     }
