@@ -37,31 +37,62 @@ IMPORTANT: Performance will be *terrible* without compiling for release, the SHA
 Manage DAT files and their contents:
 
     rrm data import <DAT_FILE>              Import a new DAT file
+        DAT_FILE                            Path to a logiqx xml format dat file
+
     rrm data update <DAT_FILE> [--yes]      Update current DAT file and re-match files
-    rrm data remove [--yes]                 Remove current DAT and all associated matches
+        DAT_FILE                            Path to a logiqx xml format dat file
+        --yes                               Skip confirmation prompt
+
+    rrm data remove [--yes] [INDEX]         Remove current or selected DAT and all associated data
+        INDEX                               Index of the DAT file to remove, as shown by list
+                                            (defaults to the current DAT)
+        --yes                               Skip confirmation prompt
+
     rrm data list                           List all installed DAT files
-    rrm data select <INDEX>                 Select active DAT file
+
+    rrm data select <INDEX>                 Select active DAT file by index
+        INDEX                               Index of the DAT file to select, as shown by list
+
     rrm data records                        Show all Sets and ROMs in current DAT
+
     rrm data sets [PARTIAL_NAME]            Search for Sets by partial name
+        PARTIAL_NAME                        Optional substring to filter sets by name
+
     rrm data roms [PARTIAL_NAME]            Search for ROMs by partial name
+        PARTIAL_NAME                        Optional substring to filter ROMs by name
 
 ### Files Commands
 
 Scan and manage ROM files:
 
     rrm files scan [OPTIONS] [PATH]         Scan directory for ROM files
+        PATH                                Directory to scan (defaults to current directory)
         -R, --recursive                     Recurse into subdirectories
         --full                              Re-scan all files, not just new ones
         --exclude <EXTENSIONS>              Comma separated list of suffixes to exclude
                                             [default: m3u,dat,txt]
 
     rrm files list [--mode MODE] [NAME]     List scanned files
-                                            Modes: all, matched, unmatched, warning
-    rrm files matched [NAME]                List matched files
-    rrm files unmatched [NAME]              List unmatched files
-    rrm files warning [NAME]                List files with warnings
+        NAME                                Optional substring to filter files by name
+        --mode <MODE>                       Filter by status: all (default), matched,
+                                            unmatched, or warning
+
+    rrm files matched [NAME]                List matched files (alias for list --mode matched)
+        NAME                                Optional substring to filter files by name
+
+    rrm files unmatched [NAME]              List unmatched files (alias for list --mode unmatched)
+        NAME                                Optional substring to filter files by name
+
+    rrm files warning [NAME]                List files with warnings (alias for list --mode warning)
+        NAME                                Optional substring to filter files by name
+
     rrm files sets [--missing] [NAME]       List found or missing game sets
-    rrm files missing [NAME]                List missing game sets
+        NAME                                Optional substring to filter sets by name
+        --missing                           Show missing sets instead of found sets
+
+    rrm files missing [NAME]                List missing game sets (alias for sets --missing)
+        NAME                                Optional substring to filter sets by name
+
     rrm files rename                        Rename loose files to correct names
 
 ### Interactive Mode
@@ -76,7 +107,7 @@ rrm stores all imported DAT files, scanned file records, and match results in a 
 - **macOS**: `~/Library/Application Support/rrm/rrm.db`
 - **Windows**: `%APPDATA%\rrm\rrm.db`
 
-A backup (`rrm.bak`) is automatically in the same directory created each time the tool is run in case you need to roll back.
+A backup (`rrm.bak`) is automatically created in the same directory each time the tool is run in case you need to roll back.
 
 ## Key Features
 
