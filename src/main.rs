@@ -92,15 +92,15 @@ enum Commands {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum ListMode {
-    /// list all files
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SelectMode {
+    /// select all files
     All,
-    /// list only matched files
+    /// select only matched files
     Matched,
-    /// list only misnamed or bad dumps
+    /// select only misnamed or bad dumps
     Warning,
-    /// list only unmatched files
+    /// select only unmatched files
     Unmatched,
 }
 
@@ -124,8 +124,8 @@ enum FileCommands {
     /// list all files scanned and show their status
     List {
         /// show only files with this status
-        #[arg(long, value_enum, default_value_t = ListMode::All)]
-        mode: ListMode,
+        #[arg(long, value_enum, default_value_t = SelectMode::All)]
+        mode: SelectMode,
         /// show only files partially matching this name
         partial_name: Option<String>,
     },
@@ -146,6 +146,19 @@ enum FileCommands {
         missing: bool,
         /// show only sets partially matching this name
         partial_name: Option<String>,
+    },
+    /// Sort files into directory
+    Sort {
+        /// sort only files with this status
+        #[arg(long, value_enum, default_value_t = SelectMode::Unmatched)]
+        mode: SelectMode,
+        /// the base path to use when moving files
+        #[arg(default_value=".", value_hint = clap::ValueHint::DirPath)]
+        path: Utf8PathBuf,
+
+        // whether to keep the moved files in the database
+        #[arg(long)]
+        keep: bool,
     },
     //rename files to the correct name (loose files only)
     Rename,
@@ -497,18 +510,21 @@ fn handle_file_commands(
                 list_found_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
             }
         }
+        FileCommands::Sort { mode, path, keep } => {
+            db::with_transaction_mut(conn, |tx| sort_files(tx, dat_id, mode, path, *keep))
+        }
         FileCommands::Rename => db::with_transaction_mut(conn, |tx| rename_files(tx, dat_id, term)),
         FileCommands::Matched { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, &ListMode::Matched, partial_name.as_deref())
+            list_scanned_files(&DatContext::new(conn, dat_id), term, &SelectMode::Matched, partial_name.as_deref())
         }
         FileCommands::Missing { partial_name } => {
             list_missing_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
         }
         FileCommands::Unmatched { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, &ListMode::Unmatched, partial_name.as_deref())
+            list_scanned_files(&DatContext::new(conn, dat_id), term, &SelectMode::Unmatched, partial_name.as_deref())
         }
         FileCommands::Warning { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, &ListMode::Warning, partial_name.as_deref())
+            list_scanned_files(&DatContext::new(conn, dat_id), term, &SelectMode::Warning, partial_name.as_deref())
         }
     }
 }
@@ -523,6 +539,161 @@ fn list_dat_files(conn: &Connection) -> Result<()> {
             println!("[{i}] {} version: {}", dat.name, dat.version);
         }
     }
+    Ok(())
+}
+
+/// Classify a file into a SelectMode based on its match records.
+fn classify_file(conn: &Connection, file: &db::FileRecord) -> Result<SelectMode> {
+    let matches = db::MatchRecord::get_by_file_id(conn, &file.id)?;
+    if matches.is_empty() {
+        return Ok(SelectMode::Unmatched);
+    }
+    if matches.iter().any(|m| m.status == db::MatchStatus::Match) {
+        Ok(SelectMode::Matched)
+    } else {
+        Ok(SelectMode::Warning)
+    }
+}
+
+/// Classify a zip directory based on the statuses of all files inside it.
+/// Returns Unmatched if no files have any matches, Matched if all files are Match, Warning otherwise.
+fn classify_zip(conn: &Connection, dir: &db::DirRecord) -> Result<SelectMode> {
+    let files = dir.get_files(conn)?;
+    if files.is_empty() {
+        return Ok(SelectMode::Unmatched);
+    }
+    let mut all_matched = true;
+    let mut any_matched = false;
+    for file in &files {
+        match classify_file(conn, file)? {
+            SelectMode::Matched => any_matched = true,
+            SelectMode::Unmatched => all_matched = false,
+            _ => {
+                any_matched = true;
+                all_matched = false;
+            }
+        }
+    }
+    if !any_matched {
+        Ok(SelectMode::Unmatched)
+    } else if all_matched {
+        Ok(SelectMode::Matched)
+    } else {
+        Ok(SelectMode::Warning)
+    }
+}
+
+fn subdir_name(mode: &SelectMode) -> &'static str {
+    match mode {
+        SelectMode::Matched => "matched",
+        SelectMode::Warning => "warning",
+        SelectMode::Unmatched => "unmatched",
+        SelectMode::All => unreachable!(),
+    }
+}
+
+/// Get or create a DirRecord for the given path, caching in the provided map.
+fn get_or_create_dest_dir(
+    conn: &Connection,
+    dat_id: &db::DatId,
+    dest_dirs: &mut BTreeMap<String, db::DirId>,
+    dest_path: &str,
+) -> Result<db::DirId> {
+    if let Some(id) = dest_dirs.get(dest_path) {
+        return Ok(*id);
+    }
+    let dir = if let Some(existing) = db::DirRecord::find_by_path_in_dat(conn, dat_id, dest_path)? {
+        existing
+    } else {
+        db::DirRecord::insert(
+            conn,
+            &db::NewDir {
+                dat_id: *dat_id,
+                path: dest_path.to_string(),
+            },
+        )?
+    };
+    dest_dirs.insert(dest_path.to_string(), dir.id);
+    Ok(dir.id)
+}
+
+fn sort_files(tx: &mut Transaction, dat_id: &db::DatId, mode: &SelectMode, path: &Utf8Path, keep: bool) -> Result<()> {
+    // Determine which modes we need subdirectories for
+    let modes: Vec<SelectMode> = match mode {
+        SelectMode::All => vec![SelectMode::Matched, SelectMode::Warning, SelectMode::Unmatched],
+        other => vec![*other],
+    };
+
+    // Create destination subdirectories on disk
+    for m in &modes {
+        let dest = path.join(subdir_name(m));
+        if !dest.exists() {
+            std::fs::create_dir_all(&dest)?;
+        }
+    }
+
+    // Cache of destination DirRecords (path -> DirId) for keep mode
+    let mut dest_dirs: BTreeMap<String, db::DirId> = BTreeMap::new();
+
+    for dir in db::DirRecord::get_by_dat(tx, dat_id)? {
+        if util::is_zip_file(&dir.path) {
+            // Classify the zip as a whole
+            let zip_mode = classify_zip(tx, &dir)?;
+            if *mode != SelectMode::All && *mode != zip_mode {
+                continue;
+            }
+
+            let zip_path = Utf8PathBuf::from(&dir.path);
+            let file_name = zip_path.file_name().context("zip should have a file name")?;
+            let dest = path.join(subdir_name(&zip_mode)).join(file_name);
+
+            match db::with_savepoint(tx, |sp| {
+                std::fs::rename(&zip_path, &dest)?;
+                if keep {
+                    // Update the dir record path to the new location
+                    dir.update_path(sp, dest.as_str())?;
+                } else {
+                    // Delete matches, files, and the dir record
+                    dir.delete_matches(sp)?;
+                    dir.delete_files(sp)?;
+                    db::DirRecord::delete_by_id(sp, &dir.id)?;
+                }
+                Ok(())
+            }) {
+                Ok(()) => println!("[zip] {} -> {}", dir.path, dest),
+                Err(e) => eprintln!("Failed to sort zip {}. Error was {e}", dir.path),
+            }
+        } else {
+            // Loose files: handle each file individually
+            let files = dir.get_files(tx)?;
+            for file in &files {
+                let file_mode = classify_file(tx, file)?;
+                if *mode != SelectMode::All && *mode != file_mode {
+                    continue;
+                }
+
+                let src = Utf8Path::new(&dir.path).join(&file.name);
+                let dest = path.join(subdir_name(&file_mode)).join(&file.name);
+
+                match db::with_savepoint(tx, |sp| {
+                    std::fs::rename(&src, &dest)?;
+                    if keep {
+                        let dest_path_str = path.join(subdir_name(&file_mode)).as_str().to_string();
+                        let dest_dir_id = get_or_create_dest_dir(sp, dat_id, &mut dest_dirs, &dest_path_str)?;
+                        file.update_dir_id(sp, &dest_dir_id)?;
+                    } else {
+                        file.delete_matches(sp)?;
+                        db::FileRecord::delete_by_id(sp, &file.id)?;
+                    }
+                    Ok(())
+                }) {
+                    Ok(()) => println!("{} -> {}", src, dest),
+                    Err(e) => eprintln!("Failed to sort {}. Error was {e}", file.name),
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1106,13 +1277,13 @@ fn insert_matches(
     Ok(())
 }
 
-fn should_display_file_status(status: Option<&db::MatchStatus>, mode: &ListMode) -> bool {
+fn should_display_file_status(status: Option<&db::MatchStatus>, mode: &SelectMode) -> bool {
     matches!(
         (status, mode),
-        (None, ListMode::Unmatched | ListMode::All)
-            | (Some(db::MatchStatus::Hash), ListMode::Warning | ListMode::All)
-            | (Some(db::MatchStatus::Name), ListMode::Warning | ListMode::All)
-            | (Some(db::MatchStatus::Match), ListMode::Matched | ListMode::All)
+        (None, SelectMode::Unmatched | SelectMode::All)
+            | (Some(db::MatchStatus::Hash), SelectMode::Warning | SelectMode::All)
+            | (Some(db::MatchStatus::Name), SelectMode::Warning | SelectMode::All)
+            | (Some(db::MatchStatus::Match), SelectMode::Matched | SelectMode::All)
     )
 }
 
@@ -1166,7 +1337,7 @@ fn format_file_status(
 fn list_scanned_files(
     ctx: &DatContext<'_>,
     term: &TermInfo,
-    mode: &ListMode,
+    mode: &SelectMode,
     partial_name: Option<&str>,
 ) -> Result<()> {
     //get these in bulk to avoid doing a query per file when we display them
@@ -1620,34 +1791,34 @@ mod tests {
 
     #[test]
     fn display_status_unmatched_file() {
-        assert!(should_display_file_status(None, &ListMode::Unmatched));
-        assert!(should_display_file_status(None, &ListMode::All));
-        assert!(!should_display_file_status(None, &ListMode::Warning));
-        assert!(!should_display_file_status(None, &ListMode::Matched));
+        assert!(should_display_file_status(None, &SelectMode::Unmatched));
+        assert!(should_display_file_status(None, &SelectMode::All));
+        assert!(!should_display_file_status(None, &SelectMode::Warning));
+        assert!(!should_display_file_status(None, &SelectMode::Matched));
     }
 
     #[test]
     fn display_status_hash_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), &ListMode::Warning));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), &ListMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), &ListMode::Matched));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), &ListMode::Unmatched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), &SelectMode::Warning));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), &SelectMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), &SelectMode::Matched));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), &SelectMode::Unmatched));
     }
 
     #[test]
     fn display_status_name_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Name), &ListMode::Warning));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Name), &ListMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), &ListMode::Matched));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), &ListMode::Unmatched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Name), &SelectMode::Warning));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Name), &SelectMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), &SelectMode::Matched));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), &SelectMode::Unmatched));
     }
 
     #[test]
     fn display_status_full_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Match), &ListMode::Matched));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Match), &ListMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), &ListMode::Warning));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), &ListMode::Unmatched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Match), &SelectMode::Matched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Match), &SelectMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), &SelectMode::Warning));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), &SelectMode::Unmatched));
     }
 
     // --- resolve_match ---
