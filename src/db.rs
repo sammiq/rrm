@@ -768,6 +768,22 @@ impl DirRecord {
         FileRecord::delete_files(conn, &self.id)
     }
 
+    pub fn update_path(&self, conn: &Connection, path: &str) -> Result<Self> {
+        let sql = format!("UPDATE {} SET path = :path WHERE id = :id", Self::table_name());
+        conn.execute(
+            &sql,
+            named_params! {
+                ":id": self.id,
+                ":path": path,
+            },
+        )?;
+        Ok(Self {
+            id: self.id,
+            dat_id: self.dat_id,
+            path: path.to_string(),
+        })
+    }
+
     pub fn relink_dirs(conn: &Connection, old_dat_id: &DatId, new_dat_id: &DatId) -> Result<usize> {
         let sql = format!("UPDATE {} SET dat_id = :new_dat_id WHERE dat_id = :old_dat_id", Self::table_name());
         let num_updated = conn.execute(
@@ -844,6 +860,25 @@ impl FileRecord {
         })
     }
 
+    pub fn update_dir_id(&self, conn: &Connection, dir_id: &DirId) -> Result<Self> {
+        let sql = format!("UPDATE {} SET dir_id = :dir_id WHERE id = :id", Self::table_name());
+        conn.execute(
+            &sql,
+            named_params! {
+                ":id": self.id,
+                ":dir_id": dir_id,
+            },
+        )?;
+        Ok(Self {
+            id: self.id,
+            dat_id: self.dat_id,
+            dir_id: *dir_id,
+            name: self.name.clone(),
+            size: self.size,
+            hash: self.hash.clone(),
+        })
+    }
+
     pub fn delete_matches(&self, conn: &Connection) -> Result<usize> {
         MatchRecord::delete_by_file_id(conn, &self.id)
     }
@@ -864,6 +899,11 @@ impl MatchRecord {
         );
         let num_deleted = conn.execute(&sql, named_params! {":dir_id": dir_id})?;
         Ok(num_deleted)
+    }
+
+    pub fn get_by_file_id(conn: &Connection, file_id: &FileId) -> Result<Vec<Self>> {
+        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {file_id}, order by "id", Self::from_row)?;
+        Ok(matches)
     }
 
     pub fn find_by_status_for_file(conn: &Connection, file_id: &FileId, status: &MatchStatus) -> Result<Vec<Self>> {
