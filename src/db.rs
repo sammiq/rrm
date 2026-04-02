@@ -631,7 +631,7 @@ impl Insertable for MatchRecord {
     type NewType = NewMatch;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MatchStatus {
     Hash,
     Name,
@@ -905,12 +905,12 @@ impl MatchRecord {
         Ok(matches)
     }
 
-    pub fn find_by_status_for_dat(conn: &Connection, dat_id: DatId, status: &MatchStatus) -> Result<Vec<Self>> {
+    pub fn find_by_status_for_dat(conn: &Connection, dat_id: DatId, status: MatchStatus) -> Result<Vec<Self>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id = dat_id.id(), status}, order by "id", Self::from_row)?;
         Ok(matches)
     }
 
-    pub fn update(&self, conn: &Connection, status: &MatchStatus) -> Result<Self> {
+    pub fn update(&self, conn: &Connection, status: MatchStatus) -> Result<Self> {
         let sql = format!("UPDATE {} SET status = :status WHERE id = :id", Self::table_name());
         conn.execute(
             &sql,
@@ -923,7 +923,7 @@ impl MatchRecord {
             id: self.id,
             dat_id: self.dat_id,
             file_id: self.file_id,
-            status: status.clone(),
+            status,
             set_id: self.set_id,
             rom_id: self.rom_id,
         })
@@ -1583,7 +1583,7 @@ mod tests {
         )
         .unwrap();
 
-        let updated = m.update(&conn, &MatchStatus::Match).unwrap();
+        let updated = m.update(&conn, MatchStatus::Match).unwrap();
         assert_eq!(updated.status, MatchStatus::Match);
 
         let fetched = MatchRecord::get_by_id(&conn, m.id).unwrap();
@@ -1693,13 +1693,13 @@ mod tests {
         )
         .unwrap();
 
-        let hash_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, &MatchStatus::Hash).unwrap();
+        let hash_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, MatchStatus::Hash).unwrap();
         assert_eq!(hash_matches.len(), 1);
 
-        let name_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, &MatchStatus::Name).unwrap();
+        let name_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, MatchStatus::Name).unwrap();
         assert_eq!(name_matches.len(), 1);
 
-        let match_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, &MatchStatus::Match).unwrap();
+        let match_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, MatchStatus::Match).unwrap();
         assert_eq!(match_matches.len(), 0);
     }
 

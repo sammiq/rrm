@@ -1325,7 +1325,7 @@ fn insert_matches(
     Ok(())
 }
 
-fn should_display_file_status(status: Option<&db::MatchStatus>, mode: SelectMode) -> bool {
+fn should_display_file_status(status: Option<db::MatchStatus>, mode: SelectMode) -> bool {
     matches!(
         (status, mode),
         (None, SelectMode::Unmatched | SelectMode::All)
@@ -1336,7 +1336,7 @@ fn should_display_file_status(status: Option<&db::MatchStatus>, mode: SelectMode
 }
 
 #[rustfmt::skip] //single line match arms are more readable
-fn format_file_indicator(status: Option<&db::MatchStatus>, is_tty: bool) -> &str {
+fn format_file_indicator(status: Option<db::MatchStatus>, is_tty: bool) -> &'static str {
     match status {
         None => if is_tty { "❌" } else { "NONE" },
         Some(db::MatchStatus::Hash) | Some(db::MatchStatus::Name) => if is_tty { "⚠️" } else { "WARN" },
@@ -1349,7 +1349,7 @@ fn format_match_status(
     matched: Option<(&db::MatchRecord, &db::RomRecord)>,
     is_tty: bool,
 ) -> String {
-    let indicator = format_file_indicator(matched.as_ref().map(|(m, _)| &m.status), is_tty);
+    let indicator = format_file_indicator(matched.map(|(m, _)| m.status), is_tty);
     match matched {
         None => format!("[{indicator}] {} {} - unknown file", file.hash, file.name),
         Some((m, rom)) => match m.status {
@@ -1402,7 +1402,7 @@ fn list_scanned_files(
         for file in files {
             if let Some(file_matches) = matches_by_file.get(&file.id) {
                 for fm in file_matches {
-                    if should_display_file_status(Some(&fm.status), mode) {
+                    if should_display_file_status(Some(fm.status), mode) {
                         let rom = roms_by_id
                             .get(&fm.rom_id)
                             .expect("Should always have a valid rom retrieved");
@@ -1427,7 +1427,7 @@ fn list_scanned_files(
     Ok(())
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum SetStatus {
     Missing,
     Partial,
@@ -1446,7 +1446,7 @@ fn calculate_set_status(set_roms: &[db::RomRecord], matched_rom_ids: &BTreeSet<d
 }
 
 #[rustfmt::skip] //single line match arms are more readable
-fn format_set_indicator(status: &SetStatus, is_tty: bool) -> &str {
+fn format_set_indicator(status: SetStatus, is_tty: bool) -> &'static str {
     match status {
         SetStatus::Missing => if is_tty { "❌" } else { "NONE" },
         SetStatus::Partial => if is_tty { "⚠️" } else { "WARN" },
@@ -1464,7 +1464,7 @@ fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option
     });
 
     println!("--- MISSING SETS ---");
-    let status = format_set_indicator(&SetStatus::Missing, term.tty_out);
+    let status = format_set_indicator(SetStatus::Missing, term.tty_out);
     for set in &all_sets {
         if let Some(partial_name) = partial_name
             && !set
@@ -1498,8 +1498,8 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
     let all_set_count = db::SetRecord::get_num_by_dat(ctx.conn, ctx.dat_id)?;
 
     println!("--- FOUND SETS ---");
-    let partial_status = format_set_indicator(&SetStatus::Partial, term.tty_out);
-    let complete_status = format_set_indicator(&SetStatus::Complete, term.tty_out);
+    let partial_status = format_set_indicator(SetStatus::Partial, term.tty_out);
+    let complete_status = format_set_indicator(SetStatus::Complete, term.tty_out);
     for set in &found_sets {
         if let Some(partial_name) = partial_name
             && !set
@@ -1550,7 +1550,7 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
 
 fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Result<()> {
     // Bulk-load all Hash-status matches and group by file_id
-    let hash_matches = db::MatchRecord::find_by_status_for_dat(tx, dat_id, &db::MatchStatus::Hash)?;
+    let hash_matches = db::MatchRecord::find_by_status_for_dat(tx, dat_id, db::MatchStatus::Hash)?;
     let mut matches_by_file: BTreeMap<db::FileId, Vec<db::MatchRecord>> = BTreeMap::new();
     for m in hash_matches {
         matches_by_file.entry(m.file_id).or_default().push(m);
@@ -1592,14 +1592,14 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
 
                 match db::with_savepoint(tx, |sp| {
                     let new_file = file.update_name(sp, &rom.name)?;
-                    let new_match = file_match.update(sp, &db::MatchStatus::Match)?;
+                    let new_match = file_match.update(sp, db::MatchStatus::Match)?;
                     let old_path = path.join(name);
                     let new_path = path.join(&new_file.name);
                     std::fs::rename(&old_path, &new_path)?;
                     Ok((new_file, new_match))
                 }) {
                     Ok((new_file, new_match)) => {
-                        let indicator = format_file_indicator(Some(&new_match.status), term.tty_out);
+                        let indicator = format_file_indicator(Some(new_match.status), term.tty_out);
                         println!("[{indicator}] {} {} -> {}", file.hash, file.name, new_file.name);
                     }
                     Err(e) => eprintln!("Failed to rename {name}. Error was {e}"),
@@ -1857,26 +1857,26 @@ mod tests {
 
     #[test]
     fn display_status_hash_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), SelectMode::Warning));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), SelectMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), SelectMode::Matched));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), SelectMode::Unmatched));
+        assert!(should_display_file_status(Some(db::MatchStatus::Hash), SelectMode::Warning));
+        assert!(should_display_file_status(Some(db::MatchStatus::Hash), SelectMode::All));
+        assert!(!should_display_file_status(Some(db::MatchStatus::Hash), SelectMode::Matched));
+        assert!(!should_display_file_status(Some(db::MatchStatus::Hash), SelectMode::Unmatched));
     }
 
     #[test]
     fn display_status_name_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Name), SelectMode::Warning));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Name), SelectMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), SelectMode::Matched));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), SelectMode::Unmatched));
+        assert!(should_display_file_status(Some(db::MatchStatus::Name), SelectMode::Warning));
+        assert!(should_display_file_status(Some(db::MatchStatus::Name), SelectMode::All));
+        assert!(!should_display_file_status(Some(db::MatchStatus::Name), SelectMode::Matched));
+        assert!(!should_display_file_status(Some(db::MatchStatus::Name), SelectMode::Unmatched));
     }
 
     #[test]
     fn display_status_full_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Match), SelectMode::Matched));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Match), SelectMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), SelectMode::Warning));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), SelectMode::Unmatched));
+        assert!(should_display_file_status(Some(db::MatchStatus::Match), SelectMode::Matched));
+        assert!(should_display_file_status(Some(db::MatchStatus::Match), SelectMode::All));
+        assert!(!should_display_file_status(Some(db::MatchStatus::Match), SelectMode::Warning));
+        assert!(!should_display_file_status(Some(db::MatchStatus::Match), SelectMode::Unmatched));
     }
 
     // --- resolve_match ---
