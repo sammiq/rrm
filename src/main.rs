@@ -1300,9 +1300,9 @@ fn format_match_status(
     file: &db::FileRecord,
     matched: Option<(&db::MatchRecord, &db::RomRecord)>,
     is_tty: bool,
-) -> Result<String> {
+) -> String {
     let indicator = format_file_indicator(matched.as_ref().map(|(m, _)| &m.status), is_tty);
-    let result = match matched {
+    match matched {
         None => format!("[{indicator}] {} {} - unknown file", file.hash, file.name),
         Some((m, rom)) => match m.status {
             db::MatchStatus::Hash => {
@@ -1315,22 +1315,6 @@ fn format_match_status(
                 format!("[{indicator}] {} {}", file.hash, file.name)
             }
         },
-    };
-    Ok(result)
-}
-
-fn format_file_status(
-    conn: &Connection,
-    file: &db::FileRecord,
-    matched: Option<&db::MatchRecord>,
-    is_tty: bool,
-) -> Result<String> {
-    match matched {
-        Some(m) => {
-            let rom = db::RomRecord::get_by_id(conn, &m.rom_id)?;
-            format_match_status(file, Some((m, &rom)), is_tty)
-        }
-        None => format_match_status(file, None, is_tty),
     }
 }
 
@@ -1346,6 +1330,13 @@ fn list_scanned_files(
         acc.entry(&m.file_id).or_default().push(m);
         acc
     });
+
+    // Bulk-load all rom records referenced by those matches
+    let rom_ids: BTreeSet<_> = matches.iter().map(|m| m.rom_id).collect();
+    let roms_by_id: BTreeMap<_, _> = db::RomRecord::get_by_ids(ctx.conn, &rom_ids)?
+        .into_iter()
+        .map(|r| (r.id, r))
+        .collect();
 
     let dirs = db::DirRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     for dir in dirs {
@@ -1364,11 +1355,12 @@ fn list_scanned_files(
             if let Some(file_matches) = matches_by_file.get(&file.id) {
                 for fm in file_matches {
                     if should_display_file_status(Some(&fm.status), mode) {
-                        lines.push(format_file_status(ctx.conn, &file, Some(fm), term.tty_out)?);
+                        let rom = roms_by_id.get(&fm.rom_id).expect("Should always have a valid rom retrieved");
+                        lines.push(format_match_status(&file, Some((fm, rom)), term.tty_out));
                     }
                 }
             } else if should_display_file_status(None, mode) {
-                lines.push(format_file_status(ctx.conn, &file, None, term.tty_out)?);
+                lines.push(format_match_status(&file, None, term.tty_out));
             }
         }
 
@@ -1488,7 +1480,7 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
                 let rom = roms_by_romid
                     .get(&matched.rom_id)
                     .expect("Should always have a valid rom retrieved");
-                let status = format_match_status(file, Some((matched, rom)), term.tty_out)?;
+                let status = format_match_status(file, Some((matched, rom)), term.tty_out);
                 println!(" {status}");
             }
 
