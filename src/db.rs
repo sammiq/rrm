@@ -250,7 +250,7 @@ where
 {
     type NewType: Bindable;
 
-    fn insert(conn: &Connection, new: &Self::NewType) -> Result<Self> {
+    fn insert(conn: &Connection, new: Self::NewType) -> Result<Self> {
         let params = new.bind_params();
         let values: Vec<&str> = params.iter().map(|(name, _)| *name).collect();
         let columns: Vec<String> = values
@@ -1270,7 +1270,7 @@ mod tests {
     #[test]
     fn insert_and_get_dat() {
         let conn = mem_db();
-        let dat = DatRecord::insert(&conn, &sample_dat()).unwrap();
+        let dat = DatRecord::insert(&conn, sample_dat()).unwrap();
         assert_eq!(dat.name, "Test DAT");
 
         let fetched = DatRecord::get_by_id(&conn, dat.id).unwrap();
@@ -1280,8 +1280,8 @@ mod tests {
     #[test]
     fn get_all_dats() {
         let conn = mem_db();
-        DatRecord::insert(&conn, &sample_dat()).unwrap();
-        DatRecord::insert(&conn, &NewDat::new("Second", "A test dat file", "1.0", "tester", "sha1")).unwrap();
+        DatRecord::insert(&conn, sample_dat()).unwrap();
+        DatRecord::insert(&conn, NewDat::new("Second", "A test dat file", "1.0", "tester", "sha1")).unwrap();
 
         let all = DatRecord::get_all(&conn).unwrap();
         assert_eq!(all.len(), 2);
@@ -1290,7 +1290,7 @@ mod tests {
     #[test]
     fn delete_dat() {
         let conn = mem_db();
-        let dat = DatRecord::insert(&conn, &sample_dat()).unwrap();
+        let dat = DatRecord::insert(&conn, sample_dat()).unwrap();
         assert!(DatRecord::delete_by_id(&conn, dat.id).unwrap());
         assert!(!DatRecord::delete_by_id(&conn, dat.id).unwrap());
     }
@@ -1298,8 +1298,8 @@ mod tests {
     // --- SetRecord ---
 
     fn insert_dat_and_set(conn: &Connection) -> (DatRecord, SetRecord) {
-        let dat = DatRecord::insert(conn, &sample_dat()).unwrap();
-        let set = SetRecord::insert(conn, &NewSet::new(dat.id, "Game Set")).unwrap();
+        let dat = DatRecord::insert(conn, sample_dat()).unwrap();
+        let set = SetRecord::insert(conn, NewSet::new(dat.id, "Game Set")).unwrap();
         (dat, set)
     }
 
@@ -1346,7 +1346,7 @@ mod tests {
     // --- RomRecord ---
 
     fn insert_rom(conn: &Connection, dat: &DatRecord, set: &SetRecord, name: &str, hash: &str) -> RomRecord {
-        RomRecord::insert(conn, &NewRom::new(dat.id, set.id, name, 1024, hash)).unwrap()
+        RomRecord::insert(conn, NewRom::new(dat.id, set.id, name, 1024, hash)).unwrap()
     }
 
     #[test]
@@ -1380,7 +1380,7 @@ mod tests {
     fn get_roms_by_sets() {
         let conn = mem_db();
         let (dat, set1) = insert_dat_and_set(&conn);
-        let set2 = SetRecord::insert(&conn, &NewSet::new(dat.id, "Set 2")).unwrap();
+        let set2 = SetRecord::insert(&conn, NewSet::new(dat.id, "Set 2")).unwrap();
         insert_rom(&conn, &dat, &set1, "a.rom", "aaa");
         insert_rom(&conn, &dat, &set2, "b.rom", "bbb");
 
@@ -1410,8 +1410,8 @@ mod tests {
     #[test]
     fn get_by_ids() {
         let conn = mem_db();
-        let d1 = DatRecord::insert(&conn, &sample_dat()).unwrap();
-        let d2 = DatRecord::insert(&conn, &NewDat::new("Second", "A test dat file", "1.0", "tester", "sha1")).unwrap();
+        let d1 = DatRecord::insert(&conn, sample_dat()).unwrap();
+        let d2 = DatRecord::insert(&conn, NewDat::new("Second", "A test dat file", "1.0", "tester", "sha1")).unwrap();
 
         let ids = vec![d1.id, d2.id];
         let result = DatRecord::get_by_ids(&conn, &ids).unwrap();
@@ -1421,7 +1421,7 @@ mod tests {
     // --- DirRecord ---
 
     fn insert_dir(conn: &Connection, dat: &DatRecord, path: &str) -> DirRecord {
-        DirRecord::insert(conn, &NewDir::new(dat.id, path)).unwrap()
+        DirRecord::insert(conn, NewDir::new(dat.id, path)).unwrap()
     }
 
     #[test]
@@ -1477,9 +1477,9 @@ mod tests {
     #[test]
     fn relink_dirs() {
         let conn = mem_db();
-        let dat1 = DatRecord::insert(&conn, &sample_dat()).unwrap();
+        let dat1 = DatRecord::insert(&conn, sample_dat()).unwrap();
         let dat2 =
-            DatRecord::insert(&conn, &NewDat::new("New DAT", "A test dat file", "1.0", "tester", "sha1")).unwrap();
+            DatRecord::insert(&conn, NewDat::new("New DAT", "A test dat file", "1.0", "tester", "sha1")).unwrap();
         insert_dir(&conn, &dat1, "/roms");
 
         let updated = DirRecord::relink_dirs(&conn, dat1.id, dat2.id).unwrap();
@@ -1491,7 +1491,7 @@ mod tests {
     // --- FileRecord ---
 
     fn insert_file(conn: &Connection, dat: &DatRecord, dir: &DirRecord, name: &str) -> FileRecord {
-        FileRecord::insert(conn, &NewFile::new(dat.id, dir.id, name, 2048, "filehash")).unwrap()
+        FileRecord::insert(conn, NewFile::new(dat.id, dir.id, name, 2048, "filehash")).unwrap()
     }
 
     #[test]
@@ -1553,9 +1553,9 @@ mod tests {
     #[test]
     fn relink_files() {
         let conn = mem_db();
-        let dat1 = DatRecord::insert(&conn, &sample_dat()).unwrap();
+        let dat1 = DatRecord::insert(&conn, sample_dat()).unwrap();
         let dat2 =
-            DatRecord::insert(&conn, &NewDat::new("New DAT", "A test dat file", "1.0", "tester", "sha1")).unwrap();
+            DatRecord::insert(&conn, NewDat::new("New DAT", "A test dat file", "1.0", "tester", "sha1")).unwrap();
         let dir = insert_dir(&conn, &dat1, "/roms");
         insert_file(&conn, &dat1, &dir, "game.zip");
 
@@ -1573,7 +1573,7 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        let m = MatchRecord::insert(&conn, &NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
+        let m = MatchRecord::insert(&conn, NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
 
         assert_eq!(m.status, MatchStatus::Hash);
 
@@ -1589,7 +1589,7 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        let m = MatchRecord::insert(&conn, &NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
+        let m = MatchRecord::insert(&conn, NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
 
         let updated = m.update(&conn, MatchStatus::Match).unwrap();
         assert_eq!(updated.status, MatchStatus::Match);
@@ -1606,7 +1606,7 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        MatchRecord::insert(&conn, &NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
+        MatchRecord::insert(&conn, NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
 
         let deleted = file.delete_matches(&conn).unwrap();
         assert_eq!(deleted, 1);
@@ -1620,7 +1620,7 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        MatchRecord::insert(&conn, &NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
+        MatchRecord::insert(&conn, NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
 
         let deleted = dir.delete_matches(&conn).unwrap();
         assert_eq!(deleted, 1);
@@ -1634,7 +1634,7 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        MatchRecord::insert(&conn, &NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
+        MatchRecord::insert(&conn, NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
 
         let deleted = MatchRecord::delete_by_dat(&conn, dat.id).unwrap();
         assert_eq!(deleted, 1);
@@ -1648,8 +1648,8 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        MatchRecord::insert(&conn, &NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
-        MatchRecord::insert(&conn, &NewMatch::new(dat.id, file.id, MatchStatus::Name, set.id, rom.id)).unwrap();
+        MatchRecord::insert(&conn, NewMatch::new(dat.id, file.id, MatchStatus::Hash, set.id, rom.id)).unwrap();
+        MatchRecord::insert(&conn, NewMatch::new(dat.id, file.id, MatchStatus::Name, set.id, rom.id)).unwrap();
 
         let hash_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, MatchStatus::Hash).unwrap();
         assert_eq!(hash_matches.len(), 1);
@@ -1668,7 +1668,7 @@ mod tests {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
         let big: u64 = u64::MAX;
-        let rom = RomRecord::insert(&conn, &NewRom::new(dat.id, set.id, "big.rom", big, "h")).unwrap();
+        let rom = RomRecord::insert(&conn, NewRom::new(dat.id, set.id, "big.rom", big, "h")).unwrap();
         assert_eq!(rom.size, big);
 
         let fetched = RomRecord::get_by_id(&conn, rom.id).unwrap();
@@ -1701,7 +1701,7 @@ mod tests {
     fn with_transaction_commits() {
         let mut conn = mem_db();
         with_transaction(&mut conn, |tx| {
-            DatRecord::insert(tx, &sample_dat())?;
+            DatRecord::insert(tx, sample_dat())?;
             Ok(())
         })
         .unwrap();
@@ -1712,7 +1712,7 @@ mod tests {
     fn with_transaction_rolls_back_on_error() {
         let mut conn = mem_db();
         let result: Result<()> = with_transaction(&mut conn, |tx| {
-            DatRecord::insert(tx, &sample_dat())?;
+            DatRecord::insert(tx, sample_dat())?;
             anyhow::bail!("forced error");
         });
         assert!(result.is_err());
