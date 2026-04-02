@@ -1326,6 +1326,18 @@ fn format_match_status(
     }
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 fn list_scanned_files(
     ctx: &DatContext<'_>,
     term: &TermInfo,
@@ -1426,12 +1438,7 @@ fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option
     println!("--- MISSING SETS ---");
     let status = format_set_indicator(SetStatus::Missing, term.tty_out);
     for set in &all_sets {
-        if let Some(partial_name) = partial_name
-            && !set
-                .name
-                .to_ascii_lowercase()
-                .contains(&partial_name.to_ascii_lowercase())
-        {
+        if let Some(partial_name) = partial_name && !contains_ascii_case_insensitive(&set.name, partial_name) {
             continue;
         }
         println_if!(!matches_by_set.contains_key(&set.id), "[{status}] {}", set.name);
@@ -1461,12 +1468,7 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
     let partial_status = format_set_indicator(SetStatus::Partial, term.tty_out);
     let complete_status = format_set_indicator(SetStatus::Complete, term.tty_out);
     for set in &found_sets {
-        if let Some(partial_name) = partial_name
-            && !set
-                .name
-                .to_ascii_lowercase()
-                .contains(&partial_name.to_ascii_lowercase())
-        {
+        if let Some(partial_name) = partial_name && !contains_ascii_case_insensitive(&set.name, partial_name) {
             continue;
         }
 
@@ -1679,6 +1681,26 @@ mod tests {
     }
 
     // --- helpers ---
+
+    #[test]
+    fn contains_ascii_case_insensitive_empty_needle() {
+        assert!(contains_ascii_case_insensitive("anything", ""));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_matches_mixed_case_substring() {
+        assert!(contains_ascii_case_insensitive("Metal Slug", "sLuG"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_no_match() {
+        assert!(!contains_ascii_case_insensitive("Metal Slug", "slugx"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_needle_longer_than_haystack() {
+        assert!(!contains_ascii_case_insensitive("abc", "abcd"));
+    }
 
     fn make_rom(id: i64, dat_id: i64, set_id: i64, size: u64, hash: &str) -> db::RomRecord {
         db::RomRecord {
