@@ -1253,6 +1253,7 @@ pub fn with_savepoint<T, F: FnOnce(&Savepoint) -> Result<T>>(conn: &mut Transact
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1688,13 +1689,12 @@ mod tests {
 
         for status in [MatchStatus::Hash, MatchStatus::Name, MatchStatus::Match] {
             let sql_val = status.to_sql().unwrap();
-            let s = match &sql_val {
-                rusqlite::types::ToSqlOutput::Borrowed(v) => match v {
-                    ValueRef::Text(t) => std::str::from_utf8(t).unwrap(),
-                    _ => panic!("expected text"),
-                },
-                _ => panic!("expected borrowed"),
-            };
+            assert!(matches!(
+                &sql_val,
+                rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(_))
+            ));
+            let rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(t)) = &sql_val else { return };
+            let s = std::str::from_utf8(t).unwrap();
             let back = MatchStatus::column_result(ValueRef::Text(s.as_bytes())).unwrap();
             assert_eq!(back, status);
         }

@@ -75,7 +75,9 @@ pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
     } else if trailing_space {
         (tokens.as_slice(), "")
     } else {
-        let (last, rest) = tokens.split_last().unwrap();
+        let Some((last, rest)) = tokens.split_last() else {
+            return (0, Vec::new());
+        };
         final_token_storage = last.clone();
         (rest, final_token_storage.as_str())
     };
@@ -230,9 +232,10 @@ fn fs_candidates(partial: &str, dirs_only: bool, in_quote: bool) -> Vec<String> 
                 let escaped = candidate.replace("'", "'\\''");
                 if is_dir { format!("'{}", escaped) } else { format!("'{}'", escaped) }
             } else {
-                let s = shlex::try_quote(&candidate)
-                    .expect("file paths do not contain null bytes")
-                    .into_owned();
+                let s = match shlex::try_quote(&candidate) {
+                    Ok(q) => q.into_owned(),
+                    Err(_) => return None,
+                };
                 if is_dir { s.strip_suffix('\'').unwrap_or(&s).to_owned() } else { s }
             };
             Some(quoted)
@@ -241,6 +244,7 @@ fn fs_candidates(partial: &str, dirs_only: bool, in_quote: bool) -> Vec<String> 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use clap::ArgAction;
@@ -326,9 +330,8 @@ mod tests {
     fn build_completions_includes_subcommands_and_args() {
         let cmd = make_command();
         let tree = build_completions(&cmd);
-        let TreeNode::Branch(_, children) = &tree else {
-            panic!("expected Branch")
-        };
+        assert!(matches!(tree, TreeNode::Branch(_, _)));
+        let TreeNode::Branch(_, children) = &tree else { return };
         let all_names: Vec<String> = children.iter().flat_map(|n| n.names()).collect();
         assert!(all_names.contains(&"--format".to_string()));
         assert!(all_names.contains(&"--verbose".to_string()));
