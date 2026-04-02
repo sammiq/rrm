@@ -513,7 +513,7 @@ fn handle_file_commands(
             db::with_transaction_mut(conn, |tx| scan_files(tx, dat_id, term, &scan_path, &options))
         }
         FileCommands::List { mode, partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, mode, partial_name.as_deref())
+            list_scanned_files(&DatContext::new(conn, dat_id), term, *mode, partial_name.as_deref())
         }
         FileCommands::Sets { missing, partial_name } => {
             if *missing {
@@ -523,20 +523,20 @@ fn handle_file_commands(
             }
         }
         FileCommands::Sort { mode, path, keep } => {
-            db::with_transaction_mut(conn, |tx| sort_files(tx, dat_id, mode, path, *keep))
+            db::with_transaction_mut(conn, |tx| sort_files(tx, dat_id, *mode, path, *keep))
         }
         FileCommands::Rename => db::with_transaction_mut(conn, |tx| rename_files(tx, dat_id, term)),
         FileCommands::Matched { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, &SelectMode::Matched, partial_name.as_deref())
+            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Matched, partial_name.as_deref())
         }
         FileCommands::Missing { partial_name } => {
             list_missing_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
         }
         FileCommands::Unmatched { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, &SelectMode::Unmatched, partial_name.as_deref())
+            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Unmatched, partial_name.as_deref())
         }
         FileCommands::Warning { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, &SelectMode::Warning, partial_name.as_deref())
+            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Warning, partial_name.as_deref())
         }
     }
 }
@@ -595,7 +595,7 @@ fn classify_zip(conn: &Connection, dir: &db::DirRecord) -> Result<SelectMode> {
     }
 }
 
-fn subdir_name(mode: &SelectMode) -> &'static str {
+fn subdir_name(mode: SelectMode) -> &'static str {
     match mode {
         SelectMode::Matched => "matched",
         SelectMode::Warning => "warning",
@@ -629,16 +629,16 @@ fn get_or_create_dest_dir(
     Ok(dir.id)
 }
 
-fn sort_files(tx: &mut Transaction, dat_id: &db::DatId, mode: &SelectMode, path: &Utf8Path, keep: bool) -> Result<()> {
+fn sort_files(tx: &mut Transaction, dat_id: &db::DatId, mode: SelectMode, path: &Utf8Path, keep: bool) -> Result<()> {
     // Determine which modes we need subdirectories for
     let modes: Vec<SelectMode> = match mode {
         SelectMode::All => vec![SelectMode::Matched, SelectMode::Warning, SelectMode::Unmatched],
-        other => vec![*other],
+        other => vec![other],
     };
 
     // Create destination subdirectories on disk
     for m in &modes {
-        let dest = path.join(subdir_name(m));
+        let dest = path.join(subdir_name(*m));
         if !dest.exists() {
             std::fs::create_dir_all(&dest)?;
         }
@@ -651,13 +651,13 @@ fn sort_files(tx: &mut Transaction, dat_id: &db::DatId, mode: &SelectMode, path:
         if util::is_zip_file(&dir.path) {
             // Classify the zip as a whole
             let zip_mode = classify_zip(tx, &dir)?;
-            if *mode != SelectMode::All && *mode != zip_mode {
+            if mode != SelectMode::All && mode != zip_mode {
                 continue;
             }
 
             let zip_path = Utf8PathBuf::from(&dir.path);
             let file_name = zip_path.file_name().context("zip should have a file name")?;
-            let dest = path.join(subdir_name(&zip_mode)).join(file_name);
+            let dest = path.join(subdir_name(zip_mode)).join(file_name);
 
             match db::with_savepoint(tx, |sp| {
                 std::fs::rename(&zip_path, &dest)?;
@@ -680,17 +680,17 @@ fn sort_files(tx: &mut Transaction, dat_id: &db::DatId, mode: &SelectMode, path:
             let files = dir.get_files(tx)?;
             for file in &files {
                 let file_mode = classify_file(tx, file)?;
-                if *mode != SelectMode::All && *mode != file_mode {
+                if mode != SelectMode::All && mode != file_mode {
                     continue;
                 }
 
                 let src = Utf8Path::new(&dir.path).join(&file.name);
-                let dest = path.join(subdir_name(&file_mode)).join(&file.name);
+                let dest = path.join(subdir_name(file_mode)).join(&file.name);
 
                 match db::with_savepoint(tx, |sp| {
                     std::fs::rename(&src, &dest)?;
                     if keep {
-                        let dest_path_str = path.join(subdir_name(&file_mode)).as_str().to_string();
+                        let dest_path_str = path.join(subdir_name(file_mode)).as_str().to_string();
                         let dest_dir_id = get_or_create_dest_dir(sp, dat_id, &mut dest_dirs, &dest_path_str)?;
                         file.update_dir_id(sp, &dest_dir_id)?;
                     } else {
@@ -1316,7 +1316,7 @@ fn insert_matches(
     Ok(())
 }
 
-fn should_display_file_status(status: Option<&db::MatchStatus>, mode: &SelectMode) -> bool {
+fn should_display_file_status(status: Option<&db::MatchStatus>, mode: SelectMode) -> bool {
     matches!(
         (status, mode),
         (None, SelectMode::Unmatched | SelectMode::All)
@@ -1360,7 +1360,7 @@ fn format_match_status(
 fn list_scanned_files(
     ctx: &DatContext<'_>,
     term: &TermInfo,
-    mode: &SelectMode,
+    mode: SelectMode,
     partial_name: Option<&str>,
 ) -> Result<()> {
     //get these in bulk to avoid doing a query per file when we display them
@@ -1838,34 +1838,34 @@ mod tests {
 
     #[test]
     fn display_status_unmatched_file() {
-        assert!(should_display_file_status(None, &SelectMode::Unmatched));
-        assert!(should_display_file_status(None, &SelectMode::All));
-        assert!(!should_display_file_status(None, &SelectMode::Warning));
-        assert!(!should_display_file_status(None, &SelectMode::Matched));
+        assert!(should_display_file_status(None, SelectMode::Unmatched));
+        assert!(should_display_file_status(None, SelectMode::All));
+        assert!(!should_display_file_status(None, SelectMode::Warning));
+        assert!(!should_display_file_status(None, SelectMode::Matched));
     }
 
     #[test]
     fn display_status_hash_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), &SelectMode::Warning));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), &SelectMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), &SelectMode::Matched));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), &SelectMode::Unmatched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), SelectMode::Warning));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Hash), SelectMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), SelectMode::Matched));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Hash), SelectMode::Unmatched));
     }
 
     #[test]
     fn display_status_name_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Name), &SelectMode::Warning));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Name), &SelectMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), &SelectMode::Matched));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), &SelectMode::Unmatched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Name), SelectMode::Warning));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Name), SelectMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), SelectMode::Matched));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Name), SelectMode::Unmatched));
     }
 
     #[test]
     fn display_status_full_match() {
-        assert!(should_display_file_status(Some(&db::MatchStatus::Match), &SelectMode::Matched));
-        assert!(should_display_file_status(Some(&db::MatchStatus::Match), &SelectMode::All));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), &SelectMode::Warning));
-        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), &SelectMode::Unmatched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Match), SelectMode::Matched));
+        assert!(should_display_file_status(Some(&db::MatchStatus::Match), SelectMode::All));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), SelectMode::Warning));
+        assert!(!should_display_file_status(Some(&db::MatchStatus::Match), SelectMode::Unmatched));
     }
 
     // --- resolve_match ---
