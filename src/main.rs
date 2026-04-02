@@ -1384,11 +1384,10 @@ enum SetStatus {
     Complete,
 }
 
-fn calculate_set_status(set_roms: &[db::RomRecord], set_matches: &[db::MatchRecord]) -> SetStatus {
-    if set_matches.is_empty() {
+fn calculate_set_status(set_roms: &[db::RomRecord], matched_rom_ids: &BTreeSet<db::RomId>) -> SetStatus {
+    if matched_rom_ids.is_empty() {
         return SetStatus::Missing;
     }
-    let matched_rom_ids: BTreeSet<_> = set_matches.iter().map(|m| m.rom_id).collect();
     if set_roms.iter().all(|rom| matched_rom_ids.contains(&rom.id)) {
         SetStatus::Complete
     } else {
@@ -1464,10 +1463,10 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
         if let Some(set_roms) = roms_by_set.get(&set.id)
             && let Some(set_matches) = matches_by_set.get(&set.id)
         {
+            let matched_rom_ids: BTreeSet<_> = set_matches.iter().map(|m| m.rom_id).collect();
             let roms_by_romid: BTreeMap<_, _> = set_roms.iter().map(|rom| (&rom.id, rom)).collect();
-            let matches_by_romid: BTreeMap<_, _> = set_matches.iter().map(|fmatch| (&fmatch.rom_id, fmatch)).collect();
 
-            if calculate_set_status(set_roms, set_matches) == SetStatus::Complete {
+            if calculate_set_status(set_roms, &matched_rom_ids) == SetStatus::Complete {
                 println!("[{complete_status}] {}", set.name);
             } else {
                 println!("[{partial_status}] {}, set has missing roms", set.name);
@@ -1487,7 +1486,7 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
             let missing_indicator = format_file_indicator(None, term.tty_out);
             for rom in set_roms {
                 println_if!(
-                    !matches_by_romid.contains_key(&rom.id),
+                    !matched_rom_ids.contains(&rom.id),
                     " {missing_indicator}  {} {} - missing file",
                     rom.hash,
                     rom.name
@@ -1832,17 +1831,6 @@ mod tests {
 
     // --- resolve_match ---
 
-    fn make_match_record(id: i64, set_id: i64, rom_id: i64) -> db::MatchRecord {
-        db::MatchRecord {
-            id: id.into(),
-            dat_id: 1i64.into(),
-            file_id: id.into(),
-            status: db::MatchStatus::Match,
-            set_id: set_id.into(),
-            rom_id: rom_id.into(),
-        }
-    }
-
     #[test]
     fn resolve_match_exact_when_name_and_hash_match() {
         let named = [make_rom(1, 1, 1, 100, "abc")];
@@ -1889,27 +1877,27 @@ mod tests {
     #[test]
     fn set_status_complete_when_all_roms_matched() {
         let roms = [make_rom(1, 1, 1, 100, "a"), make_rom(2, 1, 1, 200, "b")];
-        let matches = [make_match_record(1, 1, 1), make_match_record(2, 1, 2)];
-        assert_eq!(calculate_set_status(&roms, &matches), SetStatus::Complete);
+        let matched_ids = BTreeSet::from([1i64.into(), 2i64.into()]);
+        assert_eq!(calculate_set_status(&roms, &matched_ids), SetStatus::Complete);
     }
 
     #[test]
     fn set_status_partial_when_some_roms_unmatched() {
         let roms = [make_rom(1, 1, 1, 100, "a"), make_rom(2, 1, 1, 200, "b")];
-        let matches = [make_match_record(1, 1, 1)]; // only rom 1 matched
-        assert_eq!(calculate_set_status(&roms, &matches), SetStatus::Partial);
+        let matched_ids = BTreeSet::from([1i64.into()]); // only rom 1 matched
+        assert_eq!(calculate_set_status(&roms, &matched_ids), SetStatus::Partial);
     }
 
     #[test]
     fn set_status_missing_when_no_matches() {
         let roms = [make_rom(1, 1, 1, 100, "a")];
-        assert_eq!(calculate_set_status(&roms, &[]), SetStatus::Missing);
+        assert_eq!(calculate_set_status(&roms, &BTreeSet::new()), SetStatus::Missing);
     }
 
     #[test]
     fn set_status_complete_with_single_rom() {
         let roms = [make_rom(1, 1, 1, 100, "a")];
-        let matches = [make_match_record(1, 1, 1)];
-        assert_eq!(calculate_set_status(&roms, &matches), SetStatus::Complete);
+        let matched_ids = BTreeSet::from([1i64.into()]);
+        assert_eq!(calculate_set_status(&roms, &matched_ids), SetStatus::Complete);
     }
 }
