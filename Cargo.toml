@@ -11,6 +11,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 digest = "0.10.7"
 fallible-iterator = { version = "0.3.0", features = ["std"] }
 log = { version = "0.4.29", features = ["std"] }
+rayon = "1.11.0"
 roxmltree = "0.21.1"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 rustyline = "17.0.2"
