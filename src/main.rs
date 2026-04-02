@@ -1508,6 +1508,20 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
 }
 
 fn rename_files(tx: &mut Transaction, dat_id: &db::DatId, term: &TermInfo) -> Result<()> {
+    // Bulk-load all Hash-status matches and group by file_id
+    let hash_matches = db::MatchRecord::find_by_status_for_dat(tx, dat_id, &db::MatchStatus::Hash)?;
+    let mut matches_by_file: BTreeMap<db::FileId, Vec<db::MatchRecord>> = BTreeMap::new();
+    for m in hash_matches {
+        matches_by_file.entry(m.file_id).or_default().push(m);
+    }
+
+    // Bulk-load all rom records referenced by those matches
+    let rom_ids: BTreeSet<_> = matches_by_file.values().flatten().map(|m| m.rom_id).collect();
+    let roms_by_id: BTreeMap<_, _> = db::RomRecord::get_by_ids(tx, &rom_ids)?
+        .into_iter()
+        .map(|r| (r.id, r))
+        .collect();
+
     for directory in db::DirRecord::get_by_dat(tx, dat_id)? {
         if util::is_zip_file(&directory.path) {
             continue;
@@ -1516,21 +1530,24 @@ fn rename_files(tx: &mut Transaction, dat_id: &db::DatId, term: &TermInfo) -> Re
         let files = directory.get_files(tx)?;
         let mut matches_by_name = BTreeMap::new();
         for file in &files {
-            let file_matches = db::MatchRecord::find_by_status_for_file(tx, &file.id, &db::MatchStatus::Hash)?;
-            if file_matches.len() != 1 {
-                continue;
+            if let Some(file_matches) = matches_by_file.get(&file.id) {
+                if file_matches.len() != 1 {
+                    continue;
+                }
+                matches_by_name
+                    .entry(&file.name)
+                    .or_insert(Vec::new())
+                    .push((file, &file_matches[0]));
             }
-            matches_by_name
-                .entry(&file.name)
-                .or_insert(Vec::new())
-                .push((file, file_matches[0].clone()));
         }
 
         let path = Utf8PathBuf::from(directory.path);
         for (name, records) in matches_by_name {
             if records.len() == 1 {
                 let (file, file_match) = &records[0];
-                let rom = db::RomRecord::get_by_id(tx, &file_match.rom_id)?;
+                let rom = roms_by_id
+                    .get(&file_match.rom_id)
+                    .expect("Should always have a valid rom retrieved");
 
                 match db::with_savepoint(tx, |sp| {
                     let new_file = file.update_name(sp, &rom.name)?;
