@@ -358,7 +358,7 @@ fn select_dat_from_path(conn: &Connection) -> Option<db::DatId> {
         eprintln!("Warning: current path matches {} dat files, selecting the first.", paths.len());
     }
 
-    db::DatRecord::get_by_id(conn, &paths[0].dat_id).ok().map(|dat| {
+    db::DatRecord::get_by_id(conn, paths[0].dat_id).ok().map(|dat| {
         println!("dat file `{}` selected.", dat.name);
         dat.id
     })
@@ -372,7 +372,7 @@ fn do_command(
 ) -> Result<()> {
     match command {
         Commands::Data { data } => handle_data_commands(conn, dat_id, term, data),
-        Commands::Files { files } => handle_file_commands(conn, dat_id.as_ref(), term, files),
+        Commands::Files { files } => handle_file_commands(conn, *dat_id, term, files),
         Commands::Select { index } => select_dat(conn, dat_id, *index),
     }
 }
@@ -436,15 +436,15 @@ fn handle_data_commands(
         DataCommands::Select { index } => select_dat(conn, dat_id, *index),
         DataCommands::Records => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_dat_records(&DatContext::new(conn, dat_id))
+            list_dat_records(&DatContext::new(conn, *dat_id))
         }
         DataCommands::Sets { partial_name } => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_sets(&DatContext::new(conn, dat_id), partial_name.as_deref())
+            list_sets(&DatContext::new(conn, *dat_id), partial_name.as_deref())
         }
         DataCommands::Roms { partial_name } => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_roms(&DatContext::new(conn, dat_id), partial_name.as_deref())
+            list_roms(&DatContext::new(conn, *dat_id), partial_name.as_deref())
         }
     }
 }
@@ -485,7 +485,7 @@ fn ask_for_confirmation(term: &TermInfo, prompt: &str, force: bool) -> Result<bo
 
 fn handle_file_commands(
     conn: &mut Connection,
-    dat_id: Option<&db::DatId>,
+    dat_id: Option<db::DatId>,
     term: &TermInfo,
     files: &FileCommands,
 ) -> Result<()> {
@@ -504,11 +504,16 @@ fn handle_file_commands(
             ensure!(scan_path.is_dir(), "`{}` is not a valid directory", scan_path);
 
             let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(*parallel)
-            .build()
-            .context("Failed to create thread pool")?;
+                .num_threads(*parallel)
+                .build()
+                .context("Failed to create thread pool")?;
 
-            let options = ScanOptions { exclude, recursive: *recursive, full_scan: *full, pool: &pool };
+            let options = ScanOptions {
+                exclude,
+                recursive: *recursive,
+                full_scan: *full,
+                pool: &pool,
+            };
 
             db::with_transaction_mut(conn, |tx| scan_files(tx, dat_id, term, &scan_path, &options))
         }
@@ -556,7 +561,7 @@ fn list_dat_files(conn: &Connection) -> Result<()> {
 
 /// Classify a file into a SelectMode based on its match records.
 fn classify_file(conn: &Connection, file: &db::FileRecord) -> Result<SelectMode> {
-    let matches = db::MatchRecord::get_by_file_id(conn, &file.id)?;
+    let matches = db::MatchRecord::get_by_file_id(conn, file.id)?;
     if matches.is_empty() {
         return Ok(SelectMode::Unmatched);
     }
@@ -607,7 +612,7 @@ fn subdir_name(mode: SelectMode) -> &'static str {
 /// Get or create a DirRecord for the given path, caching in the provided map.
 fn get_or_create_dest_dir(
     conn: &Connection,
-    dat_id: &db::DatId,
+    dat_id: db::DatId,
     dest_dirs: &mut BTreeMap<String, db::DirId>,
     dest_path: &str,
 ) -> Result<db::DirId> {
@@ -620,7 +625,7 @@ fn get_or_create_dest_dir(
         db::DirRecord::insert(
             conn,
             &db::NewDir {
-                dat_id: *dat_id,
+                dat_id,
                 path: dest_path.to_string(),
             },
         )?
@@ -629,7 +634,7 @@ fn get_or_create_dest_dir(
     Ok(dir.id)
 }
 
-fn sort_files(tx: &mut Transaction, dat_id: &db::DatId, mode: SelectMode, path: &Utf8Path, keep: bool) -> Result<()> {
+fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &Utf8Path, keep: bool) -> Result<()> {
     // Determine which modes we need subdirectories for
     let modes: Vec<SelectMode> = match mode {
         SelectMode::All => vec![SelectMode::Matched, SelectMode::Warning, SelectMode::Unmatched],
@@ -668,7 +673,7 @@ fn sort_files(tx: &mut Transaction, dat_id: &db::DatId, mode: SelectMode, path: 
                     // Delete matches, files, and the dir record
                     dir.delete_matches(sp)?;
                     dir.delete_files(sp)?;
-                    db::DirRecord::delete_by_id(sp, &dir.id)?;
+                    db::DirRecord::delete_by_id(sp, dir.id)?;
                 }
                 Ok(())
             }) {
@@ -692,10 +697,10 @@ fn sort_files(tx: &mut Transaction, dat_id: &db::DatId, mode: SelectMode, path: 
                     if keep {
                         let dest_path_str = path.join(subdir_name(file_mode)).as_str().to_string();
                         let dest_dir_id = get_or_create_dest_dir(sp, dat_id, &mut dest_dirs, &dest_path_str)?;
-                        file.update_dir_id(sp, &dest_dir_id)?;
+                        file.update_dir_id(sp, dest_dir_id)?;
                     } else {
                         file.delete_matches(sp)?;
-                        db::FileRecord::delete_by_id(sp, &file.id)?;
+                        db::FileRecord::delete_by_id(sp, file.id)?;
                     }
                     Ok(())
                 }) {
@@ -713,11 +718,11 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     let imported = import_dat(conn, dat_file)?;
 
     //delete all existing matches for the old dat, we'll re-match them as we relink directories and files to the new dat
-    db::MatchRecord::delete_by_dat(conn, &old_dat_id)?;
+    db::MatchRecord::delete_by_dat(conn, old_dat_id)?;
 
-    let new_context = DatContext::new(conn, &imported.id);
+    let new_context = DatContext::new(conn, imported.id);
 
-    for directory in db::DirRecord::get_by_dat(conn, &old_dat_id)? {
+    for directory in db::DirRecord::get_by_dat(conn, old_dat_id)? {
         //check if its a zip file, if so, restrict matches to set name if matched
         let matched_sets = if util::is_zip_file(&directory.path) {
             match_sets(&new_context, &directory.path)?
@@ -732,10 +737,10 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     }
 
     //relink all directories to the new dat
-    db::DirRecord::relink_dirs(conn, &old_dat_id, &imported.id)?;
+    db::DirRecord::relink_dirs(conn, old_dat_id, imported.id)?;
 
     //relink all files to the new dat
-    db::FileRecord::relink_files(conn, &old_dat_id, &imported.id)?;
+    db::FileRecord::relink_files(conn, old_dat_id, imported.id)?;
 
     //if we successfully updated everything and relinked and the transaction completed, we can now delete the old dat
     delete_dat(conn, old_dat_id)?;
@@ -847,16 +852,16 @@ fn parse_dat_info(df_xml: &Document<'_>) -> Result<db::NewDat> {
 
 fn delete_dat(conn: &Connection, dat_id: db::DatId) -> Result<()> {
     //remove all scanned files and directories
-    db::MatchRecord::delete_by_dat(conn, &dat_id)?;
-    db::FileRecord::delete_by_dat(conn, &dat_id)?;
-    db::DirRecord::delete_by_dat(conn, &dat_id)?;
+    db::MatchRecord::delete_by_dat(conn, dat_id)?;
+    db::FileRecord::delete_by_dat(conn, dat_id)?;
+    db::DirRecord::delete_by_dat(conn, dat_id)?;
 
     //remove all roms and sets before removing the dat
-    db::RomRecord::delete_by_dat(conn, &dat_id)?;
-    db::SetRecord::delete_by_dat(conn, &dat_id)?;
+    db::RomRecord::delete_by_dat(conn, dat_id)?;
+    db::SetRecord::delete_by_dat(conn, dat_id)?;
 
     //remove the dat itself
-    db::DatRecord::delete_by_id(conn, &dat_id)?;
+    db::DatRecord::delete_by_id(conn, dat_id)?;
 
     Ok(())
 }
@@ -934,18 +939,18 @@ struct ScanOptions<'a> {
 /// repetition of carrying both as separate arguments everywhere.
 struct DatContext<'a> {
     conn: &'a Connection,
-    dat_id: &'a db::DatId,
+    dat_id: db::DatId,
 }
 
 impl<'a> DatContext<'a> {
-    fn new(conn: &'a Connection, dat_id: &'a db::DatId) -> Self {
+    fn new(conn: &'a Connection, dat_id: db::DatId) -> Self {
         Self { conn, dat_id }
     }
 }
 
 fn scan_files(
     tx: &mut Transaction,
-    dat_id: &db::DatId,
+    dat_id: db::DatId,
     term: &TermInfo,
     scan_path: &Utf8Path, //expect this to be canonicalized
     options: &ScanOptions<'_>,
@@ -978,7 +983,7 @@ fn report_progress(term: &TermInfo, count: u64) {
 
 fn scan_directory(
     tx: &mut Transaction,
-    dat_id: &db::DatId,
+    dat_id: db::DatId,
     scan_path: &Utf8Path,
     options: &ScanOptions<'_>,
     progress_fn: &dyn Fn(u64),
@@ -990,7 +995,7 @@ fn scan_directory(
             let dir = db::DirRecord::insert(
                 tx,
                 &db::NewDir {
-                    dat_id: *dat_id,
+                    dat_id,
                     path: scan_path.to_string(),
                 },
             )?;
@@ -1053,12 +1058,10 @@ fn scan_directory(
                 files_to_hash
                     .par_iter()
                     .filter_map(|(path, filename)| {
-                        let result = File::open(path)
-                            .map_err(anyhow::Error::from)
-                            .and_then(|file| {
-                                let mut reader = BufReader::new(file);
-                                util::calc_hash(&mut reader)
-                            });
+                        let result = File::open(path).map_err(anyhow::Error::from).and_then(|file| {
+                            let mut reader = BufReader::new(file);
+                            util::calc_hash(&mut reader)
+                        });
                         match result {
                             Ok((hash, file_size)) => Some((filename.as_str(), hash, file_size)),
                             Err(e) => {
@@ -1087,7 +1090,8 @@ fn scan_directory(
     // Insert hashed loose files
     let matched_sets = BTreeSet::new();
     for (filename, hash, file_size) in &hashed_files {
-        match insert_files_and_matches(&DatContext::new(tx, dat_id), &dir.id, filename, *file_size, hash, &matched_sets) {
+        match insert_files_and_matches(&DatContext::new(tx, dat_id), &dir.id, filename, *file_size, hash, &matched_sets)
+        {
             Ok(_) => file_count += 1,
             Err(e) => eprintln!("Failed to insert {}. Error: {e}", filename),
         }
@@ -1098,7 +1102,13 @@ fn scan_directory(
     for (path, entries) in &hashed_zips {
         match db::with_savepoint(tx, |sp| {
             let ctx = DatContext::new(sp, dat_id);
-            let zip_dir = db::DirRecord::insert(ctx.conn, &db::NewDir { dat_id: *dat_id, path: path.to_string() })?;
+            let zip_dir = db::DirRecord::insert(
+                ctx.conn,
+                &db::NewDir {
+                    dat_id,
+                    path: path.to_string(),
+                },
+            )?;
             let matched = match_sets(&ctx, path)?;
             for (name, hash, file_size) in entries {
                 insert_files_and_matches(&ctx, &zip_dir.id, name, *file_size, hash, &matched)?;
@@ -1138,7 +1148,7 @@ fn remove_stale_entries<'a>(
             Ok(Some(dir)) => {
                 dir.delete_matches(ctx.conn)
                     .and_then(|_| dir.delete_files(ctx.conn))
-                    .and_then(|_| db::DirRecord::delete_by_id(ctx.conn, &dir.id))
+                    .and_then(|_| db::DirRecord::delete_by_id(ctx.conn, dir.id))
                     .if_err(|e| eprintln!("Failed to delete directory {}. Error: {e}", existing_path));
             }
             Ok(None) => eprintln!("Failed to find directory entry {}.", existing_path),
@@ -1148,7 +1158,7 @@ fn remove_stale_entries<'a>(
     for (_, existing_file) in stale_files {
         existing_file
             .delete_matches(ctx.conn)
-            .and_then(|_| db::FileRecord::delete_by_id(ctx.conn, &existing_file.id))
+            .and_then(|_| db::FileRecord::delete_by_id(ctx.conn, existing_file.id))
             .if_err(|e| eprintln!("Failed to remove {}. Error: {e}", existing_file.name));
     }
 }
@@ -1180,7 +1190,6 @@ fn match_sets<P: AsRef<Utf8Path>>(ctx: &DatContext<'_>, path: P) -> Result<BTree
     let matched: BTreeSet<db::SetId> = sets.iter().map(|record| record.id).collect();
     Ok(matched)
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct FileMatch {
@@ -1282,7 +1291,7 @@ fn insert_files_and_matches(
     let file = db::FileRecord::insert(
         ctx.conn,
         &db::NewFile {
-            dat_id: *ctx.dat_id,
+            dat_id: ctx.dat_id,
             dir_id: *dir_id,
             name: file_name.to_string(),
             size: db::StoredU64(file_size),
@@ -1304,7 +1313,7 @@ fn insert_matches(
             db::MatchRecord::insert(
                 ctx.conn,
                 &db::NewMatch {
-                    dat_id: *ctx.dat_id,
+                    dat_id: ctx.dat_id,
                     file_id: file.id,
                     status: item.status,
                     set_id: item.set_id,
@@ -1394,7 +1403,9 @@ fn list_scanned_files(
             if let Some(file_matches) = matches_by_file.get(&file.id) {
                 for fm in file_matches {
                     if should_display_file_status(Some(&fm.status), mode) {
-                        let rom = roms_by_id.get(&fm.rom_id).expect("Should always have a valid rom retrieved");
+                        let rom = roms_by_id
+                            .get(&fm.rom_id)
+                            .expect("Should always have a valid rom retrieved");
                         lines.push(format_match_status(&file, Some((fm, rom)), term.tty_out));
                     }
                 }
@@ -1537,7 +1548,7 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
     Ok(())
 }
 
-fn rename_files(tx: &mut Transaction, dat_id: &db::DatId, term: &TermInfo) -> Result<()> {
+fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Result<()> {
     // Bulk-load all Hash-status matches and group by file_id
     let hash_matches = db::MatchRecord::find_by_status_for_dat(tx, dat_id, &db::MatchStatus::Hash)?;
     let mut matches_by_file: BTreeMap<db::FileId, Vec<db::MatchRecord>> = BTreeMap::new();

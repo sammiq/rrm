@@ -56,9 +56,7 @@ macro_rules! sql_query {
 /// Escape SQL LIKE special characters (`%`, `_`, `\`) in a string so they
 /// match literally when used with `ESCAPE '\'`.
 fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 // Id type that is generic but bound to a type to prevent accidentally using
@@ -142,13 +140,13 @@ impl rusqlite::types::FromSql for StoredU64 {
 }
 
 pub trait Queryable: Sized {
-    type IdType: HasId + rusqlite::ToSql;
+    type IdType: HasId + rusqlite::ToSql + Copy;
 
     fn table_name() -> &'static str;
     fn fields() -> &'static str;
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self>;
 
-    fn get_by_id(conn: &Connection, id: &Self::IdType) -> Result<Self> {
+    fn get_by_id(conn: &Connection, id: Self::IdType) -> Result<Self> {
         let record = sql_query_one!(conn, Self::table_name(), Self::fields(), where {id = id.id()}, Self::from_row)?;
         Ok(record)
     }
@@ -181,7 +179,7 @@ pub trait Queryable: Sized {
 }
 
 pub trait Deletable: Queryable {
-    fn delete_by_id(conn: &Connection, id: &Self::IdType) -> Result<bool> {
+    fn delete_by_id(conn: &Connection, id: Self::IdType) -> Result<bool> {
         let sql = format!("DELETE FROM {} WHERE id = :id", Self::table_name());
         let num_deleted = conn.execute(&sql, named_params! {":id": id.id()})?;
         Ok(num_deleted != 0)
@@ -189,13 +187,13 @@ pub trait Deletable: Queryable {
 }
 
 pub trait QueryableByDat: Queryable {
-    fn get_by_dat(conn: &Connection, dat_id: &DatId) -> Result<Vec<Self>> {
+    fn get_by_dat(conn: &Connection, dat_id: DatId) -> Result<Vec<Self>> {
         let matches =
             sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id = dat_id.id()}, Self::from_row)?;
         Ok(matches)
     }
 
-    fn get_num_by_dat(conn: &Connection, dat_id: &DatId) -> Result<usize> {
+    fn get_num_by_dat(conn: &Connection, dat_id: DatId) -> Result<usize> {
         let sql = format!("SELECT COUNT(*) FROM {} WHERE dat_id = :dat_id", Self::table_name());
         let count: i64 = conn.query_row(&sql, named_params! {":dat_id": dat_id.id()}, |row| row.get(0))?;
         Ok(count as usize)
@@ -203,7 +201,7 @@ pub trait QueryableByDat: Queryable {
 }
 
 pub trait DeletableByDat: Queryable {
-    fn delete_by_dat(conn: &Connection, dat_id: &DatId) -> Result<usize> {
+    fn delete_by_dat(conn: &Connection, dat_id: DatId) -> Result<usize> {
         let sql = format!("DELETE FROM {} WHERE dat_id = :dat_id", Self::table_name());
         let num_deleted = conn.execute(&sql, named_params! {":dat_id": dat_id.id()})?;
         Ok(num_deleted)
@@ -211,7 +209,7 @@ pub trait DeletableByDat: Queryable {
 }
 
 pub trait FindableByName: Queryable {
-    fn find_by_name(conn: &Connection, dat_id: &DatId, name: &str, exact: bool) -> Result<Vec<Self>> {
+    fn find_by_name(conn: &Connection, dat_id: DatId, name: &str, exact: bool) -> Result<Vec<Self>> {
         let matches = if exact {
             sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id = dat_id.id(), name}, order by "name", Self::from_row)
         } else {
@@ -253,7 +251,7 @@ where
         conn.execute(&sql, params.as_slice())?;
         let raw_id = conn.last_insert_rowid();
         let id = Self::IdType::from(raw_id);
-        Self::get_by_id(conn, &id)
+        Self::get_by_id(conn, id)
     }
 }
 
@@ -666,31 +664,31 @@ impl rusqlite::ToSql for MatchStatus {
 #[allow(dead_code)]
 impl DatRecord {
     pub fn get_sets(&self, conn: &Connection) -> Result<Vec<SetRecord>> {
-        SetRecord::get_by_dat(conn, &self.id)
+        SetRecord::get_by_dat(conn, self.id)
     }
 
     pub fn get_roms(&self, conn: &Connection) -> Result<Vec<RomRecord>> {
-        RomRecord::get_by_dat(conn, &self.id)
+        RomRecord::get_by_dat(conn, self.id)
     }
 
     pub fn get_directories(&self, conn: &Connection) -> Result<Vec<DirRecord>> {
-        DirRecord::get_by_dat(conn, &self.id)
+        DirRecord::get_by_dat(conn, self.id)
     }
 }
 
 impl SetRecord {
     pub fn get_roms(&self, conn: &Connection) -> Result<Vec<RomRecord>> {
-        RomRecord::get_by_set(conn, &self.id)
+        RomRecord::get_by_set(conn, self.id)
     }
 }
 
 impl RomRecord {
-    fn get_by_set(conn: &Connection, set_id: &SetId) -> Result<Vec<Self>> {
+    fn get_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<Self>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {set_id}, Self::from_row)?;
         Ok(matches)
     }
 
-    pub fn find_by_hash_in_dat(conn: &Connection, dat_id: &DatId, hash: &str) -> Result<Vec<RomRecord>> {
+    pub fn find_by_hash_in_dat(conn: &Connection, dat_id: DatId, hash: &str) -> Result<Vec<RomRecord>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id, hash}, Self::from_row)?;
         Ok(matches)
     }
@@ -729,7 +727,7 @@ impl DirRecord {
         Ok(matches)
     }
 
-    pub fn find_by_path_in_dat(conn: &Connection, dat_id: &DatId, path: &str) -> Result<Option<DirRecord>> {
+    pub fn find_by_path_in_dat(conn: &Connection, dat_id: DatId, path: &str) -> Result<Option<DirRecord>> {
         match sql_query_one!(conn, Self::table_name(), Self::fields(), where {path, dat_id}, Self::from_row
         ) {
             Ok(dir) => Ok(Some(dir)),
@@ -753,19 +751,19 @@ impl DirRecord {
     }
 
     pub fn get_files(&self, conn: &Connection) -> Result<Vec<FileRecord>> {
-        FileRecord::get_by_dir(conn, &self.id)
+        FileRecord::get_by_dir(conn, self.id)
     }
 
     pub fn find_files(&self, conn: &Connection, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
-        FileRecord::find_by_name_in_dir(conn, &self.id, name, exact)
+        FileRecord::find_by_name_in_dir(conn, self.id, name, exact)
     }
 
     pub fn delete_matches(&self, conn: &Connection) -> Result<usize> {
-        MatchRecord::delete_by_dir_id(conn, &self.id)
+        MatchRecord::delete_by_dir_id(conn, self.id)
     }
 
     pub fn delete_files(&self, conn: &Connection) -> Result<usize> {
-        FileRecord::delete_files(conn, &self.id)
+        FileRecord::delete_files(conn, self.id)
     }
 
     pub fn update_path(&self, conn: &Connection, path: &str) -> Result<Self> {
@@ -784,7 +782,7 @@ impl DirRecord {
         })
     }
 
-    pub fn relink_dirs(conn: &Connection, old_dat_id: &DatId, new_dat_id: &DatId) -> Result<usize> {
+    pub fn relink_dirs(conn: &Connection, old_dat_id: DatId, new_dat_id: DatId) -> Result<usize> {
         let sql = format!("UPDATE {} SET dat_id = :new_dat_id WHERE dat_id = :old_dat_id", Self::table_name());
         let num_updated = conn.execute(
             &sql,
@@ -798,13 +796,13 @@ impl DirRecord {
 }
 
 impl FileRecord {
-    fn get_by_dir(conn: &Connection, dir_id: &DirId) -> Result<Vec<Self>> {
+    fn get_by_dir(conn: &Connection, dir_id: DirId) -> Result<Vec<Self>> {
         let matches =
             sql_query!(conn, Self::table_name(), Self::fields(), where {dir_id}, order by "name", Self::from_row)?;
         Ok(matches)
     }
 
-    pub fn find_by_name_in_dir(conn: &Connection, dir_id: &DirId, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
+    pub fn find_by_name_in_dir(conn: &Connection, dir_id: DirId, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
         let matches = if exact {
             sql_query!(conn, Self::table_name(), FileRecord::fields(), where {dir_id, name}, order by "name", Self::from_row)
         } else {
@@ -823,13 +821,13 @@ impl FileRecord {
         Ok(matches)
     }
 
-    pub fn delete_files(conn: &Connection, dir_id: &DirId) -> Result<usize> {
+    pub fn delete_files(conn: &Connection, dir_id: DirId) -> Result<usize> {
         let sql = format!("DELETE FROM {} WHERE dir_id = :dir_id", Self::table_name());
         let num_deleted = conn.execute(&sql, named_params! {":dir_id": dir_id})?;
         Ok(num_deleted)
     }
 
-    pub fn relink_files(conn: &Connection, old_dat_id: &DatId, new_dat_id: &DatId) -> Result<usize> {
+    pub fn relink_files(conn: &Connection, old_dat_id: DatId, new_dat_id: DatId) -> Result<usize> {
         let sql = format!("UPDATE {} SET dat_id = :new_dat_id WHERE dat_id = :old_dat_id", Self::table_name());
         let num_updated = conn.execute(
             &sql,
@@ -860,7 +858,7 @@ impl FileRecord {
         })
     }
 
-    pub fn update_dir_id(&self, conn: &Connection, dir_id: &DirId) -> Result<Self> {
+    pub fn update_dir_id(&self, conn: &Connection, dir_id: DirId) -> Result<Self> {
         let sql = format!("UPDATE {} SET dir_id = :dir_id WHERE id = :id", Self::table_name());
         conn.execute(
             &sql,
@@ -872,7 +870,7 @@ impl FileRecord {
         Ok(Self {
             id: self.id,
             dat_id: self.dat_id,
-            dir_id: *dir_id,
+            dir_id,
             name: self.name.clone(),
             size: self.size,
             hash: self.hash.clone(),
@@ -880,18 +878,18 @@ impl FileRecord {
     }
 
     pub fn delete_matches(&self, conn: &Connection) -> Result<usize> {
-        MatchRecord::delete_by_file_id(conn, &self.id)
+        MatchRecord::delete_by_file_id(conn, self.id)
     }
 }
 
 impl MatchRecord {
-    pub fn delete_by_file_id(conn: &Connection, file_id: &FileId) -> Result<usize> {
+    pub fn delete_by_file_id(conn: &Connection, file_id: FileId) -> Result<usize> {
         let sql = format!("DELETE FROM {} WHERE file_id = :file_id", Self::table_name());
         let num_deleted = conn.execute(&sql, named_params! {":file_id": file_id})?;
         Ok(num_deleted)
     }
 
-    pub fn delete_by_dir_id(conn: &Connection, dir_id: &DirId) -> Result<usize> {
+    pub fn delete_by_dir_id(conn: &Connection, dir_id: DirId) -> Result<usize> {
         let sql = format!(
             "DELETE FROM {matches} WHERE file_id IN (SELECT id FROM {files} WHERE dir_id = :dir_id)",
             matches = Self::table_name(),
@@ -901,12 +899,13 @@ impl MatchRecord {
         Ok(num_deleted)
     }
 
-    pub fn get_by_file_id(conn: &Connection, file_id: &FileId) -> Result<Vec<Self>> {
-        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {file_id}, order by "id", Self::from_row)?;
+    pub fn get_by_file_id(conn: &Connection, file_id: FileId) -> Result<Vec<Self>> {
+        let matches =
+            sql_query!(conn, Self::table_name(), Self::fields(), where {file_id}, order by "id", Self::from_row)?;
         Ok(matches)
     }
 
-    pub fn find_by_status_for_dat(conn: &Connection, dat_id: &DatId, status: &MatchStatus) -> Result<Vec<Self>> {
+    pub fn find_by_status_for_dat(conn: &Connection, dat_id: DatId, status: &MatchStatus) -> Result<Vec<Self>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id = dat_id.id(), status}, order by "id", Self::from_row)?;
         Ok(matches)
     }
@@ -941,8 +940,7 @@ pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);", ())?;
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
-    let version: Option<i64> =
-        tx.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))?;
+    let version: Option<i64> = tx.query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))?;
 
     if let Some(v) = version {
         run_migrations(&tx, db_path.as_ref(), v)?;
@@ -1156,7 +1154,8 @@ mod tests {
     fn mem_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory db");
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);", ()).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);", ())
+            .unwrap();
         create_schema(&conn).unwrap();
         conn
     }
@@ -1179,7 +1178,7 @@ mod tests {
         let dat = DatRecord::insert(&conn, &sample_dat()).unwrap();
         assert_eq!(dat.name, "Test DAT");
 
-        let fetched = DatRecord::get_by_id(&conn, &dat.id).unwrap();
+        let fetched = DatRecord::get_by_id(&conn, dat.id).unwrap();
         assert_eq!(fetched, dat);
     }
 
@@ -1187,7 +1186,14 @@ mod tests {
     fn get_all_dats() {
         let conn = mem_db();
         DatRecord::insert(&conn, &sample_dat()).unwrap();
-        DatRecord::insert(&conn, &NewDat { name: "Second".into(), ..sample_dat() }).unwrap();
+        DatRecord::insert(
+            &conn,
+            &NewDat {
+                name: "Second".into(),
+                ..sample_dat()
+            },
+        )
+        .unwrap();
 
         let all = DatRecord::get_all(&conn).unwrap();
         assert_eq!(all.len(), 2);
@@ -1197,15 +1203,22 @@ mod tests {
     fn delete_dat() {
         let conn = mem_db();
         let dat = DatRecord::insert(&conn, &sample_dat()).unwrap();
-        assert!(DatRecord::delete_by_id(&conn, &dat.id).unwrap());
-        assert!(!DatRecord::delete_by_id(&conn, &dat.id).unwrap());
+        assert!(DatRecord::delete_by_id(&conn, dat.id).unwrap());
+        assert!(!DatRecord::delete_by_id(&conn, dat.id).unwrap());
     }
 
     // --- SetRecord ---
 
     fn insert_dat_and_set(conn: &Connection) -> (DatRecord, SetRecord) {
         let dat = DatRecord::insert(conn, &sample_dat()).unwrap();
-        let set = SetRecord::insert(conn, &NewSet { dat_id: dat.id, name: "Game Set".into() }).unwrap();
+        let set = SetRecord::insert(
+            conn,
+            &NewSet {
+                dat_id: dat.id,
+                name: "Game Set".into(),
+            },
+        )
+        .unwrap();
         (dat, set)
     }
 
@@ -1214,7 +1227,7 @@ mod tests {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
 
-        let sets = SetRecord::get_by_dat(&conn, &dat.id).unwrap();
+        let sets = SetRecord::get_by_dat(&conn, dat.id).unwrap();
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].name, set.name);
     }
@@ -1224,10 +1237,10 @@ mod tests {
         let conn = mem_db();
         let (dat, _) = insert_dat_and_set(&conn);
 
-        let found = SetRecord::find_by_name(&conn, &dat.id, "Game Set", true).unwrap();
+        let found = SetRecord::find_by_name(&conn, dat.id, "Game Set", true).unwrap();
         assert_eq!(found.len(), 1);
 
-        let not_found = SetRecord::find_by_name(&conn, &dat.id, "game set", true).unwrap();
+        let not_found = SetRecord::find_by_name(&conn, dat.id, "game set", true).unwrap();
         assert_eq!(not_found.len(), 0);
     }
 
@@ -1236,7 +1249,7 @@ mod tests {
         let conn = mem_db();
         let (dat, _) = insert_dat_and_set(&conn);
 
-        let found = SetRecord::find_by_name(&conn, &dat.id, "Game", false).unwrap();
+        let found = SetRecord::find_by_name(&conn, dat.id, "Game", false).unwrap();
         assert_eq!(found.len(), 1);
     }
 
@@ -1244,21 +1257,25 @@ mod tests {
     fn delete_sets_by_dat() {
         let conn = mem_db();
         let (dat, _) = insert_dat_and_set(&conn);
-        let deleted = SetRecord::delete_by_dat(&conn, &dat.id).unwrap();
+        let deleted = SetRecord::delete_by_dat(&conn, dat.id).unwrap();
         assert_eq!(deleted, 1);
-        assert_eq!(SetRecord::get_num_by_dat(&conn, &dat.id).unwrap(), 0);
+        assert_eq!(SetRecord::get_num_by_dat(&conn, dat.id).unwrap(), 0);
     }
 
     // --- RomRecord ---
 
     fn insert_rom(conn: &Connection, dat: &DatRecord, set: &SetRecord, name: &str, hash: &str) -> RomRecord {
-        RomRecord::insert(conn, &NewRom {
-            dat_id: dat.id,
-            set_id: set.id,
-            name: name.into(),
-            size: StoredU64(1024),
-            hash: hash.into(),
-        }).unwrap()
+        RomRecord::insert(
+            conn,
+            &NewRom {
+                dat_id: dat.id,
+                set_id: set.id,
+                name: name.into(),
+                size: StoredU64(1024),
+                hash: hash.into(),
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1267,7 +1284,7 @@ mod tests {
         let (dat, set) = insert_dat_and_set(&conn);
         let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc123");
 
-        let roms = RomRecord::get_by_dat(&conn, &dat.id).unwrap();
+        let roms = RomRecord::get_by_dat(&conn, dat.id).unwrap();
         assert_eq!(roms.len(), 1);
         assert_eq!(roms[0].id, rom.id);
 
@@ -1281,10 +1298,10 @@ mod tests {
         let (dat, set) = insert_dat_and_set(&conn);
         insert_rom(&conn, &dat, &set, "game.rom", "deadbeef");
 
-        let found = RomRecord::find_by_hash_in_dat(&conn, &dat.id, "deadbeef").unwrap();
+        let found = RomRecord::find_by_hash_in_dat(&conn, dat.id, "deadbeef").unwrap();
         assert_eq!(found.len(), 1);
 
-        let not_found = RomRecord::find_by_hash_in_dat(&conn, &dat.id, "000000").unwrap();
+        let not_found = RomRecord::find_by_hash_in_dat(&conn, dat.id, "000000").unwrap();
         assert_eq!(not_found.len(), 0);
     }
 
@@ -1292,7 +1309,14 @@ mod tests {
     fn get_roms_by_sets() {
         let conn = mem_db();
         let (dat, set1) = insert_dat_and_set(&conn);
-        let set2 = SetRecord::insert(&conn, &NewSet { dat_id: dat.id, name: "Set 2".into() }).unwrap();
+        let set2 = SetRecord::insert(
+            &conn,
+            &NewSet {
+                dat_id: dat.id,
+                name: "Set 2".into(),
+            },
+        )
+        .unwrap();
         insert_rom(&conn, &dat, &set1, "a.rom", "aaa");
         insert_rom(&conn, &dat, &set2, "b.rom", "bbb");
 
@@ -1323,7 +1347,14 @@ mod tests {
     fn get_by_ids() {
         let conn = mem_db();
         let d1 = DatRecord::insert(&conn, &sample_dat()).unwrap();
-        let d2 = DatRecord::insert(&conn, &NewDat { name: "Second".into(), ..sample_dat() }).unwrap();
+        let d2 = DatRecord::insert(
+            &conn,
+            &NewDat {
+                name: "Second".into(),
+                ..sample_dat()
+            },
+        )
+        .unwrap();
 
         let ids = vec![d1.id, d2.id];
         let result = DatRecord::get_by_ids(&conn, &ids).unwrap();
@@ -1333,7 +1364,14 @@ mod tests {
     // --- DirRecord ---
 
     fn insert_dir(conn: &Connection, dat: &DatRecord, path: &str) -> DirRecord {
-        DirRecord::insert(conn, &NewDir { dat_id: dat.id, path: path.into() }).unwrap()
+        DirRecord::insert(
+            conn,
+            &NewDir {
+                dat_id: dat.id,
+                path: path.into(),
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1342,7 +1380,7 @@ mod tests {
         let (dat, _) = insert_dat_and_set(&conn);
         insert_dir(&conn, &dat, "/roms/snes");
 
-        let dirs = DirRecord::get_by_dat(&conn, &dat.id).unwrap();
+        let dirs = DirRecord::get_by_dat(&conn, dat.id).unwrap();
         assert_eq!(dirs.len(), 1);
     }
 
@@ -1352,10 +1390,10 @@ mod tests {
         let (dat, _) = insert_dat_and_set(&conn);
         insert_dir(&conn, &dat, "/roms/snes");
 
-        let found = DirRecord::find_by_path_in_dat(&conn, &dat.id, "/roms/snes").unwrap();
+        let found = DirRecord::find_by_path_in_dat(&conn, dat.id, "/roms/snes").unwrap();
         assert!(found.is_some());
 
-        let not_found = DirRecord::find_by_path_in_dat(&conn, &dat.id, "/roms/nes").unwrap();
+        let not_found = DirRecord::find_by_path_in_dat(&conn, dat.id, "/roms/nes").unwrap();
         assert!(not_found.is_none());
     }
 
@@ -1390,25 +1428,36 @@ mod tests {
     fn relink_dirs() {
         let conn = mem_db();
         let dat1 = DatRecord::insert(&conn, &sample_dat()).unwrap();
-        let dat2 = DatRecord::insert(&conn, &NewDat { name: "New DAT".into(), ..sample_dat() }).unwrap();
+        let dat2 = DatRecord::insert(
+            &conn,
+            &NewDat {
+                name: "New DAT".into(),
+                ..sample_dat()
+            },
+        )
+        .unwrap();
         insert_dir(&conn, &dat1, "/roms");
 
-        let updated = DirRecord::relink_dirs(&conn, &dat1.id, &dat2.id).unwrap();
+        let updated = DirRecord::relink_dirs(&conn, dat1.id, dat2.id).unwrap();
         assert_eq!(updated, 1);
-        assert_eq!(DirRecord::get_by_dat(&conn, &dat1.id).unwrap().len(), 0);
-        assert_eq!(DirRecord::get_by_dat(&conn, &dat2.id).unwrap().len(), 1);
+        assert_eq!(DirRecord::get_by_dat(&conn, dat1.id).unwrap().len(), 0);
+        assert_eq!(DirRecord::get_by_dat(&conn, dat2.id).unwrap().len(), 1);
     }
 
     // --- FileRecord ---
 
     fn insert_file(conn: &Connection, dat: &DatRecord, dir: &DirRecord, name: &str) -> FileRecord {
-        FileRecord::insert(conn, &NewFile {
-            dat_id: dat.id,
-            dir_id: dir.id,
-            name: name.into(),
-            size: StoredU64(2048),
-            hash: "filehash".into(),
-        }).unwrap()
+        FileRecord::insert(
+            conn,
+            &NewFile {
+                dat_id: dat.id,
+                dir_id: dir.id,
+                name: name.into(),
+                size: StoredU64(2048),
+                hash: "filehash".into(),
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1450,7 +1499,7 @@ mod tests {
         assert_eq!(updated.name, "new.zip");
         assert_eq!(updated.id, file.id);
 
-        let fetched = FileRecord::get_by_id(&conn, &file.id).unwrap();
+        let fetched = FileRecord::get_by_id(&conn, file.id).unwrap();
         assert_eq!(fetched.name, "new.zip");
     }
 
@@ -1471,11 +1520,18 @@ mod tests {
     fn relink_files() {
         let conn = mem_db();
         let dat1 = DatRecord::insert(&conn, &sample_dat()).unwrap();
-        let dat2 = DatRecord::insert(&conn, &NewDat { name: "New DAT".into(), ..sample_dat() }).unwrap();
+        let dat2 = DatRecord::insert(
+            &conn,
+            &NewDat {
+                name: "New DAT".into(),
+                ..sample_dat()
+            },
+        )
+        .unwrap();
         let dir = insert_dir(&conn, &dat1, "/roms");
         insert_file(&conn, &dat1, &dir, "game.zip");
 
-        let updated = FileRecord::relink_files(&conn, &dat1.id, &dat2.id).unwrap();
+        let updated = FileRecord::relink_files(&conn, dat1.id, dat2.id).unwrap();
         assert_eq!(updated, 1);
     }
 
@@ -1489,17 +1545,21 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        let m = MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id,
-            file_id: file.id,
-            status: MatchStatus::Hash,
-            set_id: set.id,
-            rom_id: rom.id,
-        }).unwrap();
+        let m = MatchRecord::insert(
+            &conn,
+            &NewMatch {
+                dat_id: dat.id,
+                file_id: file.id,
+                status: MatchStatus::Hash,
+                set_id: set.id,
+                rom_id: rom.id,
+            },
+        )
+        .unwrap();
 
         assert_eq!(m.status, MatchStatus::Hash);
 
-        let by_dat = MatchRecord::get_by_dat(&conn, &dat.id).unwrap();
+        let by_dat = MatchRecord::get_by_dat(&conn, dat.id).unwrap();
         assert_eq!(by_dat.len(), 1);
     }
 
@@ -1511,18 +1571,22 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        let m = MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id,
-            file_id: file.id,
-            status: MatchStatus::Hash,
-            set_id: set.id,
-            rom_id: rom.id,
-        }).unwrap();
+        let m = MatchRecord::insert(
+            &conn,
+            &NewMatch {
+                dat_id: dat.id,
+                file_id: file.id,
+                status: MatchStatus::Hash,
+                set_id: set.id,
+                rom_id: rom.id,
+            },
+        )
+        .unwrap();
 
         let updated = m.update(&conn, &MatchStatus::Match).unwrap();
         assert_eq!(updated.status, MatchStatus::Match);
 
-        let fetched = MatchRecord::get_by_id(&conn, &m.id).unwrap();
+        let fetched = MatchRecord::get_by_id(&conn, m.id).unwrap();
         assert_eq!(fetched.status, MatchStatus::Match);
     }
 
@@ -1534,9 +1598,17 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id, file_id: file.id, status: MatchStatus::Hash, set_id: set.id, rom_id: rom.id,
-        }).unwrap();
+        MatchRecord::insert(
+            &conn,
+            &NewMatch {
+                dat_id: dat.id,
+                file_id: file.id,
+                status: MatchStatus::Hash,
+                set_id: set.id,
+                rom_id: rom.id,
+            },
+        )
+        .unwrap();
 
         let deleted = file.delete_matches(&conn).unwrap();
         assert_eq!(deleted, 1);
@@ -1550,9 +1622,17 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id, file_id: file.id, status: MatchStatus::Hash, set_id: set.id, rom_id: rom.id,
-        }).unwrap();
+        MatchRecord::insert(
+            &conn,
+            &NewMatch {
+                dat_id: dat.id,
+                file_id: file.id,
+                status: MatchStatus::Hash,
+                set_id: set.id,
+                rom_id: rom.id,
+            },
+        )
+        .unwrap();
 
         let deleted = dir.delete_matches(&conn).unwrap();
         assert_eq!(deleted, 1);
@@ -1566,11 +1646,19 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id, file_id: file.id, status: MatchStatus::Hash, set_id: set.id, rom_id: rom.id,
-        }).unwrap();
+        MatchRecord::insert(
+            &conn,
+            &NewMatch {
+                dat_id: dat.id,
+                file_id: file.id,
+                status: MatchStatus::Hash,
+                set_id: set.id,
+                rom_id: rom.id,
+            },
+        )
+        .unwrap();
 
-        let deleted = MatchRecord::delete_by_dat(&conn, &dat.id).unwrap();
+        let deleted = MatchRecord::delete_by_dat(&conn, dat.id).unwrap();
         assert_eq!(deleted, 1);
     }
 
@@ -1582,20 +1670,36 @@ mod tests {
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
-        MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id, file_id: file.id, status: MatchStatus::Hash, set_id: set.id, rom_id: rom.id,
-        }).unwrap();
-        MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id, file_id: file.id, status: MatchStatus::Name, set_id: set.id, rom_id: rom.id,
-        }).unwrap();
+        MatchRecord::insert(
+            &conn,
+            &NewMatch {
+                dat_id: dat.id,
+                file_id: file.id,
+                status: MatchStatus::Hash,
+                set_id: set.id,
+                rom_id: rom.id,
+            },
+        )
+        .unwrap();
+        MatchRecord::insert(
+            &conn,
+            &NewMatch {
+                dat_id: dat.id,
+                file_id: file.id,
+                status: MatchStatus::Name,
+                set_id: set.id,
+                rom_id: rom.id,
+            },
+        )
+        .unwrap();
 
-        let hash_matches = MatchRecord::find_by_status_for_dat(&conn, &dat.id, &MatchStatus::Hash).unwrap();
+        let hash_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, &MatchStatus::Hash).unwrap();
         assert_eq!(hash_matches.len(), 1);
 
-        let name_matches = MatchRecord::find_by_status_for_dat(&conn, &dat.id, &MatchStatus::Name).unwrap();
+        let name_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, &MatchStatus::Name).unwrap();
         assert_eq!(name_matches.len(), 1);
 
-        let match_matches = MatchRecord::find_by_status_for_dat(&conn, &dat.id, &MatchStatus::Match).unwrap();
+        let match_matches = MatchRecord::find_by_status_for_dat(&conn, dat.id, &MatchStatus::Match).unwrap();
         assert_eq!(match_matches.len(), 0);
     }
 
@@ -1606,16 +1710,20 @@ mod tests {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
         let big: u64 = u64::MAX;
-        let rom = RomRecord::insert(&conn, &NewRom {
-            dat_id: dat.id,
-            set_id: set.id,
-            name: "big.rom".into(),
-            size: StoredU64(big),
-            hash: "h".into(),
-        }).unwrap();
+        let rom = RomRecord::insert(
+            &conn,
+            &NewRom {
+                dat_id: dat.id,
+                set_id: set.id,
+                name: "big.rom".into(),
+                size: StoredU64(big),
+                hash: "h".into(),
+            },
+        )
+        .unwrap();
         assert_eq!(rom.size, big);
 
-        let fetched = RomRecord::get_by_id(&conn, &rom.id).unwrap();
+        let fetched = RomRecord::get_by_id(&conn, rom.id).unwrap();
         assert_eq!(fetched.size, big);
     }
 
@@ -1647,7 +1755,8 @@ mod tests {
         with_transaction(&mut conn, |tx| {
             DatRecord::insert(tx, &sample_dat())?;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(DatRecord::get_all(&conn).unwrap().len(), 1);
     }
 

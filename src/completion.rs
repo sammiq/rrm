@@ -47,11 +47,8 @@ pub fn complete(root_node: &TreeNode, line: &str) -> (usize, Vec<String>) {
     // was discarded by shlex, so we recover it by finding the opening quote in the original line.
     let mut lex = shlex::Shlex::new(line);
     let tokens: Vec<String> = lex.by_ref().collect();
-    let partial_override: Option<String> = if lex.had_error {
-        line.rfind(['\'', '"']).map(|pos| line[pos + 1..].to_owned())
-    } else {
-        None
-    };
+    let partial_override: Option<String> =
+        if lex.had_error { line.rfind(['\'', '"']).map(|pos| line[pos + 1..].to_owned()) } else { None };
     let trailing_space = partial_override.is_none() && (line.ends_with(' ') || line.is_empty());
 
     let children = match root_node {
@@ -233,7 +230,9 @@ fn fs_candidates(partial: &str, dirs_only: bool, in_quote: bool) -> Vec<String> 
                 let escaped = candidate.replace("'", "'\\''");
                 if is_dir { format!("'{}", escaped) } else { format!("'{}'", escaped) }
             } else {
-                let s = shlex::try_quote(&candidate).expect("file paths do not contain null bytes").into_owned();
+                let s = shlex::try_quote(&candidate)
+                    .expect("file paths do not contain null bytes")
+                    .into_owned();
                 if is_dir { s.strip_suffix('\'').unwrap_or(&s).to_owned() } else { s }
             };
             Some(quoted)
@@ -260,11 +259,20 @@ mod tests {
                     .value_parser(["json", "table", "plain"])
                     .num_args(1),
             )
-            .arg(Arg::new("verbose").long("verbose").short('v').action(ArgAction::SetTrue))
+            .arg(
+                Arg::new("verbose")
+                    .long("verbose")
+                    .short('v')
+                    .action(ArgAction::SetTrue),
+            )
             .subcommand(
                 Command::new("install")
                     .disable_help_flag(true)
-                    .arg(Arg::new("package").value_parser(["pkg-a", "pkg-b", "pkg-c"]).num_args(1))
+                    .arg(
+                        Arg::new("package")
+                            .value_parser(["pkg-a", "pkg-b", "pkg-c"])
+                            .num_args(1),
+                    )
                     .arg(Arg::new("force").long("force").action(ArgAction::SetTrue)),
             )
             .subcommand(Command::new("remove").disable_help_flag(true))
@@ -318,7 +326,9 @@ mod tests {
     fn build_completions_includes_subcommands_and_args() {
         let cmd = make_command();
         let tree = build_completions(&cmd);
-        let TreeNode::Branch(_, children) = &tree else { panic!("expected Branch") };
+        let TreeNode::Branch(_, children) = &tree else {
+            panic!("expected Branch")
+        };
         let all_names: Vec<String> = children.iter().flat_map(|n| n.names()).collect();
         assert!(all_names.contains(&"--format".to_string()));
         assert!(all_names.contains(&"--verbose".to_string()));
