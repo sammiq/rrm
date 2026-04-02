@@ -69,6 +69,8 @@ Scan and manage ROM files:
         PATH                                Directory to scan (defaults to current directory)
         -R, --recursive                     Recurse into subdirectories
         --full                              Re-scan all files, not just new ones
+        -p, --parallel <N>                  Number of files to hash in parallel
+                                            [default: 1]
         --exclude <EXTENSIONS>              Comma separated list of suffixes to exclude
                                             [default: m3u,dat,txt]
 
