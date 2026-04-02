@@ -598,12 +598,12 @@ fn classify_zip(conn: &Connection, dir: &db::DirRecord) -> Result<SelectMode> {
     }
 }
 
-fn subdir_name(mode: SelectMode) -> &'static str {
+fn subdir_name(mode: SelectMode) -> Option<&'static str> {
     match mode {
-        SelectMode::Matched => "matched",
-        SelectMode::Warning => "warning",
-        SelectMode::Unmatched => "unmatched",
-        SelectMode::All => unreachable!(),
+        SelectMode::Matched => Some("matched"),
+        SelectMode::Warning => Some("warning"),
+        SelectMode::Unmatched => Some("unmatched"),
+        SelectMode::All => None,
     }
 }
 
@@ -635,7 +635,8 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
 
     // Create destination subdirectories on disk
     for m in &modes {
-        let dest = path.join(subdir_name(*m));
+        let mode_subdir = subdir_name(*m).ok_or_else(|| anyhow!("cannot sort into subdirectory for mode {:?}", m))?;
+        let dest = path.join(mode_subdir);
         if !dest.exists() {
             std::fs::create_dir_all(&dest)?;
         }
@@ -654,7 +655,9 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
 
             let zip_path = Utf8PathBuf::from(&dir.path);
             let file_name = zip_path.file_name().context("zip should have a file name")?;
-            let dest = path.join(subdir_name(zip_mode)).join(file_name);
+            let mode_subdir = subdir_name(zip_mode)
+                .ok_or_else(|| anyhow!("cannot sort zip '{}' with unsupported mode {:?}", dir.path, zip_mode))?;
+            let dest = path.join(mode_subdir).join(file_name);
 
             match db::with_savepoint(tx, |sp| {
                 std::fs::rename(&zip_path, &dest)?;
@@ -682,12 +685,14 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
                 }
 
                 let src = Utf8Path::new(&dir.path).join(&file.name);
-                let dest = path.join(subdir_name(file_mode)).join(&file.name);
+                let mode_subdir = subdir_name(file_mode)
+                    .ok_or_else(|| anyhow!("cannot sort file '{}' with unsupported mode {:?}", file.name, file_mode))?;
+                let dest = path.join(mode_subdir).join(&file.name);
 
                 match db::with_savepoint(tx, |sp| {
                     std::fs::rename(&src, &dest)?;
                     if keep {
-                        let dest_path_str = path.join(subdir_name(file_mode)).as_str().to_string();
+                        let dest_path_str = path.join(mode_subdir).as_str().to_string();
                         let dest_dir_id = get_or_create_dest_dir(sp, dat_id, &mut dest_dirs, &dest_path_str)?;
                         file.update_dir_id(sp, dest_dir_id)?;
                     } else {
