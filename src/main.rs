@@ -622,13 +622,7 @@ fn get_or_create_dest_dir(
     let dir = if let Some(existing) = db::DirRecord::find_by_path_in_dat(conn, dat_id, dest_path)? {
         existing
     } else {
-        db::DirRecord::insert(
-            conn,
-            &db::NewDir {
-                dat_id,
-                path: dest_path.to_string(),
-            },
-        )?
+        db::DirRecord::insert(conn, &db::NewDir::new(dat_id, dest_path))?
     };
     dest_dirs.insert(dest_path.to_string(), dir.id);
     Ok(dir.id)
@@ -789,13 +783,7 @@ fn parse_dat(conn: &Connection, df_buffer: &str) -> Result<db::DatRecord> {
             .attribute(ATTR_GAME_NAME)
             .context("Unable to read game name in reference dat file")?;
 
-        let set = db::SetRecord::insert(
-            conn,
-            &db::NewSet {
-                dat_id: dat.id,
-                name: game_name.to_string(),
-            },
-        )?;
+        let set = db::SetRecord::insert(conn, &db::NewSet::new(dat.id, game_name))?;
 
         for rom_node in game_node.descendants().filter(|node| node.tag_name().name() == TAG_ROM) {
             let rom_name = rom_node.attribute(ATTR_ROM_NAME).context("Unable to read game name")?;
@@ -803,13 +791,13 @@ fn parse_dat(conn: &Connection, df_buffer: &str) -> Result<db::DatRecord> {
             let rom_hash = rom_node.attribute(ATTR_ROM_HASH).context("Unable to read game hash")?;
             db::RomRecord::insert(
                 conn,
-                &db::NewRom {
-                    dat_id: dat.id,
-                    set_id: set.id,
-                    name: rom_name.to_string(),
-                    size: db::StoredU64(rom_size.parse().context("should be a valid number")?),
-                    hash: rom_hash.to_string(),
-                },
+                &db::NewRom::new(
+                    dat.id,
+                    set.id,
+                    rom_name,
+                    rom_size.parse().context("should be a valid number")?,
+                    rom_hash,
+                ),
             )?;
         }
     }
@@ -836,17 +824,13 @@ fn parse_dat_info(df_xml: &Document<'_>) -> Result<db::NewDat> {
             _ => {}
         };
     }
-    let new_dat = db::NewDat {
-        name: name.context("unable to find name attribute in header")?.to_string(),
-        description: description
-            .context("unable to find description attribute in header")?
-            .to_string(),
-        version: version
-            .context("unable to find version attribute in header")?
-            .to_string(),
-        author: author.context("unable to find author attribute in header")?.to_string(),
-        hash_type: "sha1".to_string(),
-    };
+    let new_dat = db::NewDat::new(
+        name.context("unable to find name attribute in header")?,
+        description.context("unable to find description attribute in header")?,
+        version.context("unable to find version attribute in header")?,
+        author.context("unable to find author attribute in header")?,
+        "sha1",
+    );
     Ok(new_dat)
 }
 
@@ -992,13 +976,7 @@ fn scan_directory(
         Some(dir) => (dir, true),
         None => {
             //no existing records, do a full scan
-            let dir = db::DirRecord::insert(
-                tx,
-                &db::NewDir {
-                    dat_id,
-                    path: scan_path.to_string(),
-                },
-            )?;
+            let dir = db::DirRecord::insert(tx, &db::NewDir::new(dat_id, scan_path.as_str()))?;
             (dir, false)
         }
     };
@@ -1102,13 +1080,7 @@ fn scan_directory(
     for (path, entries) in &hashed_zips {
         match db::with_savepoint(tx, |sp| {
             let ctx = DatContext::new(sp, dat_id);
-            let zip_dir = db::DirRecord::insert(
-                ctx.conn,
-                &db::NewDir {
-                    dat_id,
-                    path: path.to_string(),
-                },
-            )?;
+            let zip_dir = db::DirRecord::insert(ctx.conn, &db::NewDir::new(dat_id, path.as_str()))?;
             let matched = match_sets(&ctx, path)?;
             for (name, hash, file_size) in entries {
                 insert_files_and_matches(&ctx, &zip_dir.id, name, *file_size, hash, &matched)?;
@@ -1288,16 +1260,7 @@ fn insert_files_and_matches(
     hash: &str,
     matched_sets: &BTreeSet<db::SetId>,
 ) -> Result<()> {
-    let file = db::FileRecord::insert(
-        ctx.conn,
-        &db::NewFile {
-            dat_id: ctx.dat_id,
-            dir_id: *dir_id,
-            name: file_name.to_string(),
-            size: db::StoredU64(file_size),
-            hash: hash.to_string(),
-        },
-    )?;
+    let file = db::FileRecord::insert(ctx.conn, &db::NewFile::new(ctx.dat_id, *dir_id, file_name, file_size, hash))?;
 
     insert_matches(ctx, &file, matched_sets)
 }
@@ -1312,13 +1275,7 @@ fn insert_matches(
         for item in items {
             db::MatchRecord::insert(
                 ctx.conn,
-                &db::NewMatch {
-                    dat_id: ctx.dat_id,
-                    file_id: file.id,
-                    status: item.status,
-                    set_id: item.set_id,
-                    rom_id: item.rom_id,
-                },
+                &db::NewMatch::new(ctx.dat_id, file.id, item.status, item.set_id, item.rom_id),
             )?;
         }
     }
@@ -1664,11 +1621,11 @@ mod tests {
             </header>
         </datafile>"#;
         let dat = parse_info(xml).unwrap();
-        assert_eq!(dat.name, "My DAT");
-        assert_eq!(dat.description, "A test dat");
-        assert_eq!(dat.version, "1.0");
-        assert_eq!(dat.author, "tester");
-        assert_eq!(dat.hash_type, "sha1");
+        assert_eq!(dat.name(), "My DAT");
+        assert_eq!(dat.description(), "A test dat");
+        assert_eq!(dat.version(), "1.0");
+        assert_eq!(dat.author(), "tester");
+        assert_eq!(dat.hash_type(), "sha1");
     }
 
     #[test]
