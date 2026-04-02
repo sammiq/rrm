@@ -399,10 +399,8 @@ fn handle_data_commands(
             })
         }
         DataCommands::Update { dat_file, yes } => {
-            ensure!(dat_id.is_some(), "No dat file selected");
-
             if ask_for_confirmation(term, "Are you sure you want to update the current dat file? (y/N): ", *yes)? {
-                let old_dat_id = dat_id.take().expect("Option should contain data");
+                let old_dat_id = dat_id.as_ref().copied().ok_or_else(|| anyhow!("No dat file selected"))?;
                 db::with_transaction(conn, |tx| {
                     update_dat(tx, dat_file, old_dat_id).map(|imported| {
                         println!("dat file `{}` imported and updated.", imported.name);
@@ -600,12 +598,12 @@ fn classify_zip(conn: &Connection, dir: &db::DirRecord) -> Result<SelectMode> {
     }
 }
 
-fn subdir_name(mode: SelectMode) -> &'static str {
+fn subdir_name(mode: SelectMode) -> Option<&'static str> {
     match mode {
-        SelectMode::Matched => "matched",
-        SelectMode::Warning => "warning",
-        SelectMode::Unmatched => "unmatched",
-        SelectMode::All => unreachable!(),
+        SelectMode::Matched => Some("matched"),
+        SelectMode::Warning => Some("warning"),
+        SelectMode::Unmatched => Some("unmatched"),
+        SelectMode::All => None,
     }
 }
 
@@ -637,7 +635,8 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
 
     // Create destination subdirectories on disk
     for m in &modes {
-        let dest = path.join(subdir_name(*m));
+        let mode_subdir = subdir_name(*m).ok_or_else(|| anyhow!("cannot sort into subdirectory for mode {:?}", m))?;
+        let dest = path.join(mode_subdir);
         if !dest.exists() {
             std::fs::create_dir_all(&dest)?;
         }
@@ -656,7 +655,9 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
 
             let zip_path = Utf8PathBuf::from(&dir.path);
             let file_name = zip_path.file_name().context("zip should have a file name")?;
-            let dest = path.join(subdir_name(zip_mode)).join(file_name);
+            let mode_subdir = subdir_name(zip_mode)
+                .ok_or_else(|| anyhow!("cannot sort zip '{}' with unsupported mode {:?}", dir.path, zip_mode))?;
+            let dest = path.join(mode_subdir).join(file_name);
 
             match db::with_savepoint(tx, |sp| {
                 std::fs::rename(&zip_path, &dest)?;
@@ -684,12 +685,14 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
                 }
 
                 let src = Utf8Path::new(&dir.path).join(&file.name);
-                let dest = path.join(subdir_name(file_mode)).join(&file.name);
+                let mode_subdir = subdir_name(file_mode)
+                    .ok_or_else(|| anyhow!("cannot sort file '{}' with unsupported mode {:?}", file.name, file_mode))?;
+                let dest = path.join(mode_subdir).join(&file.name);
 
                 match db::with_savepoint(tx, |sp| {
                     std::fs::rename(&src, &dest)?;
                     if keep {
-                        let dest_path_str = path.join(subdir_name(file_mode)).as_str().to_string();
+                        let dest_path_str = path.join(mode_subdir).as_str().to_string();
                         let dest_dir_id = get_or_create_dest_dir(sp, dat_id, &mut dest_dirs, &dest_path_str)?;
                         file.update_dir_id(sp, dest_dir_id)?;
                     } else {
@@ -1323,6 +1326,18 @@ fn format_match_status(
     }
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 fn list_scanned_files(
     ctx: &DatContext<'_>,
     term: &TermInfo,
@@ -1362,7 +1377,7 @@ fn list_scanned_files(
                     if should_display_file_status(Some(fm.status), mode) {
                         let rom = roms_by_id
                             .get(&fm.rom_id)
-                            .expect("Should always have a valid rom retrieved");
+                            .ok_or_else(|| anyhow!("match references missing rom id {:?}", fm.rom_id))?;
                         lines.push(format_match_status(&file, Some((fm, rom)), term.tty_out));
                     }
                 }
@@ -1423,12 +1438,7 @@ fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option
     println!("--- MISSING SETS ---");
     let status = format_set_indicator(SetStatus::Missing, term.tty_out);
     for set in &all_sets {
-        if let Some(partial_name) = partial_name
-            && !set
-                .name
-                .to_ascii_lowercase()
-                .contains(&partial_name.to_ascii_lowercase())
-        {
+        if let Some(partial_name) = partial_name && !contains_ascii_case_insensitive(&set.name, partial_name) {
             continue;
         }
         println_if!(!matches_by_set.contains_key(&set.id), "[{status}] {}", set.name);
@@ -1458,12 +1468,7 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
     let partial_status = format_set_indicator(SetStatus::Partial, term.tty_out);
     let complete_status = format_set_indicator(SetStatus::Complete, term.tty_out);
     for set in &found_sets {
-        if let Some(partial_name) = partial_name
-            && !set
-                .name
-                .to_ascii_lowercase()
-                .contains(&partial_name.to_ascii_lowercase())
-        {
+        if let Some(partial_name) = partial_name && !contains_ascii_case_insensitive(&set.name, partial_name) {
             continue;
         }
 
@@ -1482,10 +1487,10 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
             for matched in set_matches {
                 let file = files_by_id
                     .get(&matched.file_id)
-                    .expect("Should always have a valid file retrieved");
+                    .ok_or_else(|| anyhow!("set match references missing file id {:?}", matched.file_id))?;
                 let rom = roms_by_romid
                     .get(&matched.rom_id)
-                    .expect("Should always have a valid rom retrieved");
+                    .ok_or_else(|| anyhow!("set match references missing rom id {:?}", matched.rom_id))?;
                 let status = format_match_status(file, Some((matched, rom)), term.tty_out);
                 println!(" {status}");
             }
@@ -1545,7 +1550,7 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
                 let (file, file_match) = &records[0];
                 let rom = roms_by_id
                     .get(&file_match.rom_id)
-                    .expect("Should always have a valid rom retrieved");
+                    .ok_or_else(|| anyhow!("rename match references missing rom id {:?}", file_match.rom_id))?;
 
                 match db::with_savepoint(tx, |sp| {
                     let new_file = file.update_name(sp, &rom.name)?;
@@ -1676,6 +1681,26 @@ mod tests {
     }
 
     // --- helpers ---
+
+    #[test]
+    fn contains_ascii_case_insensitive_empty_needle() {
+        assert!(contains_ascii_case_insensitive("anything", ""));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_matches_mixed_case_substring() {
+        assert!(contains_ascii_case_insensitive("Metal Slug", "sLuG"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_no_match() {
+        assert!(!contains_ascii_case_insensitive("Metal Slug", "slugx"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_needle_longer_than_haystack() {
+        assert!(!contains_ascii_case_insensitive("abc", "abcd"));
+    }
 
     fn make_rom(id: i64, dat_id: i64, set_id: i64, size: u64, hash: &str) -> db::RomRecord {
         db::RomRecord {
