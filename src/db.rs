@@ -330,22 +330,27 @@ impl NewDat {
         }
     }
 
+    #[cfg(test)]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    #[cfg(test)]
     pub fn description(&self) -> &str {
         &self.description
     }
 
+    #[cfg(test)]
     pub fn version(&self) -> &str {
         &self.version
     }
 
+    #[cfg(test)]
     pub fn author(&self) -> &str {
         &self.author
     }
 
+    #[cfg(test)]
     pub fn hash_type(&self) -> &str {
         &self.hash_type
     }
