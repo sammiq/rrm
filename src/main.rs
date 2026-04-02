@@ -399,10 +399,8 @@ fn handle_data_commands(
             })
         }
         DataCommands::Update { dat_file, yes } => {
-            ensure!(dat_id.is_some(), "No dat file selected");
-
             if ask_for_confirmation(term, "Are you sure you want to update the current dat file? (y/N): ", *yes)? {
-                let old_dat_id = dat_id.take().expect("Option should contain data");
+                let old_dat_id = dat_id.as_ref().copied().ok_or_else(|| anyhow!("No dat file selected"))?;
                 db::with_transaction(conn, |tx| {
                     update_dat(tx, dat_file, old_dat_id).map(|imported| {
                         println!("dat file `{}` imported and updated.", imported.name);
@@ -1362,7 +1360,7 @@ fn list_scanned_files(
                     if should_display_file_status(Some(fm.status), mode) {
                         let rom = roms_by_id
                             .get(&fm.rom_id)
-                            .expect("Should always have a valid rom retrieved");
+                            .ok_or_else(|| anyhow!("match references missing rom id {:?}", fm.rom_id))?;
                         lines.push(format_match_status(&file, Some((fm, rom)), term.tty_out));
                     }
                 }
@@ -1482,10 +1480,10 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
             for matched in set_matches {
                 let file = files_by_id
                     .get(&matched.file_id)
-                    .expect("Should always have a valid file retrieved");
+                    .ok_or_else(|| anyhow!("set match references missing file id {:?}", matched.file_id))?;
                 let rom = roms_by_romid
                     .get(&matched.rom_id)
-                    .expect("Should always have a valid rom retrieved");
+                    .ok_or_else(|| anyhow!("set match references missing rom id {:?}", matched.rom_id))?;
                 let status = format_match_status(file, Some((matched, rom)), term.tty_out);
                 println!(" {status}");
             }
@@ -1545,7 +1543,7 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
                 let (file, file_match) = &records[0];
                 let rom = roms_by_id
                     .get(&file_match.rom_id)
-                    .expect("Should always have a valid rom retrieved");
+                    .ok_or_else(|| anyhow!("rename match references missing rom id {:?}", file_match.rom_id))?;
 
                 match db::with_savepoint(tx, |sp| {
                     let new_file = file.update_name(sp, &rom.name)?;
