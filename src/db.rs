@@ -906,8 +906,8 @@ impl MatchRecord {
         Ok(matches)
     }
 
-    pub fn find_by_status_for_file(conn: &Connection, file_id: &FileId, status: &MatchStatus) -> Result<Vec<Self>> {
-        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {file_id, status}, order by "id", Self::from_row)?;
+    pub fn find_by_status_for_dat(conn: &Connection, dat_id: &DatId, status: &MatchStatus) -> Result<Vec<Self>> {
+        let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {dat_id = dat_id.id(), status}, order by "id", Self::from_row)?;
         Ok(matches)
     }
 
@@ -1527,28 +1527,6 @@ mod tests {
     }
 
     #[test]
-    fn find_matches_by_status() {
-        let conn = mem_db();
-        let (dat, set) = insert_dat_and_set(&conn);
-        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc");
-        let dir = insert_dir(&conn, &dat, "/roms");
-        let file = insert_file(&conn, &dat, &dir, "game.zip");
-
-        MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id, file_id: file.id, status: MatchStatus::Hash, set_id: set.id, rom_id: rom.id,
-        }).unwrap();
-        MatchRecord::insert(&conn, &NewMatch {
-            dat_id: dat.id, file_id: file.id, status: MatchStatus::Name, set_id: set.id, rom_id: rom.id,
-        }).unwrap();
-
-        let hash_matches = MatchRecord::find_by_status_for_file(&conn, &file.id, &MatchStatus::Hash).unwrap();
-        assert_eq!(hash_matches.len(), 1);
-
-        let name_matches = MatchRecord::find_by_status_for_file(&conn, &file.id, &MatchStatus::Name).unwrap();
-        assert_eq!(name_matches.len(), 1);
-    }
-
-    #[test]
     fn delete_matches_by_file() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
@@ -1594,6 +1572,31 @@ mod tests {
 
         let deleted = MatchRecord::delete_by_dat(&conn, &dat.id).unwrap();
         assert_eq!(deleted, 1);
+    }
+
+    #[test]
+    fn find_matches_by_status_for_dat() {
+        let conn = mem_db();
+        let (dat, set) = insert_dat_and_set(&conn);
+        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc");
+        let dir = insert_dir(&conn, &dat, "/roms");
+        let file = insert_file(&conn, &dat, &dir, "game.zip");
+
+        MatchRecord::insert(&conn, &NewMatch {
+            dat_id: dat.id, file_id: file.id, status: MatchStatus::Hash, set_id: set.id, rom_id: rom.id,
+        }).unwrap();
+        MatchRecord::insert(&conn, &NewMatch {
+            dat_id: dat.id, file_id: file.id, status: MatchStatus::Name, set_id: set.id, rom_id: rom.id,
+        }).unwrap();
+
+        let hash_matches = MatchRecord::find_by_status_for_dat(&conn, &dat.id, &MatchStatus::Hash).unwrap();
+        assert_eq!(hash_matches.len(), 1);
+
+        let name_matches = MatchRecord::find_by_status_for_dat(&conn, &dat.id, &MatchStatus::Name).unwrap();
+        assert_eq!(name_matches.len(), 1);
+
+        let match_matches = MatchRecord::find_by_status_for_dat(&conn, &dat.id, &MatchStatus::Match).unwrap();
+        assert_eq!(match_matches.len(), 0);
     }
 
     // --- StoredU64 round-trip ---
