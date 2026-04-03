@@ -1113,6 +1113,7 @@ fn scan_directory(
                     .collect::<Vec<_>>()
             },
             || {
+                let rom_crcs = options.rom_crcs;
                 zips_to_hash
                     .par_iter()
                     .filter_map(|path| {
@@ -1124,13 +1125,24 @@ fn scan_directory(
                                 return None;
                             }
                         };
-                        match read_zip_entries(&mut zip, exclude) {
-                            Ok(entries) => Some((path, zip, entries)),
+                        let mut entries = match read_zip_entries(&mut zip, exclude) {
+                            Ok(e) => e,
                             Err(e) => {
                                 eprintln!("Failed to scan {}. Error: {e}", path);
-                                None
+                                return None;
+                            }
+                        };
+                        for entry in &mut entries {
+                            if rom_crcs.is_empty() || rom_crcs.contains(&entry.crc) {
+                                match util::calc_hash(&mut zip.by_index(entry.index).ok()?) {
+                                    Ok((hash, _)) => entry.hash = Some(hash),
+                                    Err(e) => {
+                                        eprintln!("Failed to hash {} in {}. Error: {e}", entry.name, path);
+                                    }
+                                }
                             }
                         }
+                        Some((path, entries))
                     })
                     .collect::<Vec<_>>()
             },
@@ -1155,18 +1167,13 @@ fn scan_directory(
     }
 
     // Insert hashed zip entries, each zip in its own savepoint
-    for (path, mut zip, entries) in hashed_zips {
+    for (path, entries) in hashed_zips {
         match db::with_savepoint(tx, |sp| {
             let ctx = DatContext::new(sp, dat_id);
             let zip_dir = db::DirRecord::insert(ctx.conn, db::NewDir::new(dat_id, path.as_str()))?;
             let matched = match_sets(&ctx, path)?;
             for entry in &entries {
-                let hash = if options.rom_crcs.is_empty() || options.rom_crcs.contains(&entry.crc) {
-                    Some(util::calc_hash(&mut zip.by_index(entry.index)?)?.0)
-                } else {
-                    None
-                };
-                insert_files_and_matches(&ctx, &zip_dir.id, &entry.name, entry.size, hash.as_deref(), &matched)?;
+                insert_files_and_matches(&ctx, &zip_dir.id, &entry.name, entry.size, entry.hash.as_deref(), &matched)?;
             }
             Ok(entries.len() as u64)
         }) {
@@ -1224,6 +1231,7 @@ struct ZipEntryMeta {
     name: String,
     size: u64,
     crc: String,
+    hash: Option<String>,
 }
 
 /// Read zip entry metadata without hashing file contents.
@@ -1242,6 +1250,7 @@ fn read_zip_entries(zip: &mut zip::ZipArchive<File>, exclude: &[String]) -> Resu
             name: inner_file.name().to_string(),
             size: inner_file.size(),
             crc: format!("{:08x}", inner_file.crc32()),
+            hash: None,
         });
     }
     Ok(entries)
