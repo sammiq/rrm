@@ -733,21 +733,24 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     for directory in db::DirRecord::get_by_dat(conn, old_dat_id)? {
         if util::is_zip_file(&directory.path) {
             let matched_sets = match_sets(&new_context, &directory.path)?;
-            let zip_entries: BTreeMap<_, _> = read_zip_entries(Utf8Path::new(&directory.path), &[])?
+            let zip_file = File::open(&directory.path)?;
+            let mut zip = zip::ZipArchive::new(zip_file)
+                .with_context(|| format!("could not open '{}' as a zip file", directory.path))?;
+            let zip_entries: BTreeMap<_, _> = read_zip_entries(&mut zip, &[])?
                 .into_iter()
                 .map(|entry| (entry.name.clone(), entry))
                 .collect();
             for file in directory.get_files(conn)? {
                 // Zip entries may have been left unhashed during the original scan,
                 // so recover the hash only when the new DAT makes it relevant.
-                let file = ensure_hash_for_update(conn, &directory.path, &zip_entries, &file, &new_rom_crcs)?;
-                insert_matches(&new_context, &file, &matched_sets)?;
+                let file = ensure_hash_for_update(conn, &mut zip, &directory.path, &zip_entries, &file, &new_rom_crcs)?;
+                match_roms_and_insert(&new_context, &file, &matched_sets)?;
             }
         } else {
             let matched_sets = BTreeSet::new();
             for file in directory.get_files(conn)? {
                 // Loose files are always hashed during scan, so no recovery path is needed.
-                insert_matches(&new_context, &file, &matched_sets)?;
+                match_roms_and_insert(&new_context, &file, &matched_sets)?;
             }
         }
     }
@@ -766,6 +769,7 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
 
 fn ensure_hash_for_update(
     conn: &Connection,
+    zip: &mut zip::ZipArchive<File>,
     zip_path: &str,
     zip_entries: &BTreeMap<String, ZipEntryMeta>,
     file: &db::FileRecord,
@@ -784,7 +788,7 @@ fn ensure_hash_for_update(
         return Ok(file.clone());
     }
 
-    let hash = hash_zip_entry(Utf8Path::new(zip_path), entry.index)?.0;
+    let hash = util::calc_hash(&mut zip.by_index(entry.index)?)?.0;
     file.update_hash(conn, &hash)
 }
 
@@ -1056,14 +1060,15 @@ fn scan_directory(
             continue;
         }
 
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             if !options.recursive {
                 continue;
             }
             subdirs_by_path.remove(path.as_str());
             let subdir_count = scan_directory(tx, dat_id, path, options, &|count| progress_fn(file_count + count))?;
             file_count += subdir_count;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if util::has_extension(path, options.exclude) {
                 continue;
             }
@@ -1108,14 +1113,47 @@ fn scan_directory(
                     .collect::<Vec<_>>()
             },
             || {
+                let rom_crcs = options.rom_crcs;
                 zips_to_hash
                     .par_iter()
-                    .filter_map(|path| match read_zip_entries(path, exclude) {
-                        Ok(entries) => Some((path, entries)),
-                        Err(e) => {
-                            eprintln!("Failed to scan {}. Error: {e}", path);
-                            None
+                    .filter_map(|path| {
+                        let file = match File::open(path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("Failed to open {}. Error: {e}", path);
+                                return None;
+                            }
+                        };
+                        let mut zip = match zip::ZipArchive::new(file) {
+                            Ok(z) => z,
+                            Err(e) => {
+                                eprintln!("Failed to scan {}. Error: {e}", path);
+                                return None;
+                            }
+                        };
+                        let mut entries = match read_zip_entries(&mut zip, exclude) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                eprintln!("Failed to scan {}. Error: {e}", path);
+                                return None;
+                            }
+                        };
+                        for entry in &mut entries {
+                            if rom_crcs.is_empty() || rom_crcs.contains(&entry.crc) {
+                                match zip.by_index(entry.index) {
+                                    Ok(mut inner) => match util::calc_hash(&mut inner) {
+                                        Ok((hash, _)) => entry.hash = Some(hash),
+                                        Err(e) => {
+                                            eprintln!("Failed to hash {} in {}. Error: {e}", entry.name, path);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("Failed to read entry {} in {}. Error: {e}", entry.index, path);
+                                    }
+                                }
+                            }
                         }
+                        Some((path, entries))
                     })
                     .collect::<Vec<_>>()
             },
@@ -1140,18 +1178,13 @@ fn scan_directory(
     }
 
     // Insert hashed zip entries, each zip in its own savepoint
-    for (path, entries) in &hashed_zips {
+    for (path, entries) in hashed_zips {
         match db::with_savepoint(tx, |sp| {
             let ctx = DatContext::new(sp, dat_id);
             let zip_dir = db::DirRecord::insert(ctx.conn, db::NewDir::new(dat_id, path.as_str()))?;
             let matched = match_sets(&ctx, path)?;
-            for entry in entries {
-                let hash = if options.rom_crcs.is_empty() || options.rom_crcs.contains(&entry.crc) {
-                    Some(hash_zip_entry(path, entry.index)?.0)
-                } else {
-                    None
-                };
-                insert_files_and_matches(&ctx, &zip_dir.id, &entry.name, entry.size, hash.as_deref(), &matched)?;
+            for entry in &entries {
+                insert_files_and_matches(&ctx, &zip_dir.id, &entry.name, entry.size, entry.hash.as_deref(), &matched)?;
             }
             Ok(entries.len() as u64)
         }) {
@@ -1209,12 +1242,11 @@ struct ZipEntryMeta {
     name: String,
     size: u64,
     crc: String,
+    hash: Option<String>,
 }
 
 /// Read zip entry metadata without hashing file contents.
-fn read_zip_entries(path: &Utf8Path, exclude: &[String]) -> Result<Vec<ZipEntryMeta>> {
-    let file = File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file).with_context(|| format!("could not open '{}' as a zip file", path))?;
+fn read_zip_entries(zip: &mut zip::ZipArchive<File>, exclude: &[String]) -> Result<Vec<ZipEntryMeta>> {
     let mut entries = Vec::new();
     for i in 0..zip.len() {
         let inner_file = zip.by_index(i)?;
@@ -1229,16 +1261,10 @@ fn read_zip_entries(path: &Utf8Path, exclude: &[String]) -> Result<Vec<ZipEntryM
             name: inner_file.name().to_string(),
             size: inner_file.size(),
             crc: format!("{:08x}", inner_file.crc32()),
+            hash: None,
         });
     }
     Ok(entries)
-}
-
-fn hash_zip_entry(path: &Utf8Path, index: usize) -> Result<(String, u64)> {
-    let file = File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file).with_context(|| format!("could not open '{}' as a zip file", path))?;
-    let mut inner_file = zip.by_index(index)?;
-    util::calc_hash(&mut inner_file)
 }
 
 fn match_sets<P: AsRef<Utf8Path>>(ctx: &DatContext<'_>, path: P) -> Result<BTreeSet<db::SetId>> {
@@ -1345,22 +1371,18 @@ fn insert_files_and_matches(
     hash: Option<&str>,
     matched_sets: &BTreeSet<db::SetId>,
 ) -> Result<()> {
-    ensure!(
-        matched_sets.is_empty() || hash.is_some(),
-        "cannot match '{file_name}' against candidate sets without a hash"
-    );
     let file = db::FileRecord::insert(
         ctx.conn,
         db::NewFile::new(ctx.dat_id, *dir_id, file_name, file_size, hash.unwrap_or("")),
     )?;
 
     if hash.is_some() {
-        insert_matches(ctx, &file, matched_sets)?;
+        match_roms_and_insert(ctx, &file, matched_sets)?;
     }
     Ok(())
 }
 
-fn insert_matches(
+fn match_roms_and_insert(
     ctx: &DatContext<'_>,
     file: &db::FileRecord,
     matched_sets: &BTreeSet<db::Id<db::SetRecord>>,
@@ -1873,7 +1895,11 @@ mod tests {
             let mut cursor = std::io::Cursor::new(content);
             util::calc_hash(&mut cursor).unwrap().0
         };
-        let crc = read_zip_entries(&zip_path, &[]).unwrap()[0].crc.clone();
+        let crc = {
+            let file = File::open(&zip_path).unwrap();
+            let mut zip = zip::ZipArchive::new(file).unwrap();
+            read_zip_entries(&mut zip, &[]).unwrap()[0].crc.clone()
+        };
 
         let old_dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
         let dir = db::DirRecord::insert(&conn, db::NewDir::new(old_dat.id, zip_path.as_str())).unwrap();
@@ -1965,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_files_and_matches_rejects_missing_hash_when_sets_are_pre_matched() {
+    fn insert_files_and_matches_skips_matching_when_hash_missing() {
         let conn = db::tests::mem_db();
         let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
         let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "Matched Set")).unwrap();
@@ -1973,14 +1999,12 @@ mod tests {
         let ctx = DatContext::new(&conn, dat.id);
         let matched_sets = BTreeSet::from([set.id]);
 
-        let err = insert_files_and_matches(&ctx, &dir.id, "candidate.rom", 123, None, &matched_sets).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot match 'candidate.rom' against candidate sets without a hash")
-        );
+        insert_files_and_matches(&ctx, &dir.id, "candidate.rom", 123, None, &matched_sets).unwrap();
 
         let files = dir.get_files(&conn).unwrap();
-        assert!(files.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "candidate.rom");
+        assert_eq!(files[0].hash, "");
     }
 
     // --- match_exact ---
@@ -2217,11 +2241,16 @@ mod tests {
         tmp
     }
 
+    fn open_test_zip(tmp: &tempfile::NamedTempFile) -> zip::ZipArchive<File> {
+        let file = File::open(tmp.path()).unwrap();
+        zip::ZipArchive::new(file).unwrap()
+    }
+
     #[test]
     fn read_zip_entries_returns_all_files() {
-        let zip = create_test_zip(&[("a.rom", b"hello"), ("b.rom", b"world")]);
-        let path = Utf8Path::from_path(zip.path()).unwrap();
-        let entries = read_zip_entries(path, &[]).unwrap();
+        let tmp = create_test_zip(&[("a.rom", b"hello"), ("b.rom", b"world")]);
+        let mut zip = open_test_zip(&tmp);
+        let entries = read_zip_entries(&mut zip, &[]).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "a.rom");
         assert_eq!(entries[1].name, "b.rom");
@@ -2231,10 +2260,10 @@ mod tests {
 
     #[test]
     fn read_zip_entries_excludes_extensions() {
-        let zip = create_test_zip(&[("a.rom", b"data"), ("readme.txt", b"info")]);
-        let path = Utf8Path::from_path(zip.path()).unwrap();
+        let tmp = create_test_zip(&[("a.rom", b"data"), ("readme.txt", b"info")]);
+        let mut zip = open_test_zip(&tmp);
         let exclude = vec!["txt".to_string()];
-        let entries = read_zip_entries(path, &exclude).unwrap();
+        let entries = read_zip_entries(&mut zip, &exclude).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "a.rom");
     }
@@ -2242,21 +2271,21 @@ mod tests {
     #[test]
     fn read_zip_entries_produces_consistent_crc_and_size() {
         let content = b"deterministic content";
-        let zip1 = create_test_zip(&[("file.rom", content)]);
-        let zip2 = create_test_zip(&[("file.rom", content)]);
-        let path1 = Utf8Path::from_path(zip1.path()).unwrap();
-        let path2 = Utf8Path::from_path(zip2.path()).unwrap();
-        let entries1 = read_zip_entries(path1, &[]).unwrap();
-        let entries2 = read_zip_entries(path2, &[]).unwrap();
+        let tmp1 = create_test_zip(&[("file.rom", content)]);
+        let tmp2 = create_test_zip(&[("file.rom", content)]);
+        let mut zip1 = open_test_zip(&tmp1);
+        let mut zip2 = open_test_zip(&tmp2);
+        let entries1 = read_zip_entries(&mut zip1, &[]).unwrap();
+        let entries2 = read_zip_entries(&mut zip2, &[]).unwrap();
         assert_eq!(entries1[0].crc, entries2[0].crc);
         assert_eq!(entries1[0].size, entries2[0].size);
     }
 
     #[test]
     fn read_zip_entries_empty_zip() {
-        let zip = create_test_zip(&[]);
-        let path = Utf8Path::from_path(zip.path()).unwrap();
-        let entries = read_zip_entries(path, &[]).unwrap();
+        let tmp = create_test_zip(&[]);
+        let mut zip = open_test_zip(&tmp);
+        let entries = read_zip_entries(&mut zip, &[]).unwrap();
         assert!(entries.is_empty());
     }
 }
