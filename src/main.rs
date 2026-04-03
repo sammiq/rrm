@@ -733,10 +733,14 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     for directory in db::DirRecord::get_by_dat(conn, old_dat_id)? {
         if util::is_zip_file(&directory.path) {
             let matched_sets = match_sets(&new_context, &directory.path)?;
+            let zip_entries: BTreeMap<_, _> = read_zip_entries(Utf8Path::new(&directory.path), &[])?
+                .into_iter()
+                .map(|entry| (entry.name.clone(), entry))
+                .collect();
             for file in directory.get_files(conn)? {
                 // Zip entries may have been left unhashed during the original scan,
                 // so recover the hash only when the new DAT makes it relevant.
-                let file = ensure_hash_for_update(conn, &directory.path, &file, &matched_sets, &new_rom_crcs)?;
+                let file = ensure_hash_for_update(conn, &directory.path, &zip_entries, &file, &new_rom_crcs)?;
                 insert_matches(&new_context, &file, &matched_sets)?;
             }
         } else {
@@ -763,20 +767,19 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
 fn ensure_hash_for_update(
     conn: &Connection,
     zip_path: &str,
+    zip_entries: &BTreeMap<String, ZipEntryMeta>,
     file: &db::FileRecord,
-    matched_sets: &BTreeSet<db::SetId>,
     rom_crcs: &BTreeSet<String>,
 ) -> Result<db::FileRecord> {
     if !file.hash.is_empty() {
         return Ok(file.clone());
     }
 
-    let entry = read_zip_entries(Utf8Path::new(zip_path), &[])?
-        .into_iter()
-        .find(|entry| entry.name == file.name)
+    let entry = zip_entries
+        .get(&file.name)
         .with_context(|| format!("zip entry '{}' missing from '{}'", file.name, zip_path))?;
 
-    let should_hash = !matched_sets.is_empty() || rom_crcs.is_empty() || rom_crcs.contains(&entry.crc);
+    let should_hash = rom_crcs.is_empty() || rom_crcs.contains(&entry.crc);
     if !should_hash {
         return Ok(file.clone());
     }
