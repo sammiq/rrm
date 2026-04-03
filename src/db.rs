@@ -1006,6 +1006,25 @@ impl FileRecord {
         })
     }
 
+    pub fn update_hash(&self, conn: &Connection, hash: &str) -> Result<Self> {
+        let sql = format!("UPDATE {} SET hash = :hash WHERE id = :id", Self::table_name());
+        conn.execute(
+            &sql,
+            named_params! {
+                ":id": self.id,
+                ":hash": hash,
+            },
+        )?;
+        Ok(Self {
+            id: self.id,
+            dat_id: self.dat_id,
+            dir_id: self.dir_id,
+            name: self.name.clone(),
+            size: self.size,
+            hash: hash.to_string(),
+        })
+    }
+
     pub fn delete_matches(&self, conn: &Connection) -> Result<usize> {
         MatchRecord::delete_by_file_id(conn, self.id)
     }
@@ -1609,6 +1628,21 @@ pub(crate) mod tests {
         let deleted = dir.delete_files(&conn).unwrap();
         assert_eq!(deleted, 2);
         assert_eq!(dir.get_files(&conn).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn update_file_hash() {
+        let conn = mem_db();
+        let (dat, _) = insert_dat_and_set(&conn);
+        let dir = insert_dir(&conn, &dat, "/roms");
+        let file = insert_file(&conn, &dat, &dir, "game.zip");
+
+        let updated = file.update_hash(&conn, "newhash").unwrap();
+        assert_eq!(updated.hash, "newhash");
+        assert_eq!(updated.id, file.id);
+
+        let fetched = FileRecord::get_by_id(&conn, file.id).unwrap();
+        assert_eq!(fetched.hash, "newhash");
     }
 
     #[test]

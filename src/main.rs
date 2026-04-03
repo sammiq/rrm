@@ -513,7 +513,7 @@ fn handle_file_commands(
                 .num_threads(*parallel)
                 .build()
                 .context("Failed to create thread pool")?;
-            let rom_crcs = BTreeSet::new();
+            let rom_crcs = db::RomRecord::get_crcs_by_dat(conn, dat_id)?;
 
             let options = ScanOptions {
                 exclude,
@@ -723,6 +723,7 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
 
 fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) -> Result<db::DatRecord> {
     let imported = import_dat(conn, dat_file)?;
+    let new_rom_crcs = db::RomRecord::get_crcs_by_dat(conn, imported.id)?;
 
     //delete all existing matches for the old dat, we'll re-match them as we relink directories and files to the new dat
     db::MatchRecord::delete_by_dat(conn, old_dat_id)?;
@@ -730,16 +731,20 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     let new_context = DatContext::new(conn, imported.id);
 
     for directory in db::DirRecord::get_by_dat(conn, old_dat_id)? {
-        //check if its a zip file, if so, restrict matches to set name if matched
-        let matched_sets = if util::is_zip_file(&directory.path) {
-            match_sets(&new_context, &directory.path)?
+        if util::is_zip_file(&directory.path) {
+            let matched_sets = match_sets(&new_context, &directory.path)?;
+            for file in directory.get_files(conn)? {
+                // Zip entries may have been left unhashed during the original scan,
+                // so recover the hash only when the new DAT makes it relevant.
+                let file = ensure_hash_for_update(conn, &directory.path, &file, &matched_sets, &new_rom_crcs)?;
+                insert_matches(&new_context, &file, &matched_sets)?;
+            }
         } else {
-            BTreeSet::new()
-        };
-
-        for file in directory.get_files(conn)? {
-            //rematch using existing information, but link to the new dat
-            insert_matches(&new_context, &file, &matched_sets)?;
+            let matched_sets = BTreeSet::new();
+            for file in directory.get_files(conn)? {
+                // Loose files are always hashed during scan, so no recovery path is needed.
+                insert_matches(&new_context, &file, &matched_sets)?;
+            }
         }
     }
 
@@ -753,6 +758,31 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     delete_dat(conn, old_dat_id)?;
 
     Ok(imported)
+}
+
+fn ensure_hash_for_update(
+    conn: &Connection,
+    zip_path: &str,
+    file: &db::FileRecord,
+    matched_sets: &BTreeSet<db::SetId>,
+    rom_crcs: &BTreeSet<String>,
+) -> Result<db::FileRecord> {
+    if !file.hash.is_empty() {
+        return Ok(file.clone());
+    }
+
+    let entry = read_zip_entries(Utf8Path::new(zip_path), &[])?
+        .into_iter()
+        .find(|entry| entry.name == file.name)
+        .with_context(|| format!("zip entry '{}' missing from '{}'", file.name, zip_path))?;
+
+    let should_hash = !matched_sets.is_empty() || rom_crcs.is_empty() || rom_crcs.contains(&entry.crc);
+    if !should_hash {
+        return Ok(file.clone());
+    }
+
+    let hash = hash_zip_entry(Utf8Path::new(zip_path), entry.index)?.0;
+    file.update_hash(conn, &hash)
 }
 
 fn strip_doctype(s: &mut String) {
@@ -963,15 +993,6 @@ fn scan_files(
     scan_path: &Utf8Path, //expect this to be canonicalized
     options: &ScanOptions<'_>,
 ) -> Result<()> {
-    let rom_crcs = db::RomRecord::get_crcs_by_dat(tx, dat_id)?;
-    let options = ScanOptions {
-        exclude: options.exclude,
-        rom_crcs: &rom_crcs,
-        recursive: options.recursive,
-        full_scan: options.full_scan,
-        pool: options.pool,
-    };
-
     if options.full_scan {
         //delete all records associated with the files
         db::MatchRecord::delete_by_dat(tx, dat_id)?;
@@ -979,7 +1000,7 @@ fn scan_files(
         db::DirRecord::delete_by_dat(tx, dat_id)?;
     }
 
-    let file_count = scan_directory(tx, dat_id, scan_path, &options, &|count| {
+    let file_count = scan_directory(tx, dat_id, scan_path, options, &|count| {
         report_progress(term, count);
     })?;
 
@@ -1649,6 +1670,7 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn stripped(input: &str) -> String {
         let mut s = input.to_string();
@@ -1781,6 +1803,109 @@ mod tests {
     #[test]
     fn normalize_crc_rejects_invalid_hex() {
         assert!(normalize_crc("not-hex").is_err());
+    }
+
+    #[test]
+    fn update_dat_hashes_hashless_zip_entries_when_set_name_narrows_matches() {
+        let conn = db::tests::mem_db();
+        let temp = tempdir().unwrap();
+        let zip_path = Utf8PathBuf::from_path_buf(temp.path().join("archive.zip")).unwrap();
+        let dat_path = Utf8PathBuf::from_path_buf(temp.path().join("new.dat")).unwrap();
+        let content = b"hello world";
+        let expected_hash = {
+            let mut cursor = std::io::Cursor::new(content);
+            util::calc_hash(&mut cursor).unwrap().0
+        };
+
+        {
+            let zip = create_test_zip(&[("game.rom", content)]);
+            std::fs::copy(zip.path(), zip_path.as_std_path()).unwrap();
+        }
+
+        let old_dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
+        let dir = db::DirRecord::insert(&conn, db::NewDir::new(old_dat.id, zip_path.as_str())).unwrap();
+        db::FileRecord::insert(&conn, db::NewFile::new(old_dat.id, dir.id, "game.rom", content.len() as u64, ""))
+            .unwrap();
+
+        std::fs::write(
+            dat_path.as_std_path(),
+            r#"<datafile>
+                <header>
+                    <name>Updated DAT</name>
+                    <description>A test dat</description>
+                    <version>1.0</version>
+                    <author>tester</author>
+                </header>
+                <game name="archive">
+                    <rom name="game.rom" size="11" sha1="2aae6c35c94fcfb415dbe95f408b9ce91ee846ed" />
+                </game>
+            </datafile>"#,
+        )
+        .unwrap();
+
+        let imported = update_dat(&conn, &dat_path, old_dat.id).unwrap();
+        let files = db::FileRecord::get_by_dat(&conn, imported.id).unwrap();
+        let matches = db::MatchRecord::get_by_dat(&conn, imported.id).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hash, expected_hash);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, db::MatchStatus::Match);
+    }
+
+    #[test]
+    fn update_dat_hashes_hashless_zip_entries_when_new_dat_crc_matches() {
+        let conn = db::tests::mem_db();
+        let temp = tempdir().unwrap();
+        let zip_path = Utf8PathBuf::from_path_buf(temp.path().join("bundle.zip")).unwrap();
+        let dat_path = Utf8PathBuf::from_path_buf(temp.path().join("new.dat")).unwrap();
+        let content = b"hash me from crc";
+
+        {
+            let zip = create_test_zip(&[("game.rom", content)]);
+            std::fs::copy(zip.path(), zip_path.as_std_path()).unwrap();
+        }
+
+        let expected_hash = {
+            let mut cursor = std::io::Cursor::new(content);
+            util::calc_hash(&mut cursor).unwrap().0
+        };
+        let crc = read_zip_entries(&zip_path, &[]).unwrap()[0].crc.clone();
+
+        let old_dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
+        let dir = db::DirRecord::insert(&conn, db::NewDir::new(old_dat.id, zip_path.as_str())).unwrap();
+        db::FileRecord::insert(&conn, db::NewFile::new(old_dat.id, dir.id, "game.rom", content.len() as u64, ""))
+            .unwrap();
+
+        std::fs::write(
+            dat_path.as_std_path(),
+            format!(
+                r#"<datafile>
+                    <header>
+                        <name>Updated DAT</name>
+                        <description>A test dat</description>
+                        <version>1.0</version>
+                        <author>tester</author>
+                    </header>
+                    <game name="Different Set">
+                        <rom name="different-name.rom" size="{size}" sha1="{sha1}" crc="{crc}" />
+                    </game>
+                </datafile>"#,
+                size = content.len(),
+                sha1 = expected_hash,
+                crc = crc,
+            ),
+        )
+        .unwrap();
+
+        let imported = update_dat(&conn, &dat_path, old_dat.id).unwrap();
+        let files = db::FileRecord::get_by_dat(&conn, imported.id).unwrap();
+        let matches = db::MatchRecord::get_by_dat(&conn, imported.id).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hash, expected_hash);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, db::MatchStatus::Hash);
     }
 
     // --- helpers ---
