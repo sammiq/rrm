@@ -217,15 +217,15 @@ fn handle_data_commands(
         DataCommands::Select { index } => select_dat(conn, dat_id, *index),
         DataCommands::Records => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_dat_records(&DatContext::new(conn, *dat_id))
+            list_dat_records(conn, *dat_id)
         }
         DataCommands::Sets { partial_name } => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_sets(&DatContext::new(conn, *dat_id), partial_name.as_deref())
+            list_sets(conn, *dat_id, partial_name.as_deref())
         }
         DataCommands::Roms { partial_name } => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_roms(&DatContext::new(conn, *dat_id), partial_name.as_deref())
+            list_roms(conn, *dat_id, partial_name.as_deref())
         }
     }
 }
@@ -567,28 +567,28 @@ fn ensure_hash_for_update(
     file.update_hash(conn, &hash)
 }
 
-fn list_dat_records(ctx: &DatContext<'_>) -> Result<()> {
-    let dat_record = db::DatRecord::get_by_id(ctx.conn, ctx.dat_id)?;
+fn list_dat_records(conn: &Connection, dat_id: db::DatId) -> Result<()> {
+    let dat_record = db::DatRecord::get_by_id(conn, dat_id)?;
     println!("Name:        {}", dat_record.name);
     println!("Description: {}", dat_record.description);
     println!("Version:     {}", dat_record.version);
     println!("Author:      {}", dat_record.author);
 
     println!("--- SETS ---");
-    for set in db::SetRecord::get_by_dat(ctx.conn, ctx.dat_id)? {
+    for set in db::SetRecord::get_by_dat(conn, dat_id)? {
         println!("{}", set.name);
-        for rom in set.get_roms(ctx.conn)? {
+        for rom in set.get_roms(conn)? {
             println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
         }
     }
     Ok(())
 }
 
-fn list_sets(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
+fn list_sets(conn: &Connection, dat_id: db::DatId, name: Option<&str>) -> Result<()> {
     let sets = if let Some(name) = name {
-        db::SetRecord::find_by_name(ctx.conn, ctx.dat_id, name, false)
+        db::SetRecord::find_by_name(conn, dat_id, name, false)
     } else {
-        db::SetRecord::get_by_dat(ctx.conn, ctx.dat_id)
+        db::SetRecord::get_by_dat(conn, dat_id)
     }?;
     if sets.is_empty() {
         println!("No sets found.");
@@ -600,11 +600,11 @@ fn list_sets(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn list_roms(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
+fn list_roms(conn: &Connection, dat_id: db::DatId, name: Option<&str>) -> Result<()> {
     let roms = if let Some(name) = name {
-        db::RomRecord::find_by_name(ctx.conn, ctx.dat_id, name, false)
+        db::RomRecord::find_by_name(conn, dat_id, name, false)
     } else {
-        db::RomRecord::get_by_dat(ctx.conn, ctx.dat_id)
+        db::RomRecord::get_by_dat(conn, dat_id)
     }?;
     if roms.is_empty() {
         println!("No roms found.");
@@ -613,7 +613,7 @@ fn list_roms(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
         roms.iter()
             .for_each(|rom| roms_by_set.entry(&rom.set_id).or_default().push(rom));
 
-        let all_sets = db::SetRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
+        let all_sets = db::SetRecord::get_by_dat(conn, dat_id)?;
         let sets_by_id: BTreeMap<_, _> = all_sets.iter().map(|s| (&s.id, s)).collect();
 
         for (set_id, roms) in roms_by_set {
