@@ -1117,7 +1117,7 @@ fn scan_directory(
                 zips_to_hash
                     .par_iter()
                     .filter_map(|path| {
-                        let file = File::open(path).map_err(|e| anyhow::Error::from(e)).ok()?;
+                        let file = File::open(path).map_err(anyhow::Error::from).ok()?;
                         let mut zip = match zip::ZipArchive::new(file) {
                             Ok(z) => z,
                             Err(e) => {
