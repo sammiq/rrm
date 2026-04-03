@@ -1060,14 +1060,15 @@ fn scan_directory(
             continue;
         }
 
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             if !options.recursive {
                 continue;
             }
             subdirs_by_path.remove(path.as_str());
             let subdir_count = scan_directory(tx, dat_id, path, options, &|count| progress_fn(file_count + count))?;
             file_count += subdir_count;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if util::has_extension(path, options.exclude) {
                 continue;
             }
