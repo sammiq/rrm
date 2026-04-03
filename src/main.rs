@@ -2,7 +2,9 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
+mod cli;
 mod completion;
+mod dat;
 mod db;
 mod util;
 
@@ -12,41 +14,21 @@ use std::io::{BufReader, IsTerminal, Write};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser};
 use fallible_iterator::FallibleIterator;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use roxmltree::Document;
 use rusqlite::{Connection, Transaction};
-use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::Validator;
-use rustyline::{Config, Editor, Helper};
+use rustyline::{Config, Editor};
 
-use crate::completion::{TreeNode, build_completions, complete};
+use crate::cli::{Args, Cli, Commands, CompletionHelper, DataCommands, FileCommands, SelectMode, TermInfo};
+use crate::completion::build_completions;
 use crate::db::{Deletable, DeletableByDat, FindableByName, Insertable, Queryable, QueryableByDat};
 use crate::util::{OptionIf, ResultIf};
 
 const APP_NAME: &str = "rrm";
 const ANSI_CURSOR_START: &str = "\x1B[1000D";
 const ANSI_ERASE_TO_END: &str = "\x1B[K";
-
-// constants for XML dat file
-const TAG_HEADER: &str = "header";
-const ATTR_HEADER_NAME: &str = "name";
-const ATTR_HEADER_DESC: &str = "description";
-const ATTR_HEADER_VERSION: &str = "version";
-const ATTR_HEADER_AUTHOR: &str = "author";
-
-const TAG_GAME: &str = "game";
-const ATTR_GAME_NAME: &str = "name";
-
-const TAG_ROM: &str = "rom";
-const ATTR_ROM_NAME: &str = "name";
-const ATTR_ROM_SIZE: &str = "size";
-const ATTR_ROM_HASH: &str = "sha1";
-const ATTR_ROM_CRC: &str = "crc";
 
 macro_rules! println_if {
     ($cond:expr, $($arg:tt)*) => {
@@ -55,213 +37,6 @@ macro_rules! println_if {
         }
     };
 }
-
-#[derive(Debug, Parser)]
-#[clap(version, about, long_about = None)]
-struct Args {
-    /// select the dat file to use
-    #[arg(short, long)]
-    select: Option<usize>,
-
-    /// command to execute, if none given will enter interactive mode
-    #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// force enter interactive mode, if command is given
-    #[arg(short, long)]
-    interactive: bool,
-}
-
-#[derive(Debug, Parser)]
-#[command(multicall = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Debug, Subcommand)]
-enum Commands {
-    /// execute commands on dat file
-    Data {
-        #[command(subcommand)]
-        data: DataCommands,
-    },
-    /// execute commands on files
-    Files {
-        #[command(subcommand)]
-        files: FileCommands,
-    },
-    /// Alias for `data select`
-    Select {
-        /// the index of the dat file to select, as seen in list
-        index: usize,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SelectMode {
-    /// select all files
-    All,
-    /// select only matched files
-    Matched,
-    /// select only misnamed or bad dumps
-    Warning,
-    /// select only unmatched files
-    Unmatched,
-}
-
-#[derive(Debug, Subcommand)]
-enum FileCommands {
-    /// scan a path and match files with the current dat file
-    Scan {
-        /// extensions to exclude when scanning files
-        #[arg(long, value_delimiter = ',', default_value = "m3u,dat,txt")]
-        exclude: Vec<String>,
-        /// scan recursively each directory found
-        #[arg(short('R'), long)]
-        recursive: bool,
-        /// re-scan existing files in the directory and not just new files
-        #[arg(long)]
-        full: bool,
-        /// number of files to hash in parallel (default: 1)
-        #[arg(short, long, default_value_t = 1)]
-        parallel: usize,
-        /// the path to use for scanning files
-        #[arg(default_value=".", value_hint = clap::ValueHint::DirPath)]
-        path: Utf8PathBuf,
-    },
-    /// list all files scanned and show their status
-    List {
-        /// show only files with this status
-        #[arg(long, value_enum, default_value_t = SelectMode::All)]
-        mode: SelectMode,
-        /// show only files partially matching this name
-        partial_name: Option<String>,
-    },
-    /// alias for `list --mode matched`
-    Matched {
-        /// show only files partially matching this name
-        partial_name: Option<String>,
-    },
-    /// alias for `sets --missing`
-    Missing {
-        /// show only sets partially matching this name
-        partial_name: Option<String>,
-    },
-    /// list all sets matched by scanned files
-    Sets {
-        /// show missing sets instead of matches
-        #[arg(long)]
-        missing: bool,
-        /// show only sets partially matching this name
-        partial_name: Option<String>,
-    },
-    /// Sort files into directory
-    Sort {
-        /// sort only files with this status
-        #[arg(long, value_enum, default_value_t = SelectMode::Unmatched)]
-        mode: SelectMode,
-        /// the base path to use when moving files
-        #[arg(default_value=".", value_hint = clap::ValueHint::DirPath)]
-        path: Utf8PathBuf,
-
-        // whether to keep the moved files in the database
-        #[arg(long)]
-        keep: bool,
-    },
-    //rename files to the correct name (loose files only)
-    Rename,
-    /// alias for `list --mode unmatched`
-    Unmatched {
-        /// show only files partially matching this name
-        partial_name: Option<String>,
-    },
-    /// alias for `list --mode warning`
-    Warning {
-        /// show only files partially matching this name
-        partial_name: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum DataCommands {
-    /// import a dat file into the system and make it the current dat file
-    Import {
-        /// the path and filename of the dat file to import
-        #[arg(value_hint = clap::ValueHint::FilePath)]
-        dat_file: Utf8PathBuf,
-    },
-    /// update the current dat file with a new version and re-match files
-    Update {
-        /// the path and filename of the dat file to import
-        #[arg(value_hint = clap::ValueHint::FilePath)]
-        dat_file: Utf8PathBuf,
-
-        /// don't ask for confirmation, and perform the action
-        #[arg(long)]
-        yes: bool,
-    },
-    /// remove the current dat file and all matched files
-    Remove {
-        /// don't ask for confirmation, and perform the action
-        #[arg(long)]
-        yes: bool,
-
-        /// the index of the dat file to select, as seen in list
-        index: Option<usize>,
-    },
-    /// List dat files in the system
-    List,
-    /// Select the current dat file
-    Select {
-        /// the index of the dat file to select, as seen in list
-        index: usize,
-    },
-    /// Show all Set and Roms in the current dat file
-    Records,
-    /// Search for a Set in the current dat file
-    Sets {
-        /// an optional partial name to match
-        partial_name: Option<String>,
-    },
-    /// Search for a Rom in the current dat file
-    Roms {
-        /// an optional partial name to match
-        partial_name: Option<String>,
-    },
-}
-
-struct TermInfo {
-    tty_in: bool,
-    tty_out: bool,
-    interactive: bool,
-}
-
-struct CompletionHelper<'a> {
-    node: TreeNode<'a>,
-}
-
-impl Completer for CompletionHelper<'_> {
-    type Candidate = String;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let line = &line[..pos];
-        let (trailing, completions) = complete(&self.node, line);
-        let offset = line.len() - trailing;
-        Ok((offset, completions))
-    }
-}
-impl Hinter for CompletionHelper<'_> {
-    type Hint = String;
-}
-impl Highlighter for CompletionHelper<'_> {}
-impl Validator for CompletionHelper<'_> {}
-impl Helper for CompletionHelper<'_> {}
 
 fn main() -> Result<()> {
     let data_path = util::data_dir()
@@ -393,7 +168,7 @@ fn handle_data_commands(
             ensure!(dat_file.is_file(), "`{}` is not a valid file", dat_file);
 
             db::with_transaction(conn, |tx| {
-                import_dat(tx, dat_file).map(|imported| {
+                dat::import_dat(tx, dat_file).map(|imported| {
                     if term.interactive {
                         println!("dat file `{}` imported and selected.", imported.name);
                         *dat_id = Some(imported.id);
@@ -430,7 +205,7 @@ fn handle_data_commands(
 
             if ask_for_confirmation(term, &format!("Are you sure you want to remove {}? (y/N): ", prompt), *yes)? {
                 db::with_transaction(conn, |tx| {
-                    delete_dat(tx, old_dat_id).map(|_| {
+                    dat::delete_dat(tx, old_dat_id).map(|_| {
                         println!("dat file removed.");
                         *dat_id = None;
                     })
@@ -722,7 +497,7 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
 }
 
 fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) -> Result<db::DatRecord> {
-    let imported = import_dat(conn, dat_file)?;
+    let imported = dat::import_dat(conn, dat_file)?;
     let new_rom_crcs = db::RomRecord::get_crcs_by_dat(conn, imported.id)?;
 
     //delete all existing matches for the old dat, we'll re-match them as we relink directories and files to the new dat
@@ -762,7 +537,7 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     db::FileRecord::relink_files(conn, old_dat_id, imported.id)?;
 
     //if we successfully updated everything and relinked and the transaction completed, we can now delete the old dat
-    delete_dat(conn, old_dat_id)?;
+    dat::delete_dat(conn, old_dat_id)?;
 
     Ok(imported)
 }
@@ -790,124 +565,6 @@ fn ensure_hash_for_update(
 
     let hash = util::calc_hash(&mut zip.by_index(entry.index)?)?.0;
     file.update_hash(conn, &hash)
-}
-
-fn strip_doctype(s: &mut String) {
-    let Some(start) = s.find("<!DOCTYPE") else { return };
-    let mut depth = 0usize;
-    let end = s[start..].char_indices().find(|(_, c)| match c {
-        '[' => {
-            depth += 1;
-            false
-        }
-        ']' => {
-            depth = depth.saturating_sub(1);
-            false
-        }
-        '>' if depth == 0 => true,
-        _ => false,
-    });
-    if let Some((len, _)) = end {
-        s.replace_range(start..=start + len, "");
-    }
-}
-
-fn import_dat<P: AsRef<Utf8Path>>(conn: &Connection, file_path: P) -> Result<db::DatRecord> {
-    let mut df_buffer = std::fs::read_to_string(file_path.as_ref()).context("Unable to read reference dat file")?;
-    //so we can turn off dtd-processing, we need to remove any declaration, in most files its unused and is a security issue.
-    strip_doctype(&mut df_buffer);
-    parse_dat(conn, &df_buffer)
-}
-
-fn parse_dat(conn: &Connection, df_buffer: &str) -> Result<db::DatRecord> {
-    let df_xml = Document::parse(df_buffer).context("Unable to parse reference dat file")?;
-    let new_dat = parse_dat_info(&df_xml)?;
-    let dat = db::DatRecord::insert(conn, new_dat)?;
-
-    for game_node in df_xml
-        .root_element()
-        .children()
-        .filter(|node| node.tag_name().name() == TAG_GAME)
-    {
-        let game_name = game_node
-            .attribute(ATTR_GAME_NAME)
-            .context("Unable to read game name in reference dat file")?;
-
-        let set = db::SetRecord::insert(conn, db::NewSet::new(dat.id, game_name))?;
-
-        for rom_node in game_node.descendants().filter(|node| node.tag_name().name() == TAG_ROM) {
-            let rom_name = rom_node.attribute(ATTR_ROM_NAME).context("Unable to read game name")?;
-            let rom_size = rom_node.attribute(ATTR_ROM_SIZE).context("Unable to read game size")?;
-            let rom_hash = rom_node.attribute(ATTR_ROM_HASH).context("Unable to read game hash")?;
-            let rom_crc = rom_node.attribute(ATTR_ROM_CRC).map(normalize_crc).transpose()?;
-            db::RomRecord::insert(
-                conn,
-                db::NewRom::new(
-                    dat.id,
-                    set.id,
-                    rom_name,
-                    rom_size.parse().context("should be a valid number")?,
-                    rom_hash,
-                    rom_crc,
-                ),
-            )?;
-        }
-    }
-    Ok(dat)
-}
-
-fn normalize_crc(raw_crc: &str) -> Result<String> {
-    let crc = raw_crc.trim();
-    let crc = crc.strip_prefix("0x").or_else(|| crc.strip_prefix("0X")).unwrap_or(crc);
-    ensure!(!crc.is_empty(), "crc should not be empty");
-    let parsed = u32::from_str_radix(crc, 16).with_context(|| format!("invalid crc value '{raw_crc}'"))?;
-    Ok(format!("{parsed:08x}"))
-}
-
-fn parse_dat_info(df_xml: &Document<'_>) -> Result<db::NewDat> {
-    let mut name = None;
-    let mut description = None;
-    let mut version = None;
-    let mut author = None;
-    for header_node in df_xml
-        .root_element()
-        .children()
-        .find(|node| node.tag_name().name() == TAG_HEADER)
-        .map(|header| header.children())
-        .context("Could not find header in reference dat file")?
-    {
-        match header_node.tag_name().name() {
-            ATTR_HEADER_NAME => name = header_node.text(),
-            ATTR_HEADER_DESC => description = header_node.text(),
-            ATTR_HEADER_VERSION => version = header_node.text(),
-            ATTR_HEADER_AUTHOR => author = header_node.text(),
-            _ => {}
-        };
-    }
-    let new_dat = db::NewDat::new(
-        name.context("unable to find name attribute in header")?,
-        description.context("unable to find description attribute in header")?,
-        version.context("unable to find version attribute in header")?,
-        author.context("unable to find author attribute in header")?,
-        "sha1",
-    );
-    Ok(new_dat)
-}
-
-fn delete_dat(conn: &Connection, dat_id: db::DatId) -> Result<()> {
-    //remove all scanned files and directories
-    db::MatchRecord::delete_by_dat(conn, dat_id)?;
-    db::FileRecord::delete_by_dat(conn, dat_id)?;
-    db::DirRecord::delete_by_dat(conn, dat_id)?;
-
-    //remove all roms and sets before removing the dat
-    db::RomRecord::delete_by_dat(conn, dat_id)?;
-    db::SetRecord::delete_by_dat(conn, dat_id)?;
-
-    //remove the dat itself
-    db::DatRecord::delete_by_id(conn, dat_id)?;
-
-    Ok(())
 }
 
 fn list_dat_records(ctx: &DatContext<'_>) -> Result<()> {
@@ -1696,139 +1353,6 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    fn stripped(input: &str) -> String {
-        let mut s = input.to_string();
-        strip_doctype(&mut s);
-        s
-    }
-
-    #[test]
-    fn strip_doctype_no_doctype() {
-        let xml = r#"<?xml version="1.0"?><root/>"#;
-        assert_eq!(stripped(xml), xml);
-    }
-
-    #[test]
-    fn strip_doctype_simple() {
-        let xml = r#"<?xml version="1.0"?><!DOCTYPE foo SYSTEM "foo.dtd"><root/>"#;
-        assert_eq!(stripped(xml), r#"<?xml version="1.0"?><root/>"#);
-    }
-
-    #[test]
-    fn strip_doctype_with_internal_subset() {
-        let xml = r#"<!DOCTYPE foo [<!ELEMENT bar (baz)><!ELEMENT baz (#PCDATA)>]><root/>"#;
-        assert_eq!(stripped(xml), "<root/>");
-    }
-
-    #[test]
-    fn strip_doctype_internal_subset_gt_not_confused() {
-        // The > inside the internal subset must not terminate the search early
-        let xml = r#"<!DOCTYPE foo [<!ENTITY gt ">">]><root/>"#;
-        assert_eq!(stripped(xml), "<root/>");
-    }
-
-    // --- parse_dat_info ---
-
-    fn parse_info(xml: &str) -> Result<db::NewDat> {
-        let doc = Document::parse(xml).unwrap();
-        parse_dat_info(&doc)
-    }
-
-    #[test]
-    fn parse_dat_info_valid() {
-        let xml = r#"<datafile>
-            <header>
-                <name>My DAT</name>
-                <description>A test dat</description>
-                <version>1.0</version>
-                <author>tester</author>
-            </header>
-        </datafile>"#;
-        let dat = parse_info(xml).unwrap();
-        assert_eq!(dat.name(), "My DAT");
-        assert_eq!(dat.description(), "A test dat");
-        assert_eq!(dat.version(), "1.0");
-        assert_eq!(dat.author(), "tester");
-        assert_eq!(dat.hash_type(), "sha1");
-    }
-
-    #[test]
-    fn parse_dat_info_missing_header() {
-        let xml = r#"<datafile><name>My DAT</name></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_missing_name() {
-        let xml = r#"<datafile><header>
-            <description>desc</description><version>1.0</version><author>auth</author>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_missing_description() {
-        let xml = r#"<datafile><header>
-            <name>n</name><version>1.0</version><author>auth</author>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_missing_version() {
-        let xml = r#"<datafile><header>
-            <name>n</name><description>d</description><author>auth</author>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_missing_author() {
-        let xml = r#"<datafile><header>
-            <name>n</name><description>d</description><version>1.0</version>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_ignores_unknown_elements() {
-        let xml = r#"<datafile><header>
-            <name>n</name><description>d</description><version>1.0</version>
-            <author>auth</author><unknown>ignored</unknown>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_ok());
-    }
-
-    #[test]
-    fn parse_dat_reads_optional_crc_and_normalizes_it() {
-        let conn = db::tests::mem_db();
-        let xml = r#"<datafile>
-            <header>
-                <name>My DAT</name>
-                <description>A test dat</description>
-                <version>1.0</version>
-                <author>tester</author>
-            </header>
-            <game name="Set One">
-                <rom name="a.rom" size="1" sha1="aaa" crc="0x1A2b3C"/>
-                <rom name="b.rom" size="2" sha1="bbb"/>
-            </game>
-        </datafile>"#;
-
-        let dat = parse_dat(&conn, xml).unwrap();
-        let roms = db::RomRecord::get_by_dat(&conn, dat.id).unwrap();
-        let roms_by_name: BTreeMap<_, _> = roms.iter().map(|rom| (rom.name.as_str(), rom)).collect();
-
-        assert_eq!(roms.len(), 2);
-        assert_eq!(roms_by_name["a.rom"].crc.as_deref(), Some("001a2b3c"));
-        assert_eq!(roms_by_name["b.rom"].crc, None);
-    }
-
-    #[test]
-    fn normalize_crc_rejects_invalid_hex() {
-        assert!(normalize_crc("not-hex").is_err());
-    }
 
     #[test]
     fn update_dat_hashes_hashless_zip_entries_when_set_name_narrows_matches() {
