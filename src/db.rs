@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use camino::Utf8Path;
 
@@ -448,6 +448,7 @@ pub struct RomRecord {
     pub name: String,
     pub size: u64,
     pub hash: String,
+    pub crc: Option<String>,
 }
 
 impl Queryable for RomRecord {
@@ -458,7 +459,7 @@ impl Queryable for RomRecord {
     }
 
     fn fields() -> &'static str {
-        "id, dat_id, set_id, name, size, hash"
+        "id, dat_id, set_id, name, size, hash, crc"
     }
 
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -469,6 +470,7 @@ impl Queryable for RomRecord {
             name: row.get("name")?,
             size: row.get::<_, StoredU64>("size")?.0,
             hash: row.get("hash")?,
+            crc: row.get("crc")?,
         })
     }
 }
@@ -484,16 +486,25 @@ pub struct NewRom {
     name: String,
     size: StoredU64,
     hash: String,
+    crc: Option<String>,
 }
 
 impl NewRom {
-    pub fn new(dat_id: DatId, set_id: SetId, name: impl Into<String>, size: u64, hash: impl Into<String>) -> Self {
+    pub fn new(
+        dat_id: DatId,
+        set_id: SetId,
+        name: impl Into<String>,
+        size: u64,
+        hash: impl Into<String>,
+        crc: Option<String>,
+    ) -> Self {
         Self {
             dat_id,
             set_id,
             name: name.into(),
             size: size.into(),
             hash: hash.into(),
+            crc,
         }
     }
 }
@@ -506,6 +517,7 @@ impl Bindable for NewRom {
             ":name": self.name,
             ":size": self.size,
             ":hash": self.hash,
+            ":crc": self.crc,
         }
         .to_vec()
     }
@@ -580,6 +592,8 @@ impl Insertable for DirRecord {
 
 pub type FileId = Id<FileRecord>;
 
+// FileRecord may have an empty hash if and only if it
+//is contained in a zip file and there are no matches
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileRecord {
     pub id: FileId,
@@ -799,6 +813,15 @@ impl RomRecord {
         Ok(matches)
     }
 
+    pub fn get_crcs_by_dat(conn: &Connection, dat_id: DatId) -> Result<BTreeSet<String>> {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT crc FROM roms WHERE dat_id = ?1 AND crc IS NOT NULL ORDER BY crc")?;
+        let crcs = stmt
+            .query_map([dat_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        Ok(crcs)
+    }
+
     pub fn get_by_sets<I>(conn: &Connection, set_ids: &I) -> Result<HashMap<SetId, Vec<Self>>>
     where
         for<'a> &'a I: IntoIterator<Item = &'a SetId>,
@@ -983,6 +1006,25 @@ impl FileRecord {
         })
     }
 
+    pub fn update_hash(&self, conn: &Connection, hash: &str) -> Result<Self> {
+        let sql = format!("UPDATE {} SET hash = :hash WHERE id = :id", Self::table_name());
+        conn.execute(
+            &sql,
+            named_params! {
+                ":id": self.id,
+                ":hash": hash,
+            },
+        )?;
+        Ok(Self {
+            id: self.id,
+            dat_id: self.dat_id,
+            dir_id: self.dir_id,
+            name: self.name.clone(),
+            size: self.size,
+            hash: hash.to_string(),
+        })
+    }
+
     pub fn delete_matches(&self, conn: &Connection) -> Result<usize> {
         MatchRecord::delete_by_file_id(conn, self.id)
     }
@@ -1036,7 +1078,7 @@ impl MatchRecord {
     }
 }
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub fn open_or_create<P: AsRef<Utf8Path>>(db_path: P) -> Result<Connection> {
     let mut conn = Connection::open(db_path.as_ref())?;
@@ -1083,6 +1125,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             name VARCHAR NOT NULL,
             size VARCHAR NOT NULL,
             hash VARCHAR NOT NULL,
+            crc VARCHAR,
             FOREIGN KEY (dat_id) REFERENCES dats(id),
             FOREIGN KEY (set_id) REFERENCES sets(id)
         );
@@ -1121,6 +1164,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX idx_set_roms ON roms(set_id);
         CREATE INDEX idx_dat_roms_name ON roms(dat_id, name);
         CREATE INDEX idx_dat_roms_hash ON roms(dat_id, hash);
+        CREATE INDEX idx_dat_roms_crc ON roms(dat_id, crc);
         CREATE INDEX idx_dat_dirs ON dirs(dat_id);
         CREATE INDEX idx_dat_dirs_path ON dirs(dat_id, path);
         CREATE INDEX idx_dir_files ON files(dir_id);
@@ -1228,6 +1272,16 @@ fn run_migrations(conn: &Connection, db_path: &Utf8Path, version: i64) -> Result
         conn.execute("INSERT INTO schema_version (version) VALUES (2)", [])?;
     }
 
+    if version < 3 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE roms ADD COLUMN crc VARCHAR;
+            CREATE INDEX IF NOT EXISTS idx_dat_roms_crc ON roms(dat_id, crc);
+            "#,
+        )?;
+        conn.execute("INSERT INTO schema_version (version) VALUES (3)", [])?;
+    }
+
     Ok(())
 }
 
@@ -1254,11 +1308,11 @@ pub fn with_savepoint<T, F: FnOnce(&Savepoint) -> Result<T>>(conn: &mut Transact
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Create an in-memory database with the current schema.
-    fn mem_db() -> Connection {
+    pub(crate) fn mem_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory db");
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);", ())
@@ -1267,7 +1321,7 @@ mod tests {
         conn
     }
 
-    fn sample_dat() -> NewDat {
+    pub(crate) fn sample_dat() -> NewDat {
         NewDat::new("Test DAT", "A test dat file", "1.0", "tester", "sha1")
     }
 
@@ -1351,15 +1405,22 @@ mod tests {
 
     // --- RomRecord ---
 
-    fn insert_rom(conn: &Connection, dat: &DatRecord, set: &SetRecord, name: &str, hash: &str) -> RomRecord {
-        RomRecord::insert(conn, NewRom::new(dat.id, set.id, name, 1024, hash)).unwrap()
+    fn insert_rom(
+        conn: &Connection,
+        dat: &DatRecord,
+        set: &SetRecord,
+        name: &str,
+        hash: &str,
+        crc: Option<&str>,
+    ) -> RomRecord {
+        RomRecord::insert(conn, NewRom::new(dat.id, set.id, name, 1024, hash, crc.map(str::to_string))).unwrap()
     }
 
     #[test]
     fn insert_and_query_roms() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
-        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc123");
+        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc123", None);
 
         let roms = RomRecord::get_by_dat(&conn, dat.id).unwrap();
         assert_eq!(roms.len(), 1);
@@ -1373,7 +1434,7 @@ mod tests {
     fn find_rom_by_hash() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
-        insert_rom(&conn, &dat, &set, "game.rom", "deadbeef");
+        insert_rom(&conn, &dat, &set, "game.rom", "deadbeef", None);
 
         let found = RomRecord::find_by_hash_in_dat(&conn, dat.id, "deadbeef").unwrap();
         assert_eq!(found.len(), 1);
@@ -1387,14 +1448,27 @@ mod tests {
         let conn = mem_db();
         let (dat, set1) = insert_dat_and_set(&conn);
         let set2 = SetRecord::insert(&conn, NewSet::new(dat.id, "Set 2")).unwrap();
-        insert_rom(&conn, &dat, &set1, "a.rom", "aaa");
-        insert_rom(&conn, &dat, &set2, "b.rom", "bbb");
+        insert_rom(&conn, &dat, &set1, "a.rom", "aaa", None);
+        insert_rom(&conn, &dat, &set2, "b.rom", "bbb", None);
 
         let ids = vec![set1.id, set2.id];
         let map = RomRecord::get_by_sets(&conn, &ids).unwrap();
         assert_eq!(map.len(), 2);
         assert_eq!(map[&set1.id].len(), 1);
         assert_eq!(map[&set2.id].len(), 1);
+    }
+
+    #[test]
+    fn get_crcs_by_dat_returns_only_populated_crcs() {
+        let conn = mem_db();
+        let (dat, set1) = insert_dat_and_set(&conn);
+        let set2 = SetRecord::insert(&conn, NewSet::new(dat.id, "Set 2")).unwrap();
+        insert_rom(&conn, &dat, &set1, "a.rom", "aaa", Some("deadbeef"));
+        insert_rom(&conn, &dat, &set2, "b.rom", "bbb", None);
+        insert_rom(&conn, &dat, &set2, "c.rom", "ccc", Some("cafebabe"));
+
+        let crcs = RomRecord::get_crcs_by_dat(&conn, dat.id).unwrap();
+        assert_eq!(crcs, BTreeSet::from(["cafebabe".to_string(), "deadbeef".to_string()]));
     }
 
     #[test]
@@ -1557,6 +1631,21 @@ mod tests {
     }
 
     #[test]
+    fn update_file_hash() {
+        let conn = mem_db();
+        let (dat, _) = insert_dat_and_set(&conn);
+        let dir = insert_dir(&conn, &dat, "/roms");
+        let file = insert_file(&conn, &dat, &dir, "game.zip");
+
+        let updated = file.update_hash(&conn, "newhash").unwrap();
+        assert_eq!(updated.hash, "newhash");
+        assert_eq!(updated.id, file.id);
+
+        let fetched = FileRecord::get_by_id(&conn, file.id).unwrap();
+        assert_eq!(fetched.hash, "newhash");
+    }
+
+    #[test]
     fn relink_files() {
         let conn = mem_db();
         let dat1 = DatRecord::insert(&conn, sample_dat()).unwrap();
@@ -1575,7 +1664,7 @@ mod tests {
     fn insert_and_query_matches() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
-        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc");
+        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc", None);
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
@@ -1591,7 +1680,7 @@ mod tests {
     fn update_match_status() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
-        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc");
+        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc", None);
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
@@ -1608,7 +1697,7 @@ mod tests {
     fn delete_matches_by_file() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
-        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc");
+        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc", None);
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
@@ -1622,7 +1711,7 @@ mod tests {
     fn delete_matches_by_dir() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
-        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc");
+        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc", None);
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
@@ -1636,7 +1725,7 @@ mod tests {
     fn delete_matches_by_dat() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
-        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc");
+        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc", None);
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
@@ -1650,7 +1739,7 @@ mod tests {
     fn find_matches_by_status_for_dat() {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
-        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc");
+        let rom = insert_rom(&conn, &dat, &set, "game.rom", "abc", None);
         let dir = insert_dir(&conn, &dat, "/roms");
         let file = insert_file(&conn, &dat, &dir, "game.zip");
 
@@ -1674,7 +1763,7 @@ mod tests {
         let conn = mem_db();
         let (dat, set) = insert_dat_and_set(&conn);
         let big: u64 = u64::MAX;
-        let rom = RomRecord::insert(&conn, NewRom::new(dat.id, set.id, "big.rom", big, "h")).unwrap();
+        let rom = RomRecord::insert(&conn, NewRom::new(dat.id, set.id, "big.rom", big, "h", None)).unwrap();
         assert_eq!(rom.size, big);
 
         let fetched = RomRecord::get_by_id(&conn, rom.id).unwrap();
@@ -1689,11 +1778,10 @@ mod tests {
 
         for status in [MatchStatus::Hash, MatchStatus::Name, MatchStatus::Match] {
             let sql_val = status.to_sql().unwrap();
-            assert!(matches!(
-                &sql_val,
-                rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(_))
-            ));
-            let rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(t)) = &sql_val else { return };
+            assert!(matches!(&sql_val, rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(_))));
+            let rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(t)) = &sql_val else {
+                return;
+            };
             let s = std::str::from_utf8(t).unwrap();
             let back = MatchStatus::column_result(ValueRef::Text(s.as_bytes())).unwrap();
             assert_eq!(back, status);
