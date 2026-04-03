@@ -744,13 +744,13 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
                 // Zip entries may have been left unhashed during the original scan,
                 // so recover the hash only when the new DAT makes it relevant.
                 let file = ensure_hash_for_update(conn, &mut zip, &directory.path, &zip_entries, &file, &new_rom_crcs)?;
-                insert_matches(&new_context, &file, &matched_sets)?;
+                match_roms_and_insert(&new_context, &file, &matched_sets)?;
             }
         } else {
             let matched_sets = BTreeSet::new();
             for file in directory.get_files(conn)? {
                 // Loose files are always hashed during scan, so no recovery path is needed.
-                insert_matches(&new_context, &file, &matched_sets)?;
+                match_roms_and_insert(&new_context, &file, &matched_sets)?;
             }
         }
     }
@@ -1371,22 +1371,18 @@ fn insert_files_and_matches(
     hash: Option<&str>,
     matched_sets: &BTreeSet<db::SetId>,
 ) -> Result<()> {
-    ensure!(
-        matched_sets.is_empty() || hash.is_some(),
-        "cannot match '{file_name}' against candidate sets without a hash"
-    );
     let file = db::FileRecord::insert(
         ctx.conn,
         db::NewFile::new(ctx.dat_id, *dir_id, file_name, file_size, hash.unwrap_or("")),
     )?;
 
     if hash.is_some() {
-        insert_matches(ctx, &file, matched_sets)?;
+        match_roms_and_insert(ctx, &file, matched_sets)?;
     }
     Ok(())
 }
 
-fn insert_matches(
+fn match_roms_and_insert(
     ctx: &DatContext<'_>,
     file: &db::FileRecord,
     matched_sets: &BTreeSet<db::Id<db::SetRecord>>,
@@ -1995,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_files_and_matches_rejects_missing_hash_when_sets_are_pre_matched() {
+    fn insert_files_and_matches_skips_matching_when_hash_missing() {
         let conn = db::tests::mem_db();
         let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
         let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "Matched Set")).unwrap();
@@ -2003,14 +1999,12 @@ mod tests {
         let ctx = DatContext::new(&conn, dat.id);
         let matched_sets = BTreeSet::from([set.id]);
 
-        let err = insert_files_and_matches(&ctx, &dir.id, "candidate.rom", 123, None, &matched_sets).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot match 'candidate.rom' against candidate sets without a hash")
-        );
+        insert_files_and_matches(&ctx, &dir.id, "candidate.rom", 123, None, &matched_sets).unwrap();
 
         let files = dir.get_files(&conn).unwrap();
-        assert!(files.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "candidate.rom");
+        assert_eq!(files[0].hash, "");
     }
 
     // --- match_exact ---
