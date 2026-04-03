@@ -1117,7 +1117,13 @@ fn scan_directory(
                 zips_to_hash
                     .par_iter()
                     .filter_map(|path| {
-                        let file = File::open(path).map_err(anyhow::Error::from).ok()?;
+                        let file = match File::open(path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("Failed to open {}. Error: {e}", path);
+                                return None;
+                            }
+                        };
                         let mut zip = match zip::ZipArchive::new(file) {
                             Ok(z) => z,
                             Err(e) => {
@@ -1134,10 +1140,15 @@ fn scan_directory(
                         };
                         for entry in &mut entries {
                             if rom_crcs.is_empty() || rom_crcs.contains(&entry.crc) {
-                                match util::calc_hash(&mut zip.by_index(entry.index).ok()?) {
-                                    Ok((hash, _)) => entry.hash = Some(hash),
+                                match zip.by_index(entry.index) {
+                                    Ok(mut inner) => match util::calc_hash(&mut inner) {
+                                        Ok((hash, _)) => entry.hash = Some(hash),
+                                        Err(e) => {
+                                            eprintln!("Failed to hash {} in {}. Error: {e}", entry.name, path);
+                                        }
+                                    },
                                     Err(e) => {
-                                        eprintln!("Failed to hash {} in {}. Error: {e}", entry.name, path);
+                                        eprintln!("Failed to read entry {} in {}. Error: {e}", entry.index, path);
                                     }
                                 }
                             }
