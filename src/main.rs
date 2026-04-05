@@ -2,51 +2,51 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
+mod cli;
 mod completion;
+mod dat;
 mod db;
+mod matching;
+mod scan;
 mod util;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufReader, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use fallible_iterator::FallibleIterator;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use roxmltree::Document;
+use clap::{CommandFactory, Parser};
 use rusqlite::{Connection, Transaction};
-use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::Validator;
-use rustyline::{Config, Editor, Helper};
+use rustyline::{Config, Editor};
 
-use crate::completion::{TreeNode, build_completions, complete};
+use crate::cli::{Args, Cli, Commands, CompletionHelper, DataCommands, FileCommands, SelectMode, TermInfo};
+use crate::completion::build_completions;
 use crate::db::{Deletable, DeletableByDat, FindableByName, Insertable, Queryable, QueryableByDat};
+use crate::matching::{match_roms_and_insert, match_sets};
+use crate::scan::{ScanOptions, read_zip_entries, scan_files};
 use crate::util::{OptionIf, ResultIf};
 
 const APP_NAME: &str = "rrm";
-const ANSI_CURSOR_START: &str = "\x1B[1000D";
-const ANSI_ERASE_TO_END: &str = "\x1B[K";
 
-// constants for XML dat file
-const TAG_HEADER: &str = "header";
-const ATTR_HEADER_NAME: &str = "name";
-const ATTR_HEADER_DESC: &str = "description";
-const ATTR_HEADER_VERSION: &str = "version";
-const ATTR_HEADER_AUTHOR: &str = "author";
+struct ListContext<'a> {
+    conn: &'a Connection,
+    dat_id: db::DatId,
+    term: &'a TermInfo,
+    partial_name: Option<&'a str>,
+}
 
-const TAG_GAME: &str = "game";
-const ATTR_GAME_NAME: &str = "name";
-
-const TAG_ROM: &str = "rom";
-const ATTR_ROM_NAME: &str = "name";
-const ATTR_ROM_SIZE: &str = "size";
-const ATTR_ROM_HASH: &str = "sha1";
-const ATTR_ROM_CRC: &str = "crc";
+impl<'a> ListContext<'a> {
+    fn new(conn: &'a Connection, dat_id: db::DatId, term: &'a TermInfo, partial_name: Option<&'a str>) -> Self {
+        Self {
+            conn,
+            dat_id,
+            term,
+            partial_name,
+        }
+    }
+}
 
 macro_rules! println_if {
     ($cond:expr, $($arg:tt)*) => {
@@ -55,213 +55,6 @@ macro_rules! println_if {
         }
     };
 }
-
-#[derive(Debug, Parser)]
-#[clap(version, about, long_about = None)]
-struct Args {
-    /// select the dat file to use
-    #[arg(short, long)]
-    select: Option<usize>,
-
-    /// command to execute, if none given will enter interactive mode
-    #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// force enter interactive mode, if command is given
-    #[arg(short, long)]
-    interactive: bool,
-}
-
-#[derive(Debug, Parser)]
-#[command(multicall = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Debug, Subcommand)]
-enum Commands {
-    /// execute commands on dat file
-    Data {
-        #[command(subcommand)]
-        data: DataCommands,
-    },
-    /// execute commands on files
-    Files {
-        #[command(subcommand)]
-        files: FileCommands,
-    },
-    /// Alias for `data select`
-    Select {
-        /// the index of the dat file to select, as seen in list
-        index: usize,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SelectMode {
-    /// select all files
-    All,
-    /// select only matched files
-    Matched,
-    /// select only misnamed or bad dumps
-    Warning,
-    /// select only unmatched files
-    Unmatched,
-}
-
-#[derive(Debug, Subcommand)]
-enum FileCommands {
-    /// scan a path and match files with the current dat file
-    Scan {
-        /// extensions to exclude when scanning files
-        #[arg(long, value_delimiter = ',', default_value = "m3u,dat,txt")]
-        exclude: Vec<String>,
-        /// scan recursively each directory found
-        #[arg(short('R'), long)]
-        recursive: bool,
-        /// re-scan existing files in the directory and not just new files
-        #[arg(long)]
-        full: bool,
-        /// number of files to hash in parallel (default: 1)
-        #[arg(short, long, default_value_t = 1)]
-        parallel: usize,
-        /// the path to use for scanning files
-        #[arg(default_value=".", value_hint = clap::ValueHint::DirPath)]
-        path: Utf8PathBuf,
-    },
-    /// list all files scanned and show their status
-    List {
-        /// show only files with this status
-        #[arg(long, value_enum, default_value_t = SelectMode::All)]
-        mode: SelectMode,
-        /// show only files partially matching this name
-        partial_name: Option<String>,
-    },
-    /// alias for `list --mode matched`
-    Matched {
-        /// show only files partially matching this name
-        partial_name: Option<String>,
-    },
-    /// alias for `sets --missing`
-    Missing {
-        /// show only sets partially matching this name
-        partial_name: Option<String>,
-    },
-    /// list all sets matched by scanned files
-    Sets {
-        /// show missing sets instead of matches
-        #[arg(long)]
-        missing: bool,
-        /// show only sets partially matching this name
-        partial_name: Option<String>,
-    },
-    /// Sort files into directory
-    Sort {
-        /// sort only files with this status
-        #[arg(long, value_enum, default_value_t = SelectMode::Unmatched)]
-        mode: SelectMode,
-        /// the base path to use when moving files
-        #[arg(default_value=".", value_hint = clap::ValueHint::DirPath)]
-        path: Utf8PathBuf,
-
-        // whether to keep the moved files in the database
-        #[arg(long)]
-        keep: bool,
-    },
-    //rename files to the correct name (loose files only)
-    Rename,
-    /// alias for `list --mode unmatched`
-    Unmatched {
-        /// show only files partially matching this name
-        partial_name: Option<String>,
-    },
-    /// alias for `list --mode warning`
-    Warning {
-        /// show only files partially matching this name
-        partial_name: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum DataCommands {
-    /// import a dat file into the system and make it the current dat file
-    Import {
-        /// the path and filename of the dat file to import
-        #[arg(value_hint = clap::ValueHint::FilePath)]
-        dat_file: Utf8PathBuf,
-    },
-    /// update the current dat file with a new version and re-match files
-    Update {
-        /// the path and filename of the dat file to import
-        #[arg(value_hint = clap::ValueHint::FilePath)]
-        dat_file: Utf8PathBuf,
-
-        /// don't ask for confirmation, and perform the action
-        #[arg(long)]
-        yes: bool,
-    },
-    /// remove the current dat file and all matched files
-    Remove {
-        /// don't ask for confirmation, and perform the action
-        #[arg(long)]
-        yes: bool,
-
-        /// the index of the dat file to select, as seen in list
-        index: Option<usize>,
-    },
-    /// List dat files in the system
-    List,
-    /// Select the current dat file
-    Select {
-        /// the index of the dat file to select, as seen in list
-        index: usize,
-    },
-    /// Show all Set and Roms in the current dat file
-    Records,
-    /// Search for a Set in the current dat file
-    Sets {
-        /// an optional partial name to match
-        partial_name: Option<String>,
-    },
-    /// Search for a Rom in the current dat file
-    Roms {
-        /// an optional partial name to match
-        partial_name: Option<String>,
-    },
-}
-
-struct TermInfo {
-    tty_in: bool,
-    tty_out: bool,
-    interactive: bool,
-}
-
-struct CompletionHelper<'a> {
-    node: TreeNode<'a>,
-}
-
-impl Completer for CompletionHelper<'_> {
-    type Candidate = String;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let line = &line[..pos];
-        let (trailing, completions) = complete(&self.node, line);
-        let offset = line.len() - trailing;
-        Ok((offset, completions))
-    }
-}
-impl Hinter for CompletionHelper<'_> {
-    type Hint = String;
-}
-impl Highlighter for CompletionHelper<'_> {}
-impl Validator for CompletionHelper<'_> {}
-impl Helper for CompletionHelper<'_> {}
 
 fn main() -> Result<()> {
     let data_path = util::data_dir()
@@ -393,7 +186,7 @@ fn handle_data_commands(
             ensure!(dat_file.is_file(), "`{}` is not a valid file", dat_file);
 
             db::with_transaction(conn, |tx| {
-                import_dat(tx, dat_file).map(|imported| {
+                dat::import_dat(tx, dat_file).map(|imported| {
                     if term.interactive {
                         println!("dat file `{}` imported and selected.", imported.name);
                         *dat_id = Some(imported.id);
@@ -430,7 +223,7 @@ fn handle_data_commands(
 
             if ask_for_confirmation(term, &format!("Are you sure you want to remove {}? (y/N): ", prompt), *yes)? {
                 db::with_transaction(conn, |tx| {
-                    delete_dat(tx, old_dat_id).map(|_| {
+                    dat::delete_dat(tx, old_dat_id).map(|_| {
                         println!("dat file removed.");
                         *dat_id = None;
                     })
@@ -442,15 +235,15 @@ fn handle_data_commands(
         DataCommands::Select { index } => select_dat(conn, dat_id, *index),
         DataCommands::Records => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_dat_records(&DatContext::new(conn, *dat_id))
+            list_dat_records(conn, *dat_id)
         }
         DataCommands::Sets { partial_name } => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_sets(&DatContext::new(conn, *dat_id), partial_name.as_deref())
+            list_sets(conn, *dat_id, partial_name.as_deref())
         }
         DataCommands::Roms { partial_name } => {
             let dat_id = dat_id.as_ref().ok_or_else(|| anyhow!("No dat file selected"))?;
-            list_roms(&DatContext::new(conn, *dat_id), partial_name.as_deref())
+            list_roms(conn, *dat_id, partial_name.as_deref())
         }
     }
 }
@@ -526,13 +319,15 @@ fn handle_file_commands(
             db::with_transaction_mut(conn, |tx| scan_files(tx, dat_id, term, &scan_path, &options))
         }
         FileCommands::List { mode, partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, *mode, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_scanned_files(&ctx, *mode)
         }
         FileCommands::Sets { missing, partial_name } => {
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
             if *missing {
-                list_missing_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
+                list_missing_sets(&ctx)
             } else {
-                list_found_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
+                list_found_sets(&ctx)
             }
         }
         FileCommands::Sort { mode, path, keep } => {
@@ -540,16 +335,20 @@ fn handle_file_commands(
         }
         FileCommands::Rename => db::with_transaction_mut(conn, |tx| rename_files(tx, dat_id, term)),
         FileCommands::Matched { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Matched, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_scanned_files(&ctx, SelectMode::Matched)
         }
         FileCommands::Missing { partial_name } => {
-            list_missing_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_missing_sets(&ctx)
         }
         FileCommands::Unmatched { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Unmatched, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_scanned_files(&ctx, SelectMode::Unmatched)
         }
         FileCommands::Warning { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Warning, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_scanned_files(&ctx, SelectMode::Warning)
         }
     }
 }
@@ -722,17 +521,15 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
 }
 
 fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) -> Result<db::DatRecord> {
-    let imported = import_dat(conn, dat_file)?;
+    let imported = dat::import_dat(conn, dat_file)?;
     let new_rom_crcs = db::RomRecord::get_crcs_by_dat(conn, imported.id)?;
 
     //delete all existing matches for the old dat, we'll re-match them as we relink directories and files to the new dat
     db::MatchRecord::delete_by_dat(conn, old_dat_id)?;
 
-    let new_context = DatContext::new(conn, imported.id);
-
     for directory in db::DirRecord::get_by_dat(conn, old_dat_id)? {
         if util::is_zip_file(&directory.path) {
-            let matched_sets = match_sets(&new_context, &directory.path)?;
+            let matched_sets = match_sets(conn, imported.id, &directory.path)?;
             let zip_file = File::open(&directory.path)?;
             let mut zip = zip::ZipArchive::new(zip_file)
                 .with_context(|| format!("could not open '{}' as a zip file", directory.path))?;
@@ -744,13 +541,13 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
                 // Zip entries may have been left unhashed during the original scan,
                 // so recover the hash only when the new DAT makes it relevant.
                 let file = ensure_hash_for_update(conn, &mut zip, &directory.path, &zip_entries, &file, &new_rom_crcs)?;
-                match_roms_and_insert(&new_context, &file, &matched_sets)?;
+                match_roms_and_insert(conn, imported.id, &file, &matched_sets)?;
             }
         } else {
             let matched_sets = BTreeSet::new();
             for file in directory.get_files(conn)? {
                 // Loose files are always hashed during scan, so no recovery path is needed.
-                match_roms_and_insert(&new_context, &file, &matched_sets)?;
+                match_roms_and_insert(conn, imported.id, &file, &matched_sets)?;
             }
         }
     }
@@ -762,7 +559,7 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     db::FileRecord::relink_files(conn, old_dat_id, imported.id)?;
 
     //if we successfully updated everything and relinked and the transaction completed, we can now delete the old dat
-    delete_dat(conn, old_dat_id)?;
+    dat::delete_dat(conn, old_dat_id)?;
 
     Ok(imported)
 }
@@ -771,7 +568,7 @@ fn ensure_hash_for_update(
     conn: &Connection,
     zip: &mut zip::ZipArchive<File>,
     zip_path: &str,
-    zip_entries: &BTreeMap<String, ZipEntryMeta>,
+    zip_entries: &BTreeMap<String, scan::ZipEntryMeta>,
     file: &db::FileRecord,
     rom_crcs: &BTreeSet<String>,
 ) -> Result<db::FileRecord> {
@@ -792,146 +589,28 @@ fn ensure_hash_for_update(
     file.update_hash(conn, &hash)
 }
 
-fn strip_doctype(s: &mut String) {
-    let Some(start) = s.find("<!DOCTYPE") else { return };
-    let mut depth = 0usize;
-    let end = s[start..].char_indices().find(|(_, c)| match c {
-        '[' => {
-            depth += 1;
-            false
-        }
-        ']' => {
-            depth = depth.saturating_sub(1);
-            false
-        }
-        '>' if depth == 0 => true,
-        _ => false,
-    });
-    if let Some((len, _)) = end {
-        s.replace_range(start..=start + len, "");
-    }
-}
-
-fn import_dat<P: AsRef<Utf8Path>>(conn: &Connection, file_path: P) -> Result<db::DatRecord> {
-    let mut df_buffer = std::fs::read_to_string(file_path.as_ref()).context("Unable to read reference dat file")?;
-    //so we can turn off dtd-processing, we need to remove any declaration, in most files its unused and is a security issue.
-    strip_doctype(&mut df_buffer);
-    parse_dat(conn, &df_buffer)
-}
-
-fn parse_dat(conn: &Connection, df_buffer: &str) -> Result<db::DatRecord> {
-    let df_xml = Document::parse(df_buffer).context("Unable to parse reference dat file")?;
-    let new_dat = parse_dat_info(&df_xml)?;
-    let dat = db::DatRecord::insert(conn, new_dat)?;
-
-    for game_node in df_xml
-        .root_element()
-        .children()
-        .filter(|node| node.tag_name().name() == TAG_GAME)
-    {
-        let game_name = game_node
-            .attribute(ATTR_GAME_NAME)
-            .context("Unable to read game name in reference dat file")?;
-
-        let set = db::SetRecord::insert(conn, db::NewSet::new(dat.id, game_name))?;
-
-        for rom_node in game_node.descendants().filter(|node| node.tag_name().name() == TAG_ROM) {
-            let rom_name = rom_node.attribute(ATTR_ROM_NAME).context("Unable to read game name")?;
-            let rom_size = rom_node.attribute(ATTR_ROM_SIZE).context("Unable to read game size")?;
-            let rom_hash = rom_node.attribute(ATTR_ROM_HASH).context("Unable to read game hash")?;
-            let rom_crc = rom_node.attribute(ATTR_ROM_CRC).map(normalize_crc).transpose()?;
-            db::RomRecord::insert(
-                conn,
-                db::NewRom::new(
-                    dat.id,
-                    set.id,
-                    rom_name,
-                    rom_size.parse().context("should be a valid number")?,
-                    rom_hash,
-                    rom_crc,
-                ),
-            )?;
-        }
-    }
-    Ok(dat)
-}
-
-fn normalize_crc(raw_crc: &str) -> Result<String> {
-    let crc = raw_crc.trim();
-    let crc = crc.strip_prefix("0x").or_else(|| crc.strip_prefix("0X")).unwrap_or(crc);
-    ensure!(!crc.is_empty(), "crc should not be empty");
-    let parsed = u32::from_str_radix(crc, 16).with_context(|| format!("invalid crc value '{raw_crc}'"))?;
-    Ok(format!("{parsed:08x}"))
-}
-
-fn parse_dat_info(df_xml: &Document<'_>) -> Result<db::NewDat> {
-    let mut name = None;
-    let mut description = None;
-    let mut version = None;
-    let mut author = None;
-    for header_node in df_xml
-        .root_element()
-        .children()
-        .find(|node| node.tag_name().name() == TAG_HEADER)
-        .map(|header| header.children())
-        .context("Could not find header in reference dat file")?
-    {
-        match header_node.tag_name().name() {
-            ATTR_HEADER_NAME => name = header_node.text(),
-            ATTR_HEADER_DESC => description = header_node.text(),
-            ATTR_HEADER_VERSION => version = header_node.text(),
-            ATTR_HEADER_AUTHOR => author = header_node.text(),
-            _ => {}
-        };
-    }
-    let new_dat = db::NewDat::new(
-        name.context("unable to find name attribute in header")?,
-        description.context("unable to find description attribute in header")?,
-        version.context("unable to find version attribute in header")?,
-        author.context("unable to find author attribute in header")?,
-        "sha1",
-    );
-    Ok(new_dat)
-}
-
-fn delete_dat(conn: &Connection, dat_id: db::DatId) -> Result<()> {
-    //remove all scanned files and directories
-    db::MatchRecord::delete_by_dat(conn, dat_id)?;
-    db::FileRecord::delete_by_dat(conn, dat_id)?;
-    db::DirRecord::delete_by_dat(conn, dat_id)?;
-
-    //remove all roms and sets before removing the dat
-    db::RomRecord::delete_by_dat(conn, dat_id)?;
-    db::SetRecord::delete_by_dat(conn, dat_id)?;
-
-    //remove the dat itself
-    db::DatRecord::delete_by_id(conn, dat_id)?;
-
-    Ok(())
-}
-
-fn list_dat_records(ctx: &DatContext<'_>) -> Result<()> {
-    let dat_record = db::DatRecord::get_by_id(ctx.conn, ctx.dat_id)?;
+fn list_dat_records(conn: &Connection, dat_id: db::DatId) -> Result<()> {
+    let dat_record = db::DatRecord::get_by_id(conn, dat_id)?;
     println!("Name:        {}", dat_record.name);
     println!("Description: {}", dat_record.description);
     println!("Version:     {}", dat_record.version);
     println!("Author:      {}", dat_record.author);
 
     println!("--- SETS ---");
-    for set in db::SetRecord::get_by_dat(ctx.conn, ctx.dat_id)? {
+    for set in db::SetRecord::get_by_dat(conn, dat_id)? {
         println!("{}", set.name);
-        for rom in set.get_roms(ctx.conn)? {
+        for rom in set.get_roms(conn)? {
             println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
         }
     }
     Ok(())
 }
 
-fn list_sets(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
+fn list_sets(conn: &Connection, dat_id: db::DatId, name: Option<&str>) -> Result<()> {
     let sets = if let Some(name) = name {
-        db::SetRecord::find_by_name(ctx.conn, ctx.dat_id, name, false)
+        db::SetRecord::find_by_name(conn, dat_id, name, false)
     } else {
-        db::SetRecord::get_by_dat(ctx.conn, ctx.dat_id)
+        db::SetRecord::get_by_dat(conn, dat_id)
     }?;
     if sets.is_empty() {
         println!("No sets found.");
@@ -943,11 +622,11 @@ fn list_sets(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn list_roms(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
+fn list_roms(conn: &Connection, dat_id: db::DatId, name: Option<&str>) -> Result<()> {
     let roms = if let Some(name) = name {
-        db::RomRecord::find_by_name(ctx.conn, ctx.dat_id, name, false)
+        db::RomRecord::find_by_name(conn, dat_id, name, false)
     } else {
-        db::RomRecord::get_by_dat(ctx.conn, ctx.dat_id)
+        db::RomRecord::get_by_dat(conn, dat_id)
     }?;
     if roms.is_empty() {
         println!("No roms found.");
@@ -956,7 +635,7 @@ fn list_roms(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
         roms.iter()
             .for_each(|rom| roms_by_set.entry(&rom.set_id).or_default().push(rom));
 
-        let all_sets = db::SetRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
+        let all_sets = db::SetRecord::get_by_dat(conn, dat_id)?;
         let sets_by_id: BTreeMap<_, _> = all_sets.iter().map(|s| (&s.id, s)).collect();
 
         for (set_id, roms) in roms_by_set {
@@ -965,435 +644,6 @@ fn list_roms(ctx: &DatContext<'_>, name: Option<&str>) -> Result<()> {
                 roms.iter()
                     .for_each(|rom| println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size)));
             });
-        }
-    }
-    Ok(())
-}
-
-/// Options that are fixed for the duration of a scan and passed through every recursive call.
-struct ScanOptions<'a> {
-    exclude: &'a [String],
-    rom_crcs: &'a BTreeSet<String>,
-    recursive: bool,
-    full_scan: bool,
-    pool: &'a rayon::ThreadPool,
-}
-
-/// Bundles a database connection with the currently selected dat file ID.
-/// Passed to any function that operates on a specific dat, avoiding the
-/// repetition of carrying both as separate arguments everywhere.
-struct DatContext<'a> {
-    conn: &'a Connection,
-    dat_id: db::DatId,
-}
-
-impl<'a> DatContext<'a> {
-    fn new(conn: &'a Connection, dat_id: db::DatId) -> Self {
-        Self { conn, dat_id }
-    }
-}
-
-fn scan_files(
-    tx: &mut Transaction,
-    dat_id: db::DatId,
-    term: &TermInfo,
-    scan_path: &Utf8Path, //expect this to be canonicalized
-    options: &ScanOptions<'_>,
-) -> Result<()> {
-    if options.full_scan {
-        //delete all records associated with the files
-        db::MatchRecord::delete_by_dat(tx, dat_id)?;
-        db::FileRecord::delete_by_dat(tx, dat_id)?;
-        db::DirRecord::delete_by_dat(tx, dat_id)?;
-    }
-
-    let file_count = scan_directory(tx, dat_id, scan_path, options, &|count| {
-        report_progress(term, count);
-    })?;
-
-    if term.tty_out {
-        println!("{ANSI_CURSOR_START}{} new files scanned.{ANSI_ERASE_TO_END}", file_count);
-    } else {
-        println!("{} new files scanned.", file_count);
-    }
-    Ok(())
-}
-
-fn report_progress(term: &TermInfo, count: u64) {
-    if term.tty_out {
-        print!("{ANSI_CURSOR_START}{count} new files scanned.{ANSI_ERASE_TO_END}");
-        std::io::stdout().flush().ok();
-    }
-}
-
-fn scan_directory(
-    tx: &mut Transaction,
-    dat_id: db::DatId,
-    scan_path: &Utf8Path,
-    options: &ScanOptions<'_>,
-    progress_fn: &dyn Fn(u64),
-) -> Result<u64> {
-    let (dir, incremental) = match db::DirRecord::find_by_path_in_dat(tx, dat_id, scan_path.as_str())? {
-        Some(dir) => (dir, true),
-        None => {
-            //no existing records, do a full scan
-            let dir = db::DirRecord::insert(tx, db::NewDir::new(dat_id, scan_path.as_str()))?;
-            (dir, false)
-        }
-    };
-
-    //these will be empty if not incremental, but its cheap enough to call them that its not worth optimising them out
-    let existing_subdirs = dir.get_children(tx)?;
-    let mut subdirs_by_path: BTreeSet<_> = existing_subdirs.iter().map(|dir| dir.path.as_str()).collect();
-
-    let existing_files = dir.get_files(tx)?;
-    let mut files_by_name: BTreeMap<_, _> = existing_files.iter().map(|file| (file.name.as_str(), file)).collect();
-
-    let mut file_count = 0u64;
-    let mut files_to_hash: Vec<(Utf8PathBuf, String)> = Vec::new();
-    let mut zips_to_hash: Vec<Utf8PathBuf> = Vec::new();
-
-    let mut iter = fallible_iterator::convert(scan_path.read_dir_utf8()?);
-    while let Some(entry) = iter.next()? {
-        let path = entry.path();
-        if util::is_hidden_file(path) {
-            continue;
-        }
-
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            if !options.recursive {
-                continue;
-            }
-            subdirs_by_path.remove(path.as_str());
-            let subdir_count = scan_directory(tx, dat_id, path, options, &|count| progress_fn(file_count + count))?;
-            file_count += subdir_count;
-        } else if file_type.is_file() {
-            if util::has_extension(path, options.exclude) {
-                continue;
-            }
-
-            if util::is_zip_file(path) {
-                let was_scanned = subdirs_by_path.remove(path.as_str());
-                if !was_scanned {
-                    zips_to_hash.push(path.to_path_buf());
-                }
-            } else if let Some(filename) = path.file_name() {
-                let exists = files_by_name.remove(filename).is_some();
-                if exists && incremental {
-                    //there was an existing scanned file, so skip it
-                    continue;
-                }
-                files_to_hash.push((path.to_path_buf(), filename.to_string()));
-            }
-        }
-        progress_fn(file_count);
-    }
-
-    // Hash loose files and zip entries in parallel, then insert results serially
-    let exclude = options.exclude;
-    let (hashed_files, hashed_zips) = options.pool.install(|| {
-        rayon::join(
-            || {
-                files_to_hash
-                    .par_iter()
-                    .filter_map(|(path, filename)| {
-                        let result = File::open(path).map_err(anyhow::Error::from).and_then(|file| {
-                            let mut reader = BufReader::new(file);
-                            util::calc_hash(&mut reader)
-                        });
-                        match result {
-                            Ok((hash, file_size)) => Some((filename.as_str(), hash, file_size)),
-                            Err(e) => {
-                                eprintln!("Failed to scan {}. Error: {e}", path);
-                                None
-                            }
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            },
-            || {
-                let rom_crcs = options.rom_crcs;
-                zips_to_hash
-                    .par_iter()
-                    .filter_map(|path| {
-                        let file = match File::open(path) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                eprintln!("Failed to open {}. Error: {e}", path);
-                                return None;
-                            }
-                        };
-                        let mut zip = match zip::ZipArchive::new(file) {
-                            Ok(z) => z,
-                            Err(e) => {
-                                eprintln!("Failed to scan {}. Error: {e}", path);
-                                return None;
-                            }
-                        };
-                        let mut entries = match read_zip_entries(&mut zip, exclude) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                eprintln!("Failed to scan {}. Error: {e}", path);
-                                return None;
-                            }
-                        };
-                        for entry in &mut entries {
-                            if rom_crcs.is_empty() || rom_crcs.contains(&entry.crc) {
-                                match zip.by_index(entry.index) {
-                                    Ok(mut inner) => match util::calc_hash(&mut inner) {
-                                        Ok((hash, _)) => entry.hash = Some(hash),
-                                        Err(e) => {
-                                            eprintln!("Failed to hash {} in {}. Error: {e}", entry.name, path);
-                                        }
-                                    },
-                                    Err(e) => {
-                                        eprintln!("Failed to read entry {} in {}. Error: {e}", entry.index, path);
-                                    }
-                                }
-                            }
-                        }
-                        Some((path, entries))
-                    })
-                    .collect::<Vec<_>>()
-            },
-        )
-    });
-
-    // Insert hashed loose files
-    let matched_sets = BTreeSet::new();
-    for (filename, hash, file_size) in &hashed_files {
-        match insert_files_and_matches(
-            &DatContext::new(tx, dat_id),
-            &dir.id,
-            filename,
-            *file_size,
-            Some(hash),
-            &matched_sets,
-        ) {
-            Ok(_) => file_count += 1,
-            Err(e) => eprintln!("Failed to insert {}. Error: {e}", filename),
-        }
-        progress_fn(file_count);
-    }
-
-    // Insert hashed zip entries, each zip in its own savepoint
-    for (path, entries) in hashed_zips {
-        match db::with_savepoint(tx, |sp| {
-            let ctx = DatContext::new(sp, dat_id);
-            let zip_dir = db::DirRecord::insert(ctx.conn, db::NewDir::new(dat_id, path.as_str()))?;
-            let matched = match_sets(&ctx, path)?;
-            for entry in &entries {
-                insert_files_and_matches(&ctx, &zip_dir.id, &entry.name, entry.size, entry.hash.as_deref(), &matched)?;
-            }
-            Ok(entries.len() as u64)
-        }) {
-            Ok(count) => {
-                file_count += count;
-                progress_fn(file_count);
-            }
-            Err(e) => eprintln!("Failed to scan {}. Error: {e}", path),
-        }
-    }
-
-    if incremental {
-        remove_stale_entries(&DatContext::new(tx, dat_id), subdirs_by_path, files_by_name);
-    }
-
-    Ok(file_count)
-}
-
-/// Removes DB records for directories and files that were present in a previous scan
-/// but were not encountered in the current one. Directories that still exist on disk are
-/// left alone — the user may have simply omitted the `--recursive` flag.
-fn remove_stale_entries<'a>(
-    ctx: &DatContext<'_>,
-    stale_subdirs: BTreeSet<&'a str>,
-    stale_files: BTreeMap<&'a str, &'a db::FileRecord>,
-) {
-    for existing_path in stale_subdirs {
-        if Utf8Path::new(existing_path).is_dir() {
-            // Directory still exists on disk — skip so we don't lose data when the user
-            // forgets the --recursive flag.
-            continue;
-        }
-        match db::DirRecord::find_by_path_in_dat(ctx.conn, ctx.dat_id, existing_path) {
-            Ok(Some(dir)) => {
-                dir.delete_matches(ctx.conn)
-                    .and_then(|_| dir.delete_files(ctx.conn))
-                    .and_then(|_| db::DirRecord::delete_by_id(ctx.conn, dir.id))
-                    .if_err(|e| eprintln!("Failed to delete directory {}. Error: {e}", existing_path));
-            }
-            Ok(None) => eprintln!("Failed to find directory entry {}.", existing_path),
-            Err(e) => eprintln!("Failed to get directory entry {}. Error: {e}", existing_path),
-        }
-    }
-    for (_, existing_file) in stale_files {
-        existing_file
-            .delete_matches(ctx.conn)
-            .and_then(|_| db::FileRecord::delete_by_id(ctx.conn, existing_file.id))
-            .if_err(|e| eprintln!("Failed to remove {}. Error: {e}", existing_file.name));
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ZipEntryMeta {
-    index: usize,
-    name: String,
-    size: u64,
-    crc: String,
-    hash: Option<String>,
-}
-
-/// Read zip entry metadata without hashing file contents.
-fn read_zip_entries(zip: &mut zip::ZipArchive<File>, exclude: &[String]) -> Result<Vec<ZipEntryMeta>> {
-    let mut entries = Vec::new();
-    for i in 0..zip.len() {
-        let inner_file = zip.by_index(i)?;
-        if !inner_file.is_file() {
-            continue;
-        }
-        if util::has_extension(inner_file.name(), exclude) {
-            continue;
-        }
-        entries.push(ZipEntryMeta {
-            index: i,
-            name: inner_file.name().to_string(),
-            size: inner_file.size(),
-            crc: format!("{:08x}", inner_file.crc32()),
-            hash: None,
-        });
-    }
-    Ok(entries)
-}
-
-fn match_sets<P: AsRef<Utf8Path>>(ctx: &DatContext<'_>, path: P) -> Result<BTreeSet<db::SetId>> {
-    let name = path.as_ref().file_prefix().context("should have a file name")?;
-    let sets = db::SetRecord::find_by_name(ctx.conn, ctx.dat_id, name, true)?;
-    let matched: BTreeSet<db::SetId> = sets.iter().map(|record| record.id).collect();
-    Ok(matched)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct FileMatch {
-    pub status: db::MatchStatus,
-    pub set_id: db::SetId,
-    pub rom_id: db::RomId,
-}
-
-fn resolve_match(
-    file_size: u64,
-    hash: &str,
-    matched_sets: &BTreeSet<db::SetId>,
-    named_roms: &[db::RomRecord],
-    hash_roms: &[db::RomRecord],
-) -> Option<Vec<FileMatch>> {
-    // Step 1: if something is named the same, check for exact matches and return if so.
-    if !named_roms.is_empty() {
-        let exact_matches = match_exact(file_size, hash, matched_sets, named_roms);
-        if exact_matches.is_some() {
-            return exact_matches;
-        }
-    }
-    // Step 2: if something is named the same, but the hash doesn't match,
-    // check whether we got hash only matches if we ignore the filename.
-    // If so, then treat it as a hash match, otherwise return the name only matches,
-    // if there are any.
-    if hash_roms.is_empty() {
-        match_names(matched_sets, named_roms)
-    } else {
-        match_hashes(matched_sets, hash_roms)
-    }
-}
-
-fn match_roms(
-    ctx: &DatContext<'_>,
-    filename: &str,
-    file_size: u64,
-    hash: &str,
-    matched_sets: &BTreeSet<db::SetId>,
-) -> Result<Option<Vec<FileMatch>>> {
-    let named_roms = db::RomRecord::find_by_name(ctx.conn, ctx.dat_id, filename, true)?;
-    let hash_roms = db::RomRecord::find_by_hash_in_dat(ctx.conn, ctx.dat_id, hash)?;
-    Ok(resolve_match(file_size, hash, matched_sets, &named_roms, &hash_roms))
-}
-
-fn match_exact(
-    file_size: u64,
-    hash: &str,
-    matched_sets: &BTreeSet<db::Id<db::SetRecord>>,
-    named_roms: &[db::RomRecord],
-) -> Option<Vec<FileMatch>> {
-    let matches: Vec<_> = named_roms
-        .iter()
-        .filter(|rom| matched_sets.is_empty() || matched_sets.contains(&rom.set_id))
-        .filter(|rom| file_size == rom.size && hash == rom.hash)
-        .map(|rom| FileMatch {
-            status: db::MatchStatus::Match,
-            set_id: rom.set_id,
-            rom_id: rom.id,
-        })
-        .collect();
-    if matches.is_empty() { None } else { Some(matches) }
-}
-
-fn match_names(matched_sets: &BTreeSet<db::Id<db::SetRecord>>, named_roms: &[db::RomRecord]) -> Option<Vec<FileMatch>> {
-    let matches: Vec<_> = named_roms
-        .iter()
-        .filter(|rom| matched_sets.is_empty() || matched_sets.contains(&rom.set_id))
-        .map(|rom| FileMatch {
-            status: db::MatchStatus::Name,
-            set_id: rom.set_id,
-            rom_id: rom.id,
-        })
-        .collect();
-    if matches.is_empty() { None } else { Some(matches) }
-}
-
-fn match_hashes(matched_sets: &BTreeSet<db::Id<db::SetRecord>>, hash_roms: &[db::RomRecord]) -> Option<Vec<FileMatch>> {
-    let matches: Vec<_> = hash_roms
-        .iter()
-        .filter(|rom| matched_sets.is_empty() || matched_sets.contains(&rom.set_id))
-        .map(|rom| FileMatch {
-            status: db::MatchStatus::Hash,
-            set_id: rom.set_id,
-            rom_id: rom.id,
-        })
-        .collect();
-    if matches.is_empty() { None } else { Some(matches) }
-}
-
-fn insert_files_and_matches(
-    ctx: &DatContext<'_>,
-    dir_id: &db::DirId,
-    file_name: &str,
-    file_size: u64,
-    hash: Option<&str>,
-    matched_sets: &BTreeSet<db::SetId>,
-) -> Result<()> {
-    let file = db::FileRecord::insert(
-        ctx.conn,
-        db::NewFile::new(ctx.dat_id, *dir_id, file_name, file_size, hash.unwrap_or("")),
-    )?;
-
-    if hash.is_some() {
-        match_roms_and_insert(ctx, &file, matched_sets)?;
-    }
-    Ok(())
-}
-
-fn match_roms_and_insert(
-    ctx: &DatContext<'_>,
-    file: &db::FileRecord,
-    matched_sets: &BTreeSet<db::Id<db::SetRecord>>,
-) -> Result<()> {
-    let matched = match_roms(ctx, &file.name, file.size, &file.hash, matched_sets)?;
-    if let Some(items) = matched {
-        for item in items {
-            db::MatchRecord::insert(
-                ctx.conn,
-                db::NewMatch::new(ctx.dat_id, file.id, item.status, item.set_id, item.rom_id),
-            )?;
         }
     }
     Ok(())
@@ -1452,12 +702,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-fn list_scanned_files(
-    ctx: &DatContext<'_>,
-    term: &TermInfo,
-    mode: SelectMode,
-    partial_name: Option<&str>,
-) -> Result<()> {
+fn list_scanned_files(ctx: &ListContext<'_>, mode: SelectMode) -> Result<()> {
     //get these in bulk to avoid doing a query per file when we display them
     let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     let matches_by_file: BTreeMap<_, Vec<_>> = matches.iter().fold(BTreeMap::new(), |mut acc, m| {
@@ -1474,7 +719,7 @@ fn list_scanned_files(
 
     let dirs = db::DirRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     for dir in dirs {
-        let files = if let Some(partial_name) = partial_name {
+        let files = if let Some(partial_name) = ctx.partial_name {
             dir.find_files(ctx.conn, partial_name, false)?
         } else {
             dir.get_files(ctx.conn)?
@@ -1492,11 +737,11 @@ fn list_scanned_files(
                         let rom = roms_by_id
                             .get(&fm.rom_id)
                             .ok_or_else(|| anyhow!("match references missing rom id {:?}", fm.rom_id))?;
-                        lines.push(format_match_status(&file, Some((fm, rom)), term.tty_out));
+                        lines.push(format_match_status(&file, Some((fm, rom)), ctx.term.tty_out));
                     }
                 }
             } else if should_display_file_status(None, mode) {
-                lines.push(format_match_status(&file, None, term.tty_out));
+                lines.push(format_match_status(&file, None, ctx.term.tty_out));
             }
         }
 
@@ -1540,7 +785,7 @@ fn format_set_indicator(status: SetStatus, is_tty: bool) -> &'static str {
     }
 }
 
-fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&str>) -> Result<()> {
+fn list_missing_sets(ctx: &ListContext<'_>) -> Result<()> {
     let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     let all_sets = db::SetRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
 
@@ -1550,9 +795,9 @@ fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option
     });
 
     println!("--- MISSING SETS ---");
-    let status = format_set_indicator(SetStatus::Missing, term.tty_out);
+    let status = format_set_indicator(SetStatus::Missing, ctx.term.tty_out);
     for set in &all_sets {
-        if let Some(partial_name) = partial_name
+        if let Some(partial_name) = ctx.partial_name
             && !contains_ascii_case_insensitive(&set.name, partial_name)
         {
             continue;
@@ -1563,7 +808,7 @@ fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option
     Ok(())
 }
 
-fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&str>) -> Result<()> {
+fn list_found_sets(ctx: &ListContext<'_>) -> Result<()> {
     //get all the matches so we know what sets we found
     let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     let set_ids: BTreeSet<_> = matches.iter().map(|m| m.set_id).collect();
@@ -1581,10 +826,10 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
     let all_set_count = db::SetRecord::get_num_by_dat(ctx.conn, ctx.dat_id)?;
 
     println!("--- FOUND SETS ---");
-    let partial_status = format_set_indicator(SetStatus::Partial, term.tty_out);
-    let complete_status = format_set_indicator(SetStatus::Complete, term.tty_out);
+    let partial_status = format_set_indicator(SetStatus::Partial, ctx.term.tty_out);
+    let complete_status = format_set_indicator(SetStatus::Complete, ctx.term.tty_out);
     for set in &found_sets {
-        if let Some(partial_name) = partial_name
+        if let Some(partial_name) = ctx.partial_name
             && !contains_ascii_case_insensitive(&set.name, partial_name)
         {
             continue;
@@ -1609,11 +854,11 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
                 let rom = roms_by_romid
                     .get(&matched.rom_id)
                     .ok_or_else(|| anyhow!("set match references missing rom id {:?}", matched.rom_id))?;
-                let status = format_match_status(file, Some((matched, rom)), term.tty_out);
+                let status = format_match_status(file, Some((matched, rom)), ctx.term.tty_out);
                 println!(" {status}");
             }
 
-            let missing_indicator = format_file_indicator(None, term.tty_out);
+            let missing_indicator = format_file_indicator(None, ctx.term.tty_out);
             for rom in set_roms {
                 println_if!(
                     !matched_rom_ids.contains(&rom.id),
@@ -1696,139 +941,6 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    fn stripped(input: &str) -> String {
-        let mut s = input.to_string();
-        strip_doctype(&mut s);
-        s
-    }
-
-    #[test]
-    fn strip_doctype_no_doctype() {
-        let xml = r#"<?xml version="1.0"?><root/>"#;
-        assert_eq!(stripped(xml), xml);
-    }
-
-    #[test]
-    fn strip_doctype_simple() {
-        let xml = r#"<?xml version="1.0"?><!DOCTYPE foo SYSTEM "foo.dtd"><root/>"#;
-        assert_eq!(stripped(xml), r#"<?xml version="1.0"?><root/>"#);
-    }
-
-    #[test]
-    fn strip_doctype_with_internal_subset() {
-        let xml = r#"<!DOCTYPE foo [<!ELEMENT bar (baz)><!ELEMENT baz (#PCDATA)>]><root/>"#;
-        assert_eq!(stripped(xml), "<root/>");
-    }
-
-    #[test]
-    fn strip_doctype_internal_subset_gt_not_confused() {
-        // The > inside the internal subset must not terminate the search early
-        let xml = r#"<!DOCTYPE foo [<!ENTITY gt ">">]><root/>"#;
-        assert_eq!(stripped(xml), "<root/>");
-    }
-
-    // --- parse_dat_info ---
-
-    fn parse_info(xml: &str) -> Result<db::NewDat> {
-        let doc = Document::parse(xml).unwrap();
-        parse_dat_info(&doc)
-    }
-
-    #[test]
-    fn parse_dat_info_valid() {
-        let xml = r#"<datafile>
-            <header>
-                <name>My DAT</name>
-                <description>A test dat</description>
-                <version>1.0</version>
-                <author>tester</author>
-            </header>
-        </datafile>"#;
-        let dat = parse_info(xml).unwrap();
-        assert_eq!(dat.name(), "My DAT");
-        assert_eq!(dat.description(), "A test dat");
-        assert_eq!(dat.version(), "1.0");
-        assert_eq!(dat.author(), "tester");
-        assert_eq!(dat.hash_type(), "sha1");
-    }
-
-    #[test]
-    fn parse_dat_info_missing_header() {
-        let xml = r#"<datafile><name>My DAT</name></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_missing_name() {
-        let xml = r#"<datafile><header>
-            <description>desc</description><version>1.0</version><author>auth</author>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_missing_description() {
-        let xml = r#"<datafile><header>
-            <name>n</name><version>1.0</version><author>auth</author>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_missing_version() {
-        let xml = r#"<datafile><header>
-            <name>n</name><description>d</description><author>auth</author>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_missing_author() {
-        let xml = r#"<datafile><header>
-            <name>n</name><description>d</description><version>1.0</version>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_err());
-    }
-
-    #[test]
-    fn parse_dat_info_ignores_unknown_elements() {
-        let xml = r#"<datafile><header>
-            <name>n</name><description>d</description><version>1.0</version>
-            <author>auth</author><unknown>ignored</unknown>
-        </header></datafile>"#;
-        assert!(parse_info(xml).is_ok());
-    }
-
-    #[test]
-    fn parse_dat_reads_optional_crc_and_normalizes_it() {
-        let conn = db::tests::mem_db();
-        let xml = r#"<datafile>
-            <header>
-                <name>My DAT</name>
-                <description>A test dat</description>
-                <version>1.0</version>
-                <author>tester</author>
-            </header>
-            <game name="Set One">
-                <rom name="a.rom" size="1" sha1="aaa" crc="0x1A2b3C"/>
-                <rom name="b.rom" size="2" sha1="bbb"/>
-            </game>
-        </datafile>"#;
-
-        let dat = parse_dat(&conn, xml).unwrap();
-        let roms = db::RomRecord::get_by_dat(&conn, dat.id).unwrap();
-        let roms_by_name: BTreeMap<_, _> = roms.iter().map(|rom| (rom.name.as_str(), rom)).collect();
-
-        assert_eq!(roms.len(), 2);
-        assert_eq!(roms_by_name["a.rom"].crc.as_deref(), Some("001a2b3c"));
-        assert_eq!(roms_by_name["b.rom"].crc, None);
-    }
-
-    #[test]
-    fn normalize_crc_rejects_invalid_hex() {
-        assert!(normalize_crc("not-hex").is_err());
-    }
 
     #[test]
     fn update_dat_hashes_hashless_zip_entries_when_set_name_narrows_matches() {
@@ -1971,156 +1083,6 @@ mod tests {
         }
     }
 
-    // --- insert_files_and_matches ---
-
-    #[test]
-    fn insert_files_and_matches_allows_missing_hash_when_no_matched_sets() {
-        let conn = db::tests::mem_db();
-        let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
-        let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
-        let ctx = DatContext::new(&conn, dat.id);
-
-        insert_files_and_matches(&ctx, &dir.id, "unknown.rom", 123, None, &BTreeSet::new()).unwrap();
-
-        let files = dir.get_files(&conn).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].hash, "");
-
-        let matches = db::MatchRecord::get_by_dat(&conn, dat.id).unwrap();
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn insert_files_and_matches_skips_matching_when_hash_missing() {
-        let conn = db::tests::mem_db();
-        let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
-        let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "Matched Set")).unwrap();
-        let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
-        let ctx = DatContext::new(&conn, dat.id);
-        let matched_sets = BTreeSet::from([set.id]);
-
-        insert_files_and_matches(&ctx, &dir.id, "candidate.rom", 123, None, &matched_sets).unwrap();
-
-        let files = dir.get_files(&conn).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].name, "candidate.rom");
-        assert_eq!(files[0].hash, "");
-    }
-
-    // --- match_exact ---
-
-    #[test]
-    fn match_exact_empty_roms() {
-        assert!(match_exact(100, "abc", &BTreeSet::new(), &[]).is_none());
-    }
-
-    #[test]
-    fn match_exact_no_match_wrong_size() {
-        let roms = [make_rom(1, 1, 1, 200, "abc")];
-        assert!(match_exact(100, "abc", &BTreeSet::new(), &roms).is_none());
-    }
-
-    #[test]
-    fn match_exact_no_match_wrong_hash() {
-        let roms = [make_rom(1, 1, 1, 100, "xyz")];
-        assert!(match_exact(100, "abc", &BTreeSet::new(), &roms).is_none());
-    }
-
-    #[test]
-    fn match_exact_single_match() {
-        let roms = [make_rom(1, 1, 1, 100, "abc")];
-        let result = match_exact(100, "abc", &BTreeSet::new(), &roms).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].status, db::MatchStatus::Match);
-        assert_eq!(result[0].set_id, 1i64.into());
-        assert_eq!(result[0].rom_id, 1i64.into());
-    }
-
-    #[test]
-    fn match_exact_multiple_matches() {
-        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 100, "abc")];
-        let result = match_exact(100, "abc", &BTreeSet::new(), &roms).unwrap();
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn match_exact_set_filter_includes() {
-        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 100, "abc")];
-        let filter = BTreeSet::from([1i64.into()]);
-        let result = match_exact(100, "abc", &filter, &roms).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].set_id, 1i64.into());
-    }
-
-    #[test]
-    fn match_exact_set_filter_excludes_all() {
-        let roms = [make_rom(1, 1, 1, 100, "abc")];
-        let filter = BTreeSet::from([99i64.into()]);
-        assert!(match_exact(100, "abc", &filter, &roms).is_none());
-    }
-
-    // --- match_names ---
-
-    #[test]
-    fn match_names_empty_roms() {
-        assert!(match_names(&BTreeSet::new(), &[]).is_none());
-    }
-
-    #[test]
-    fn match_names_returns_all_unfiltered() {
-        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 200, "def")];
-        let result = match_names(&BTreeSet::new(), &roms).unwrap();
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|m| m.status == db::MatchStatus::Name));
-    }
-
-    #[test]
-    fn match_names_set_filter() {
-        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 200, "def")];
-        let filter = BTreeSet::from([2i64.into()]);
-        let result = match_names(&filter, &roms).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].set_id, 2i64.into());
-    }
-
-    #[test]
-    fn match_names_set_filter_excludes_all() {
-        let roms = [make_rom(1, 1, 1, 100, "abc")];
-        let filter = BTreeSet::from([99i64.into()]);
-        assert!(match_names(&filter, &roms).is_none());
-    }
-
-    // --- match_hashes ---
-
-    #[test]
-    fn match_hashes_empty_roms() {
-        assert!(match_hashes(&BTreeSet::new(), &[]).is_none());
-    }
-
-    #[test]
-    fn match_hashes_returns_all_unfiltered() {
-        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 200, "def")];
-        let result = match_hashes(&BTreeSet::new(), &roms).unwrap();
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|m| m.status == db::MatchStatus::Hash));
-    }
-
-    #[test]
-    fn match_hashes_set_filter() {
-        let roms = [make_rom(1, 1, 1, 100, "abc"), make_rom(2, 1, 2, 200, "def")];
-        let filter = BTreeSet::from([1i64.into()]);
-        let result = match_hashes(&filter, &roms).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].set_id, 1i64.into());
-    }
-
-    #[test]
-    fn match_hashes_set_filter_excludes_all() {
-        let roms = [make_rom(1, 1, 1, 100, "abc")];
-        let filter = BTreeSet::from([99i64.into()]);
-        assert!(match_hashes(&filter, &roms).is_none());
-    }
-
     // --- should_display_file_status ---
 
     #[test]
@@ -2155,49 +1117,6 @@ mod tests {
         assert!(!should_display_file_status(Some(db::MatchStatus::Match), SelectMode::Unmatched));
     }
 
-    // --- resolve_match ---
-
-    #[test]
-    fn resolve_match_exact_when_name_and_hash_match() {
-        let named = [make_rom(1, 1, 1, 100, "abc")];
-        let hash = [make_rom(1, 1, 1, 100, "abc")];
-        let result = resolve_match(100, "abc", &BTreeSet::new(), &named, &hash).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].status, db::MatchStatus::Match);
-    }
-
-    #[test]
-    fn resolve_match_hash_match_beats_name_only() {
-        // name matches but hash is wrong; a different rom matches by hash — expect Hash status
-        let named = [make_rom(1, 1, 1, 100, "xyz")];
-        let hash_roms = [make_rom(2, 1, 2, 999, "abc")];
-        let result = resolve_match(100, "abc", &BTreeSet::new(), &named, &hash_roms).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].status, db::MatchStatus::Hash);
-        assert_eq!(result[0].rom_id, 2i64.into());
-    }
-
-    #[test]
-    fn resolve_match_name_only_when_no_hash_match() {
-        // name matches but hash is wrong, and no hash-only match exists — expect Name status
-        let named = [make_rom(1, 1, 1, 100, "xyz")];
-        let result = resolve_match(100, "abc", &BTreeSet::new(), &named, &[]).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].status, db::MatchStatus::Name);
-    }
-
-    #[test]
-    fn resolve_match_none_when_no_named_and_no_hash() {
-        assert!(resolve_match(100, "abc", &BTreeSet::new(), &[], &[]).is_none());
-    }
-
-    #[test]
-    fn resolve_match_none_when_no_named_and_hash_filtered_out() {
-        let hash_roms = [make_rom(2, 1, 2, 999, "abc")];
-        let filter = BTreeSet::from([99i64.into()]);
-        assert!(resolve_match(100, "abc", &filter, &[], &hash_roms).is_none());
-    }
-
     // --- calculate_set_status ---
 
     #[test]
@@ -2227,7 +1146,7 @@ mod tests {
         assert_eq!(calculate_set_status(&roms, &matched_ids), SetStatus::Complete);
     }
 
-    // --- read_zip_entries ---
+    // --- test helpers ---
 
     fn create_test_zip(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
         use zip::write::SimpleFileOptions;
@@ -2239,53 +1158,5 @@ mod tests {
         }
         writer.finish().unwrap();
         tmp
-    }
-
-    fn open_test_zip(tmp: &tempfile::NamedTempFile) -> zip::ZipArchive<File> {
-        let file = File::open(tmp.path()).unwrap();
-        zip::ZipArchive::new(file).unwrap()
-    }
-
-    #[test]
-    fn read_zip_entries_returns_all_files() {
-        let tmp = create_test_zip(&[("a.rom", b"hello"), ("b.rom", b"world")]);
-        let mut zip = open_test_zip(&tmp);
-        let entries = read_zip_entries(&mut zip, &[]).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "a.rom");
-        assert_eq!(entries[1].name, "b.rom");
-        assert!(entries[0].size > 0);
-        assert!(entries[1].size > 0);
-    }
-
-    #[test]
-    fn read_zip_entries_excludes_extensions() {
-        let tmp = create_test_zip(&[("a.rom", b"data"), ("readme.txt", b"info")]);
-        let mut zip = open_test_zip(&tmp);
-        let exclude = vec!["txt".to_string()];
-        let entries = read_zip_entries(&mut zip, &exclude).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "a.rom");
-    }
-
-    #[test]
-    fn read_zip_entries_produces_consistent_crc_and_size() {
-        let content = b"deterministic content";
-        let tmp1 = create_test_zip(&[("file.rom", content)]);
-        let tmp2 = create_test_zip(&[("file.rom", content)]);
-        let mut zip1 = open_test_zip(&tmp1);
-        let mut zip2 = open_test_zip(&tmp2);
-        let entries1 = read_zip_entries(&mut zip1, &[]).unwrap();
-        let entries2 = read_zip_entries(&mut zip2, &[]).unwrap();
-        assert_eq!(entries1[0].crc, entries2[0].crc);
-        assert_eq!(entries1[0].size, entries2[0].size);
-    }
-
-    #[test]
-    fn read_zip_entries_empty_zip() {
-        let tmp = create_test_zip(&[]);
-        let mut zip = open_test_zip(&tmp);
-        let entries = read_zip_entries(&mut zip, &[]).unwrap();
-        assert!(entries.is_empty());
     }
 }
