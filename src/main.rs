@@ -6,6 +6,7 @@ mod cli;
 mod completion;
 mod dat;
 mod db;
+mod matching;
 mod scan;
 mod util;
 
@@ -23,7 +24,8 @@ use rustyline::{Config, Editor};
 use crate::cli::{Args, Cli, Commands, CompletionHelper, DataCommands, FileCommands, SelectMode, TermInfo};
 use crate::completion::build_completions;
 use crate::db::{Deletable, DeletableByDat, FindableByName, Insertable, Queryable, QueryableByDat};
-use crate::scan::{DatContext, ScanOptions, match_roms_and_insert, match_sets, read_zip_entries, scan_files};
+use crate::matching::{DatContext, match_roms_and_insert, match_sets};
+use crate::scan::{ScanOptions, read_zip_entries, scan_files};
 use crate::util::{OptionIf, ResultIf};
 
 const APP_NAME: &str = "rrm";
