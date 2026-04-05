@@ -63,6 +63,9 @@ fn match_roms(
     matched_sets: &BTreeSet<db::SetId>,
 ) -> Result<Option<Vec<FileMatch>>> {
     let named_roms = db::RomRecord::find_by_name(conn, dat_id, &file.name, true)?;
+    if file.hash.is_empty() {
+        return Ok(match_names(matched_sets, &named_roms));
+    }
     let hash_roms = db::RomRecord::find_by_hash_in_dat(conn, dat_id, &file.hash)?;
     Ok(resolve_match(file.size, &file.hash, matched_sets, &named_roms, &hash_roms))
 }
@@ -125,9 +128,7 @@ pub(crate) fn insert_files_and_matches(
         db::NewFile::new(dat_id, dir_id, &scanned_file.name, scanned_file.size, hash.unwrap_or("")),
     )?;
 
-    if hash.is_some() {
-        match_roms_and_insert(conn, dat_id, &file, matched_sets)?;
-    }
+    match_roms_and_insert(conn, dat_id, &file, matched_sets)?;
     Ok(())
 }
 
@@ -191,10 +192,12 @@ mod tests {
     }
 
     #[test]
-    fn insert_files_and_matches_skips_matching_when_hash_missing() {
+    fn insert_files_and_matches_matches_by_name_when_hash_missing() {
         let conn = db::tests::mem_db();
         let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
         let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "Matched Set")).unwrap();
+        let rom = db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "candidate.rom", 123, "abc123", None))
+            .unwrap();
         let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
         let matched_sets = BTreeSet::from([set.id]);
         let scanned_file = ScannedFile {
@@ -209,6 +212,11 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "candidate.rom");
         assert_eq!(files[0].hash, "");
+
+        let matches = db::MatchRecord::get_by_dat(&conn, dat.id).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, db::MatchStatus::Name);
+        assert_eq!(matches[0].rom_id, rom.id);
     }
 
     #[test]
@@ -502,6 +510,25 @@ mod tests {
     }
 
     #[test]
+    fn match_roms_name_only_match_when_hash_is_wrong() {
+        let conn = db::tests::mem_db();
+        let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
+        let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "TestSet")).unwrap();
+        let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
+        let rom =
+            db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "game.rom", 512, "correct_hash", None)).unwrap();
+        let file =
+            db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "game.rom", 512, "wrong_hash")).unwrap();
+
+        let result = match_roms(&conn, dat.id, &file, &BTreeSet::new()).unwrap();
+        assert!(result.is_some());
+        let matches = result.unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, db::MatchStatus::Name);
+        assert_eq!(matches[0].rom_id, rom.id);
+    }
+
+    #[test]
     fn match_roms_no_match() {
         let conn = db::tests::mem_db();
         let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
@@ -510,5 +537,36 @@ mod tests {
             .unwrap();
         let result = match_roms(&conn, dat.id, &file, &BTreeSet::new()).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn match_roms_skips_hash_matching_when_file_hash_empty() {
+        let conn = db::tests::mem_db();
+        let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
+        let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "TestSet")).unwrap();
+        let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
+        let _rom = db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "original.rom", 512, "", None)).unwrap();
+        let file = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "renamed.rom", 512, "")).unwrap();
+
+        let result = match_roms(&conn, dat.id, &file, &BTreeSet::new()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn match_roms_returns_name_match_when_file_hash_empty() {
+        let conn = db::tests::mem_db();
+        let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
+        let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "TestSet")).unwrap();
+        let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
+        let rom = db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "same-name.rom", 512, "realhash", None))
+            .unwrap();
+        let file = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "same-name.rom", 999, "")).unwrap();
+
+        let result = match_roms(&conn, dat.id, &file, &BTreeSet::new()).unwrap();
+        assert!(result.is_some());
+        let matches = result.unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, db::MatchStatus::Name);
+        assert_eq!(matches[0].rom_id, rom.id);
     }
 }
