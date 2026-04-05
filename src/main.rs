@@ -24,11 +24,22 @@ use rustyline::{Config, Editor};
 use crate::cli::{Args, Cli, Commands, CompletionHelper, DataCommands, FileCommands, SelectMode, TermInfo};
 use crate::completion::build_completions;
 use crate::db::{Deletable, DeletableByDat, FindableByName, Insertable, Queryable, QueryableByDat};
-use crate::matching::{DatContext, match_roms_and_insert, match_sets};
+use crate::matching::{match_roms_and_insert, match_sets};
 use crate::scan::{ScanOptions, read_zip_entries, scan_files};
 use crate::util::{OptionIf, ResultIf};
 
 const APP_NAME: &str = "rrm";
+
+struct DatContext<'a> {
+    conn: &'a Connection,
+    dat_id: db::DatId,
+}
+
+impl<'a> DatContext<'a> {
+    fn new(conn: &'a Connection, dat_id: db::DatId) -> Self {
+        Self { conn, dat_id }
+    }
+}
 
 macro_rules! println_if {
     ($cond:expr, $($arg:tt)*) => {
@@ -503,11 +514,9 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     //delete all existing matches for the old dat, we'll re-match them as we relink directories and files to the new dat
     db::MatchRecord::delete_by_dat(conn, old_dat_id)?;
 
-    let new_context = DatContext::new(conn, imported.id);
-
     for directory in db::DirRecord::get_by_dat(conn, old_dat_id)? {
         if util::is_zip_file(&directory.path) {
-            let matched_sets = match_sets(&new_context, &directory.path)?;
+            let matched_sets = match_sets(conn, imported.id, &directory.path)?;
             let zip_file = File::open(&directory.path)?;
             let mut zip = zip::ZipArchive::new(zip_file)
                 .with_context(|| format!("could not open '{}' as a zip file", directory.path))?;
@@ -519,13 +528,13 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
                 // Zip entries may have been left unhashed during the original scan,
                 // so recover the hash only when the new DAT makes it relevant.
                 let file = ensure_hash_for_update(conn, &mut zip, &directory.path, &zip_entries, &file, &new_rom_crcs)?;
-                match_roms_and_insert(&new_context, &file, &matched_sets)?;
+                match_roms_and_insert(conn, imported.id, &file, &matched_sets)?;
             }
         } else {
             let matched_sets = BTreeSet::new();
             for file in directory.get_files(conn)? {
                 // Loose files are always hashed during scan, so no recovery path is needed.
-                match_roms_and_insert(&new_context, &file, &matched_sets)?;
+                match_roms_and_insert(conn, imported.id, &file, &matched_sets)?;
             }
         }
     }

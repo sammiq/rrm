@@ -10,7 +10,7 @@ use rusqlite::Transaction;
 
 use crate::cli::TermInfo;
 use crate::db::{self, Deletable, DeletableByDat, Insertable};
-use crate::matching::{DatContext, ScannedFile, insert_files_and_matches, match_sets};
+use crate::matching::{ScannedFile, insert_files_and_matches, match_sets};
 use crate::util::{self, ResultIf};
 
 const ANSI_CURSOR_START: &str = "\x1B[1000D";
@@ -208,7 +208,7 @@ fn scan_directory(
     // Insert hashed loose files
     let matched_sets = BTreeSet::new();
     for scanned_file in &hashed_files {
-        match insert_files_and_matches(&DatContext::new(tx, dat_id), dir.id, scanned_file, &matched_sets) {
+        match insert_files_and_matches(tx, dat_id, dir.id, scanned_file, &matched_sets) {
             Ok(_) => file_count += 1,
             Err(e) => eprintln!("Failed to insert {}. Error: {e}", scanned_file.name),
         }
@@ -218,9 +218,8 @@ fn scan_directory(
     // Insert hashed zip entries, each zip in its own savepoint
     for (path, entries) in hashed_zips {
         match db::with_savepoint(tx, |sp| {
-            let ctx = DatContext::new(sp, dat_id);
-            let zip_dir = db::DirRecord::insert(ctx.conn, db::NewDir::new(dat_id, path.as_str()))?;
-            let matched = match_sets(&ctx, path)?;
+            let zip_dir = db::DirRecord::insert(sp, db::NewDir::new(dat_id, path.as_str()))?;
+            let matched = match_sets(sp, dat_id, path)?;
             let entry_count = entries.len() as u64;
             for entry in entries {
                 let scanned_file = ScannedFile {
@@ -228,7 +227,7 @@ fn scan_directory(
                     size: entry.size,
                     hash: entry.hash,
                 };
-                insert_files_and_matches(&ctx, zip_dir.id, &scanned_file, &matched)?;
+                insert_files_and_matches(sp, dat_id, zip_dir.id, &scanned_file, &matched)?;
             }
             Ok(entry_count)
         }) {
