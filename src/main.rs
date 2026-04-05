@@ -30,14 +30,21 @@ use crate::util::{OptionIf, ResultIf};
 
 const APP_NAME: &str = "rrm";
 
-struct DatContext<'a> {
+struct ListContext<'a> {
     conn: &'a Connection,
     dat_id: db::DatId,
+    term: &'a TermInfo,
+    partial_name: Option<&'a str>,
 }
 
-impl<'a> DatContext<'a> {
-    fn new(conn: &'a Connection, dat_id: db::DatId) -> Self {
-        Self { conn, dat_id }
+impl<'a> ListContext<'a> {
+    fn new(conn: &'a Connection, dat_id: db::DatId, term: &'a TermInfo, partial_name: Option<&'a str>) -> Self {
+        Self {
+            conn,
+            dat_id,
+            term,
+            partial_name,
+        }
     }
 }
 
@@ -312,13 +319,15 @@ fn handle_file_commands(
             db::with_transaction_mut(conn, |tx| scan_files(tx, dat_id, term, &scan_path, &options))
         }
         FileCommands::List { mode, partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, *mode, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_scanned_files(&ctx, *mode)
         }
         FileCommands::Sets { missing, partial_name } => {
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
             if *missing {
-                list_missing_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
+                list_missing_sets(&ctx)
             } else {
-                list_found_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
+                list_found_sets(&ctx)
             }
         }
         FileCommands::Sort { mode, path, keep } => {
@@ -326,16 +335,20 @@ fn handle_file_commands(
         }
         FileCommands::Rename => db::with_transaction_mut(conn, |tx| rename_files(tx, dat_id, term)),
         FileCommands::Matched { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Matched, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_scanned_files(&ctx, SelectMode::Matched)
         }
         FileCommands::Missing { partial_name } => {
-            list_missing_sets(&DatContext::new(conn, dat_id), term, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_missing_sets(&ctx)
         }
         FileCommands::Unmatched { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Unmatched, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_scanned_files(&ctx, SelectMode::Unmatched)
         }
         FileCommands::Warning { partial_name } => {
-            list_scanned_files(&DatContext::new(conn, dat_id), term, SelectMode::Warning, partial_name.as_deref())
+            let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
+            list_scanned_files(&ctx, SelectMode::Warning)
         }
     }
 }
@@ -689,12 +702,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-fn list_scanned_files(
-    ctx: &DatContext<'_>,
-    term: &TermInfo,
-    mode: SelectMode,
-    partial_name: Option<&str>,
-) -> Result<()> {
+fn list_scanned_files(ctx: &ListContext<'_>, mode: SelectMode) -> Result<()> {
     //get these in bulk to avoid doing a query per file when we display them
     let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     let matches_by_file: BTreeMap<_, Vec<_>> = matches.iter().fold(BTreeMap::new(), |mut acc, m| {
@@ -711,7 +719,7 @@ fn list_scanned_files(
 
     let dirs = db::DirRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     for dir in dirs {
-        let files = if let Some(partial_name) = partial_name {
+        let files = if let Some(partial_name) = ctx.partial_name {
             dir.find_files(ctx.conn, partial_name, false)?
         } else {
             dir.get_files(ctx.conn)?
@@ -729,11 +737,11 @@ fn list_scanned_files(
                         let rom = roms_by_id
                             .get(&fm.rom_id)
                             .ok_or_else(|| anyhow!("match references missing rom id {:?}", fm.rom_id))?;
-                        lines.push(format_match_status(&file, Some((fm, rom)), term.tty_out));
+                        lines.push(format_match_status(&file, Some((fm, rom)), ctx.term.tty_out));
                     }
                 }
             } else if should_display_file_status(None, mode) {
-                lines.push(format_match_status(&file, None, term.tty_out));
+                lines.push(format_match_status(&file, None, ctx.term.tty_out));
             }
         }
 
@@ -777,7 +785,7 @@ fn format_set_indicator(status: SetStatus, is_tty: bool) -> &'static str {
     }
 }
 
-fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&str>) -> Result<()> {
+fn list_missing_sets(ctx: &ListContext<'_>) -> Result<()> {
     let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     let all_sets = db::SetRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
 
@@ -787,9 +795,9 @@ fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option
     });
 
     println!("--- MISSING SETS ---");
-    let status = format_set_indicator(SetStatus::Missing, term.tty_out);
+    let status = format_set_indicator(SetStatus::Missing, ctx.term.tty_out);
     for set in &all_sets {
-        if let Some(partial_name) = partial_name
+        if let Some(partial_name) = ctx.partial_name
             && !contains_ascii_case_insensitive(&set.name, partial_name)
         {
             continue;
@@ -800,7 +808,7 @@ fn list_missing_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option
     Ok(())
 }
 
-fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&str>) -> Result<()> {
+fn list_found_sets(ctx: &ListContext<'_>) -> Result<()> {
     //get all the matches so we know what sets we found
     let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     let set_ids: BTreeSet<_> = matches.iter().map(|m| m.set_id).collect();
@@ -818,10 +826,10 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
     let all_set_count = db::SetRecord::get_num_by_dat(ctx.conn, ctx.dat_id)?;
 
     println!("--- FOUND SETS ---");
-    let partial_status = format_set_indicator(SetStatus::Partial, term.tty_out);
-    let complete_status = format_set_indicator(SetStatus::Complete, term.tty_out);
+    let partial_status = format_set_indicator(SetStatus::Partial, ctx.term.tty_out);
+    let complete_status = format_set_indicator(SetStatus::Complete, ctx.term.tty_out);
     for set in &found_sets {
-        if let Some(partial_name) = partial_name
+        if let Some(partial_name) = ctx.partial_name
             && !contains_ascii_case_insensitive(&set.name, partial_name)
         {
             continue;
@@ -846,11 +854,11 @@ fn list_found_sets(ctx: &DatContext<'_>, term: &TermInfo, partial_name: Option<&
                 let rom = roms_by_romid
                     .get(&matched.rom_id)
                     .ok_or_else(|| anyhow!("set match references missing rom id {:?}", matched.rom_id))?;
-                let status = format_match_status(file, Some((matched, rom)), term.tty_out);
+                let status = format_match_status(file, Some((matched, rom)), ctx.term.tty_out);
                 println!(" {status}");
             }
 
-            let missing_indicator = format_file_indicator(None, term.tty_out);
+            let missing_indicator = format_file_indicator(None, ctx.term.tty_out);
             for rom in set_roms {
                 println_if!(
                     !matched_rom_ids.contains(&rom.id),
