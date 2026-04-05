@@ -27,6 +27,13 @@ pub(crate) struct FileMatch {
     pub rom_id: db::RomId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScannedFile {
+    pub name: String,
+    pub size: u64,
+    pub hash: Option<String>,
+}
+
 pub(crate) fn match_sets<P: AsRef<Utf8Path>>(ctx: &DatContext<'_>, path: P) -> Result<BTreeSet<db::SetId>> {
     let name = path.as_ref().file_prefix().context("should have a file name")?;
     let sets = db::SetRecord::find_by_name(ctx.conn, ctx.dat_id, name, true)?;
@@ -118,15 +125,14 @@ fn match_hashes(matched_sets: &BTreeSet<db::Id<db::SetRecord>>, hash_roms: &[db:
 
 pub(crate) fn insert_files_and_matches(
     ctx: &DatContext<'_>,
-    dir_id: &db::DirId,
-    file_name: &str,
-    file_size: u64,
-    hash: Option<&str>,
+    dir_id: db::DirId,
+    scanned_file: &ScannedFile,
     matched_sets: &BTreeSet<db::SetId>,
 ) -> Result<()> {
+    let hash = scanned_file.hash.as_deref();
     let file = db::FileRecord::insert(
         ctx.conn,
-        db::NewFile::new(ctx.dat_id, *dir_id, file_name, file_size, hash.unwrap_or("")),
+        db::NewFile::new(ctx.dat_id, dir_id, &scanned_file.name, scanned_file.size, hash.unwrap_or("")),
     )?;
 
     if hash.is_some() {
@@ -178,8 +184,13 @@ mod tests {
         let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
         let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
         let ctx = DatContext::new(&conn, dat.id);
+        let scanned_file = ScannedFile {
+            name: "unknown.rom".to_string(),
+            size: 123,
+            hash: None,
+        };
 
-        insert_files_and_matches(&ctx, &dir.id, "unknown.rom", 123, None, &BTreeSet::new()).unwrap();
+        insert_files_and_matches(&ctx, dir.id, &scanned_file, &BTreeSet::new()).unwrap();
 
         let files = dir.get_files(&conn).unwrap();
         assert_eq!(files.len(), 1);
@@ -197,8 +208,13 @@ mod tests {
         let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
         let ctx = DatContext::new(&conn, dat.id);
         let matched_sets = BTreeSet::from([set.id]);
+        let scanned_file = ScannedFile {
+            name: "candidate.rom".to_string(),
+            size: 123,
+            hash: None,
+        };
 
-        insert_files_and_matches(&ctx, &dir.id, "candidate.rom", 123, None, &matched_sets).unwrap();
+        insert_files_and_matches(&ctx, dir.id, &scanned_file, &matched_sets).unwrap();
 
         let files = dir.get_files(&conn).unwrap();
         assert_eq!(files.len(), 1);
@@ -215,8 +231,13 @@ mod tests {
             db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "test.rom", 100, "abc123", None)).unwrap();
         let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
         let ctx = DatContext::new(&conn, dat.id);
+        let scanned_file = ScannedFile {
+            name: "test.rom".to_string(),
+            size: 100,
+            hash: Some("abc123".to_string()),
+        };
 
-        insert_files_and_matches(&ctx, &dir.id, "test.rom", 100, Some("abc123"), &BTreeSet::new()).unwrap();
+        insert_files_and_matches(&ctx, dir.id, &scanned_file, &BTreeSet::new()).unwrap();
 
         let matches = db::MatchRecord::get_by_dat(&conn, dat.id).unwrap();
         assert_eq!(matches.len(), 1);

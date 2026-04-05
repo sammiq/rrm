@@ -10,7 +10,7 @@ use rusqlite::Transaction;
 
 use crate::cli::TermInfo;
 use crate::db::{self, Deletable, DeletableByDat, Insertable};
-use crate::matching::{DatContext, insert_files_and_matches, match_sets};
+use crate::matching::{DatContext, ScannedFile, insert_files_and_matches, match_sets};
 use crate::util::{self, ResultIf};
 
 const ANSI_CURSOR_START: &str = "\x1B[1000D";
@@ -144,7 +144,11 @@ fn scan_directory(
                             util::calc_hash(&mut reader)
                         });
                         match result {
-                            Ok((hash, file_size)) => Some((filename.as_str(), hash, file_size)),
+                            Ok((hash, file_size)) => Some(ScannedFile {
+                                name: filename.to_string(),
+                                size: file_size,
+                                hash: Some(hash),
+                            }),
                             Err(e) => {
                                 eprintln!("Failed to scan {}. Error: {e}", path);
                                 None
@@ -203,17 +207,10 @@ fn scan_directory(
 
     // Insert hashed loose files
     let matched_sets = BTreeSet::new();
-    for (filename, hash, file_size) in &hashed_files {
-        match insert_files_and_matches(
-            &DatContext::new(tx, dat_id),
-            &dir.id,
-            filename,
-            *file_size,
-            Some(hash),
-            &matched_sets,
-        ) {
+    for scanned_file in &hashed_files {
+        match insert_files_and_matches(&DatContext::new(tx, dat_id), dir.id, scanned_file, &matched_sets) {
             Ok(_) => file_count += 1,
-            Err(e) => eprintln!("Failed to insert {}. Error: {e}", filename),
+            Err(e) => eprintln!("Failed to insert {}. Error: {e}", scanned_file.name),
         }
         progress_fn(file_count);
     }
@@ -224,10 +221,16 @@ fn scan_directory(
             let ctx = DatContext::new(sp, dat_id);
             let zip_dir = db::DirRecord::insert(ctx.conn, db::NewDir::new(dat_id, path.as_str()))?;
             let matched = match_sets(&ctx, path)?;
-            for entry in &entries {
-                insert_files_and_matches(&ctx, &zip_dir.id, &entry.name, entry.size, entry.hash.as_deref(), &matched)?;
+            let entry_count = entries.len() as u64;
+            for entry in entries {
+                let scanned_file = ScannedFile {
+                    name: entry.name,
+                    size: entry.size,
+                    hash: entry.hash,
+                };
+                insert_files_and_matches(&ctx, zip_dir.id, &scanned_file, &matched)?;
             }
-            Ok(entries.len() as u64)
+            Ok(entry_count)
         }) {
             Ok(count) => {
                 file_count += count;
@@ -238,7 +241,7 @@ fn scan_directory(
     }
 
     if incremental {
-        remove_stale_entries(&DatContext::new(tx, dat_id), subdirs_by_path, files_by_name);
+        remove_stale_entries(tx, dat_id, subdirs_by_path, files_by_name);
     }
 
     Ok(file_count)
@@ -248,7 +251,8 @@ fn scan_directory(
 /// but were not encountered in the current one. Directories that still exist on disk are
 /// left alone — the user may have simply omitted the `--recursive` flag.
 fn remove_stale_entries<'a>(
-    ctx: &DatContext<'_>,
+    conn: &rusqlite::Connection,
+    dat_id: db::DatId,
     stale_subdirs: BTreeSet<&'a str>,
     stale_files: BTreeMap<&'a str, &'a db::FileRecord>,
 ) {
@@ -258,11 +262,11 @@ fn remove_stale_entries<'a>(
             // forgets the --recursive flag.
             continue;
         }
-        match db::DirRecord::find_by_path_in_dat(ctx.conn, ctx.dat_id, existing_path) {
+        match db::DirRecord::find_by_path_in_dat(conn, dat_id, existing_path) {
             Ok(Some(dir)) => {
-                dir.delete_matches(ctx.conn)
-                    .and_then(|_| dir.delete_files(ctx.conn))
-                    .and_then(|_| db::DirRecord::delete_by_id(ctx.conn, dir.id))
+                dir.delete_matches(conn)
+                    .and_then(|_| dir.delete_files(conn))
+                    .and_then(|_| db::DirRecord::delete_by_id(conn, dir.id))
                     .if_err(|e| eprintln!("Failed to delete directory {}. Error: {e}", existing_path));
             }
             Ok(None) => eprintln!("Failed to find directory entry {}.", existing_path),
@@ -271,8 +275,8 @@ fn remove_stale_entries<'a>(
     }
     for (_, existing_file) in stale_files {
         existing_file
-            .delete_matches(ctx.conn)
-            .and_then(|_| db::FileRecord::delete_by_id(ctx.conn, existing_file.id))
+            .delete_matches(conn)
+            .and_then(|_| db::FileRecord::delete_by_id(conn, existing_file.id))
             .if_err(|e| eprintln!("Failed to remove {}. Error: {e}", existing_file.name));
     }
 }
