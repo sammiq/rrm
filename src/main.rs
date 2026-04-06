@@ -329,29 +329,23 @@ fn handle_file_commands(
 }
 
 /// Classify a file into a SelectMode based on its match records.
-fn classify_file(conn: &Connection, file: &db::FileRecord) -> Result<SelectMode> {
-    let matches = db::MatchRecord::get_by_file_id(conn, file.id)?;
-    if matches.is_empty() {
-        return Ok(SelectMode::Unmatched);
-    }
-    if matches.iter().any(|m| m.status == db::MatchStatus::Match) {
-        Ok(SelectMode::Matched)
-    } else {
-        Ok(SelectMode::Warning)
-    }
+fn classify_file(file: &db::FileRecord, file_modes: &BTreeMap<db::FileId, SelectMode>) -> SelectMode {
+    file_modes
+        .get(&file.id)
+        .copied()
+        .unwrap_or(SelectMode::Unmatched)
 }
 
 /// Classify a zip directory based on the statuses of all files inside it.
 /// Returns Unmatched if no files have any matches, Matched if all files are Match, Warning otherwise.
-fn classify_zip(conn: &Connection, dir: &db::DirRecord) -> Result<SelectMode> {
-    let files = dir.get_files(conn)?;
+fn classify_zip(files: &[db::FileRecord], file_modes: &BTreeMap<db::FileId, SelectMode>) -> SelectMode {
     if files.is_empty() {
-        return Ok(SelectMode::Unmatched);
+        return SelectMode::Unmatched;
     }
     let mut all_matched = true;
     let mut any_matched = false;
-    for file in &files {
-        match classify_file(conn, file)? {
+    for file in files {
+        match classify_file(file, file_modes) {
             SelectMode::Matched => any_matched = true,
             SelectMode::Unmatched => all_matched = false,
             _ => {
@@ -361,12 +355,42 @@ fn classify_zip(conn: &Connection, dir: &db::DirRecord) -> Result<SelectMode> {
         }
     }
     if !any_matched {
-        Ok(SelectMode::Unmatched)
+        SelectMode::Unmatched
     } else if all_matched {
-        Ok(SelectMode::Matched)
+        SelectMode::Matched
     } else {
-        Ok(SelectMode::Warning)
+        SelectMode::Warning
     }
+}
+
+/// Build per-file sort mode in one pass over match records for the dat.
+fn get_file_modes(conn: &Connection, dat_id: db::DatId) -> Result<BTreeMap<db::FileId, SelectMode>> {
+    let mut file_modes = BTreeMap::new();
+    for matched in db::MatchRecord::get_by_dat(conn, dat_id)? {
+        let mode = file_modes.entry(matched.file_id).or_insert(SelectMode::Warning);
+        if matched.status == db::MatchStatus::Match {
+            *mode = SelectMode::Matched;
+        }
+    }
+    Ok(file_modes)
+}
+
+/// Bulk-load all directories and files for a dat, grouped by directory.
+/// This avoids calling `dir.get_files()` inside loops.
+fn get_dirs_with_files(conn: &Connection, dat_id: db::DatId) -> Result<Vec<(db::DirRecord, Vec<db::FileRecord>)>> {
+    let dirs = db::DirRecord::get_by_dat(conn, dat_id)?;
+    let mut files_by_dir: BTreeMap<db::DirId, Vec<db::FileRecord>> = BTreeMap::new();
+    for file in db::FileRecord::get_by_dat(conn, dat_id)? {
+        files_by_dir.entry(file.dir_id).or_default().push(file);
+    }
+
+    let mut dirs_with_files = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let mut files = files_by_dir.remove(&dir.id).unwrap_or_default();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        dirs_with_files.push((dir, files));
+    }
+    Ok(dirs_with_files)
 }
 
 fn subdir_name(mode: SelectMode) -> Option<&'static str> {
@@ -415,11 +439,12 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
 
     // Cache of destination DirRecords (path -> DirId) for keep mode
     let mut dest_dirs: BTreeMap<String, db::DirId> = BTreeMap::new();
+    let file_modes = get_file_modes(tx, dat_id)?;
 
-    for dir in db::DirRecord::get_by_dat(tx, dat_id)? {
+    for (dir, files) in get_dirs_with_files(tx, dat_id)? {
         if util::is_zip_file(&dir.path) {
             // Classify the zip as a whole
-            let zip_mode = classify_zip(tx, &dir)?;
+            let zip_mode = classify_zip(&files, &file_modes);
             if mode != SelectMode::All && mode != zip_mode {
                 continue;
             }
@@ -448,9 +473,8 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
             }
         } else {
             // Loose files: handle each file individually
-            let files = dir.get_files(tx)?;
             for file in &files {
-                let file_mode = classify_file(tx, file)?;
+                let file_mode = classify_file(file, &file_modes);
                 if mode != SelectMode::All && mode != file_mode {
                     continue;
                 }
@@ -489,7 +513,7 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     //delete all existing matches for the old dat, we'll re-match them as we relink directories and files to the new dat
     db::MatchRecord::delete_by_dat(conn, old_dat_id)?;
 
-    for directory in db::DirRecord::get_by_dat(conn, old_dat_id)? {
+    for (directory, files) in get_dirs_with_files(conn, old_dat_id)? {
         if util::is_zip_file(&directory.path) {
             let matched_sets = match_sets(conn, imported.id, &directory.path)?;
             let zip_file = File::open(&directory.path)?;
@@ -499,7 +523,7 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
                 .into_iter()
                 .map(|entry| (entry.name.clone(), entry))
                 .collect();
-            for file in directory.get_files(conn)? {
+            for file in files {
                 // Zip entries may have been left unhashed during the original scan,
                 // so recover the hash only when the new DAT makes it relevant.
                 let file = ensure_hash_for_update(conn, &mut zip, &directory.path, &zip_entries, &file, &new_rom_crcs)?;
@@ -507,7 +531,7 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
             }
         } else {
             let matched_sets = BTreeSet::new();
-            for file in directory.get_files(conn)? {
+            for file in files {
                 // Loose files are always hashed during scan, so no recovery path is needed.
                 match_roms_and_insert(conn, imported.id, &file, &matched_sets)?;
             }
@@ -566,12 +590,11 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
         .map(|r| (r.id, r))
         .collect();
 
-    for directory in db::DirRecord::get_by_dat(tx, dat_id)? {
+    for (directory, files) in get_dirs_with_files(tx, dat_id)? {
         if util::is_zip_file(&directory.path) {
             continue;
         }
 
-        let files = directory.get_files(tx)?;
         let mut matches_by_name = BTreeMap::new();
         for file in &files {
             if let Some(file_matches) = matches_by_file.get(&file.id) {
@@ -619,6 +642,77 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn get_file_modes_marks_match_vs_warning_and_omits_unmatched() {
+        let conn = db::tests::mem_db();
+        let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
+        let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "Set")).unwrap();
+        let rom = db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "rom.bin", 1, "abc", None)).unwrap();
+        let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/tmp")).unwrap();
+
+        let file_match = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "match.bin", 1, "abc")).unwrap();
+        let file_warn = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "warn.bin", 1, "def")).unwrap();
+        let file_unmatched =
+            db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "none.bin", 1, "ghi")).unwrap();
+
+        db::MatchRecord::insert(&conn, db::NewMatch::new(dat.id, file_match.id, db::MatchStatus::Match, set.id, rom.id))
+            .unwrap();
+        db::MatchRecord::insert(&conn, db::NewMatch::new(dat.id, file_warn.id, db::MatchStatus::Hash, set.id, rom.id))
+            .unwrap();
+
+        let modes = get_file_modes(&conn, dat.id).unwrap();
+        assert_eq!(modes.get(&file_match.id), Some(&SelectMode::Matched));
+        assert_eq!(modes.get(&file_warn.id), Some(&SelectMode::Warning));
+        assert!(!modes.contains_key(&file_unmatched.id));
+    }
+
+    #[test]
+    fn classify_helpers_use_precomputed_modes() {
+        let conn = db::tests::mem_db();
+        let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
+        let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/tmp")).unwrap();
+
+        let matched_file = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "a.bin", 1, "a")).unwrap();
+        let warning_file = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "b.bin", 1, "b")).unwrap();
+        let unmatched_file = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "c.bin", 1, "c")).unwrap();
+
+        let mut modes = BTreeMap::new();
+        modes.insert(matched_file.id, SelectMode::Matched);
+        modes.insert(warning_file.id, SelectMode::Warning);
+
+        assert_eq!(classify_file(&matched_file, &modes), SelectMode::Matched);
+        assert_eq!(classify_file(&unmatched_file, &modes), SelectMode::Unmatched);
+
+        assert_eq!(classify_zip(&[matched_file.clone()], &modes), SelectMode::Matched);
+        assert_eq!(classify_zip(&[warning_file.clone()], &modes), SelectMode::Warning);
+        assert_eq!(classify_zip(&[unmatched_file.clone()], &modes), SelectMode::Unmatched);
+        assert_eq!(
+            classify_zip(&[matched_file, warning_file, unmatched_file], &modes),
+            SelectMode::Warning
+        );
+    }
+
+    #[test]
+    fn get_dirs_with_files_groups_and_sorts_files_by_name() {
+        let conn = db::tests::mem_db();
+        let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
+        let dir1 = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/a")).unwrap();
+        let dir2 = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/b")).unwrap();
+
+        db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir1.id, "z.bin", 1, "1")).unwrap();
+        db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir1.id, "a.bin", 1, "2")).unwrap();
+        db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir2.id, "m.bin", 1, "3")).unwrap();
+
+        let grouped = get_dirs_with_files(&conn, dat.id).unwrap();
+        let names_by_dir: BTreeMap<_, Vec<_>> = grouped
+            .into_iter()
+            .map(|(dir, files)| (dir.id, files.into_iter().map(|f| f.name).collect::<Vec<_>>()))
+            .collect();
+
+        assert_eq!(names_by_dir.get(&dir1.id), Some(&vec!["a.bin".to_string(), "z.bin".to_string()]));
+        assert_eq!(names_by_dir.get(&dir2.id), Some(&vec!["m.bin".to_string()]));
+    }
 
     #[test]
     fn update_dat_hashes_hashless_zip_entries_when_set_name_narrows_matches() {

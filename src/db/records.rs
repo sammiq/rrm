@@ -901,6 +901,7 @@ impl MatchRecord {
         Ok(num_deleted)
     }
 
+    #[allow(dead_code)]
     pub fn get_by_file_id(conn: &Connection, file_id: FileId) -> Result<Vec<Self>> {
         let matches =
             sql_query!(conn, Self::table_name(), Self::fields(), where {file_id}, order by "id", Self::from_row)?;
