@@ -17,7 +17,12 @@ pub(crate) struct ListContext<'a> {
 }
 
 impl<'a> ListContext<'a> {
-    pub(crate) fn new(conn: &'a Connection, dat_id: db::DatId, term: &'a TermInfo, partial_name: Option<&'a str>) -> Self {
+    pub(crate) fn new(
+        conn: &'a Connection,
+        dat_id: db::DatId,
+        term: &'a TermInfo,
+        partial_name: Option<&'a str>,
+    ) -> Self {
         Self {
             conn,
             dat_id,

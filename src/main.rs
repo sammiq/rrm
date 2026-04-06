@@ -26,7 +26,9 @@ use crate::cli::{Args, Cli, Commands, CompletionHelper, DataCommands, FileComman
 use crate::completion::build_completions;
 use crate::db::{Deletable, DeletableByDat, Insertable, Queryable, QueryableByDat};
 use crate::display::{ListContext, format_file_indicator};
-use crate::display::{list_dat_files, list_dat_records, list_found_sets, list_missing_sets, list_roms, list_scanned_files, list_sets};
+use crate::display::{
+    list_dat_files, list_dat_records, list_found_sets, list_missing_sets, list_roms, list_scanned_files, list_sets,
+};
 use crate::matching::{match_roms_and_insert, match_sets};
 use crate::scan::{ScanOptions, read_zip_entries, scan_files};
 use crate::util::ResultIf;
@@ -301,11 +303,7 @@ fn handle_file_commands(
         }
         FileCommands::Sets { missing, partial_name } => {
             let ctx = ListContext::new(conn, dat_id, term, partial_name.as_deref());
-            if *missing {
-                list_missing_sets(&ctx)
-            } else {
-                list_found_sets(&ctx)
-            }
+            if *missing { list_missing_sets(&ctx) } else { list_found_sets(&ctx) }
         }
         FileCommands::Sort { mode, path, keep } => {
             db::with_transaction_mut(conn, |tx| sort_files(tx, dat_id, *mode, path, *keep))
