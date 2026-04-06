@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, named_params, params, params_from_iter};
@@ -441,6 +441,62 @@ impl DirRecord {
         FileRecord::get_by_dir(conn, self.id)
     }
 
+    pub fn get_by_dat_with_files(conn: &Connection, dat_id: DatId) -> Result<Vec<(DirRecord, Vec<FileRecord>)>> {
+        let sql = r#"
+            SELECT
+                d.id AS dir_id,
+                d.dat_id AS dir_dat_id,
+                d.path AS dir_path,
+                f.id AS file_id,
+                f.dat_id AS file_dat_id,
+                f.dir_id AS file_dir_id,
+                f.name AS file_name,
+                f.size AS file_size,
+                f.hash AS file_hash
+            FROM dirs d
+            LEFT JOIN files f ON f.dir_id = d.id AND f.dat_id = d.dat_id
+            WHERE d.dat_id = ?1
+            ORDER BY d.path, f.name
+        "#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query([dat_id])?;
+
+        let mut grouped: Vec<(DirRecord, Vec<FileRecord>)> = Vec::new();
+        let mut index_by_dir: BTreeMap<DirId, usize> = BTreeMap::new();
+
+        while let Some(row) = rows.next()? {
+            let dir = DirRecord {
+                id: row.get("dir_id")?,
+                dat_id: row.get("dir_dat_id")?,
+                path: row.get("dir_path")?,
+            };
+
+            let dir_idx = if let Some(idx) = index_by_dir.get(&dir.id) {
+                *idx
+            } else {
+                let idx = grouped.len();
+                index_by_dir.insert(dir.id, idx);
+                grouped.push((dir, Vec::new()));
+                idx
+            };
+
+            if let Some(file_id) = row.get::<_, Option<FileId>>("file_id")? {
+                grouped[dir_idx].1.push(FileRecord {
+                    id: file_id,
+                    dat_id: row.get("file_dat_id")?,
+                    dir_id: row.get("file_dir_id")?,
+                    name: row.get("file_name")?,
+                    size: row.get::<_, StoredU64>("file_size")?.0,
+                    hash: row.get("file_hash")?,
+                });
+            }
+        }
+
+        Ok(grouped)
+    }
+
+    #[allow(dead_code)]
     pub fn find_files(&self, conn: &Connection, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
         FileRecord::find_by_name_in_dir(conn, self.id, name, exact)
     }
@@ -572,6 +628,7 @@ impl FileRecord {
         Ok(matches)
     }
 
+    #[allow(dead_code)]
     pub fn find_by_name_in_dir(conn: &Connection, dir_id: DirId, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
         let matches = if exact {
             sql_query!(conn, Self::table_name(), FileRecord::fields(), where {dir_id, name}, order by "name", Self::from_row)

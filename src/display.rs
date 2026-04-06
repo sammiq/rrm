@@ -186,12 +186,15 @@ pub(crate) fn list_scanned_files(ctx: &ListContext<'_>, mode: SelectMode) -> Res
         }
     }
 
-    let dirs = db::DirRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
-    for dir in dirs {
-        let files = if let Some(partial_name) = ctx.partial_name {
-            dir.find_files(ctx.conn, partial_name, false)?
+    let dirs_with_files = db::DirRecord::get_by_dat_with_files(ctx.conn, ctx.dat_id)?;
+    for (dir, files) in dirs_with_files {
+        let files: Vec<_> = if let Some(partial_name) = ctx.partial_name {
+            files
+                .into_iter()
+                .filter(|f| contains_ascii_case_insensitive(&f.name, partial_name))
+                .collect()
         } else {
-            dir.get_files(ctx.conn)?
+            files
         };
 
         if files.is_empty() {

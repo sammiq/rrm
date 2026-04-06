@@ -375,24 +375,6 @@ fn get_file_modes(conn: &Connection, dat_id: db::DatId) -> Result<BTreeMap<db::F
     Ok(file_modes)
 }
 
-/// Bulk-load all directories and files for a dat, grouped by directory.
-/// This avoids calling `dir.get_files()` inside loops.
-fn get_dirs_with_files(conn: &Connection, dat_id: db::DatId) -> Result<Vec<(db::DirRecord, Vec<db::FileRecord>)>> {
-    let dirs = db::DirRecord::get_by_dat(conn, dat_id)?;
-    let mut files_by_dir: BTreeMap<db::DirId, Vec<db::FileRecord>> = BTreeMap::new();
-    for file in db::FileRecord::get_by_dat(conn, dat_id)? {
-        files_by_dir.entry(file.dir_id).or_default().push(file);
-    }
-
-    let mut dirs_with_files = Vec::with_capacity(dirs.len());
-    for dir in dirs {
-        let mut files = files_by_dir.remove(&dir.id).unwrap_or_default();
-        files.sort_by(|a, b| a.name.cmp(&b.name));
-        dirs_with_files.push((dir, files));
-    }
-    Ok(dirs_with_files)
-}
-
 fn subdir_name(mode: SelectMode) -> Option<&'static str> {
     match mode {
         SelectMode::Matched => Some("matched"),
@@ -441,7 +423,7 @@ fn sort_files(tx: &mut Transaction, dat_id: db::DatId, mode: SelectMode, path: &
     let mut dest_dirs: BTreeMap<String, db::DirId> = BTreeMap::new();
     let file_modes = get_file_modes(tx, dat_id)?;
 
-    for (dir, files) in get_dirs_with_files(tx, dat_id)? {
+    for (dir, files) in db::DirRecord::get_by_dat_with_files(tx, dat_id)? {
         if util::is_zip_file(&dir.path) {
             // Classify the zip as a whole
             let zip_mode = classify_zip(&files, &file_modes);
@@ -513,7 +495,7 @@ fn update_dat(conn: &Connection, dat_file: &Utf8PathBuf, old_dat_id: db::DatId) 
     //delete all existing matches for the old dat, we'll re-match them as we relink directories and files to the new dat
     db::MatchRecord::delete_by_dat(conn, old_dat_id)?;
 
-    for (directory, files) in get_dirs_with_files(conn, old_dat_id)? {
+    for (directory, files) in db::DirRecord::get_by_dat_with_files(conn, old_dat_id)? {
         if util::is_zip_file(&directory.path) {
             let matched_sets = match_sets(conn, imported.id, &directory.path)?;
             let zip_file = File::open(&directory.path)?;
@@ -590,7 +572,7 @@ fn rename_files(tx: &mut Transaction, dat_id: db::DatId, term: &TermInfo) -> Res
         .map(|r| (r.id, r))
         .collect();
 
-    for (directory, files) in get_dirs_with_files(tx, dat_id)? {
+    for (directory, files) in db::DirRecord::get_by_dat_with_files(tx, dat_id)? {
         if util::is_zip_file(&directory.path) {
             continue;
         }
@@ -704,7 +686,7 @@ mod tests {
         db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir1.id, "a.bin", 1, "2")).unwrap();
         db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir2.id, "m.bin", 1, "3")).unwrap();
 
-        let grouped = get_dirs_with_files(&conn, dat.id).unwrap();
+        let grouped = db::DirRecord::get_by_dat_with_files(&conn, dat.id).unwrap();
         let names_by_dir: BTreeMap<_, Vec<_>> = grouped
             .into_iter()
             .map(|(dir, files)| (dir.id, files.into_iter().map(|f| f.name).collect::<Vec<_>>()))
