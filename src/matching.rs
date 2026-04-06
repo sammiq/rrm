@@ -141,10 +141,7 @@ pub(crate) fn match_roms_and_insert(
     let matched = match_roms(conn, dat_id, file, matched_sets)?;
     if let Some(items) = matched {
         for item in items {
-            db::MatchRecord::insert(
-                conn,
-                db::NewMatch::new(dat_id, file.id, item.status, item.set_id, item.rom_id),
-            )?;
+            db::MatchRecord::insert(conn, db::NewMatch::new(dat_id, file.id, item.status, item.set_id, item.rom_id))?;
         }
     }
     Ok(())
@@ -515,8 +512,8 @@ mod tests {
         let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
         let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "TestSet")).unwrap();
         let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
-        let rom =
-            db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "game.rom", 512, "correct_hash", None)).unwrap();
+        let rom = db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "game.rom", 512, "correct_hash", None))
+            .unwrap();
         let file =
             db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "game.rom", 512, "wrong_hash")).unwrap();
 
@@ -533,8 +530,8 @@ mod tests {
         let conn = db::tests::mem_db();
         let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
         let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
-        let file = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "unknown.rom", 999, "no_match"))
-            .unwrap();
+        let file =
+            db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "unknown.rom", 999, "no_match")).unwrap();
         let result = match_roms(&conn, dat.id, &file, &BTreeSet::new()).unwrap();
         assert!(result.is_none());
     }
@@ -545,7 +542,8 @@ mod tests {
         let dat = db::DatRecord::insert(&conn, db::tests::sample_dat()).unwrap();
         let set = db::SetRecord::insert(&conn, db::NewSet::new(dat.id, "TestSet")).unwrap();
         let dir = db::DirRecord::insert(&conn, db::NewDir::new(dat.id, "/roms")).unwrap();
-        let _rom = db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "original.rom", 512, "", None)).unwrap();
+        let _rom =
+            db::RomRecord::insert(&conn, db::NewRom::new(dat.id, set.id, "original.rom", 512, "", None)).unwrap();
         let file = db::FileRecord::insert(&conn, db::NewFile::new(dat.id, dir.id, "renamed.rom", 512, "")).unwrap();
 
         let result = match_roms(&conn, dat.id, &file, &BTreeSet::new()).unwrap();
