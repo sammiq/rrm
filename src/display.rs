@@ -60,11 +60,19 @@ pub(crate) fn list_dat_records(conn: &Connection, dat_id: db::DatId) -> Result<(
     println!("Version:     {}", dat_record.version);
     println!("Author:      {}", dat_record.author);
 
+    let all_roms = db::RomRecord::get_by_dat(conn, dat_id)?;
+    let mut roms_by_set: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    all_roms
+        .iter()
+        .for_each(|rom| roms_by_set.entry(rom.set_id).or_default().push(rom));
+
     println!("--- SETS ---");
     for set in db::SetRecord::get_by_dat(conn, dat_id)? {
         println!("{}", set.name);
-        for rom in set.get_roms(conn)? {
-            println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
+        if let Some(roms) = roms_by_set.get(&set.id) {
+            for rom in roms {
+                println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
+            }
         }
     }
     Ok(())
@@ -167,19 +175,16 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 }
 
 pub(crate) fn list_scanned_files(ctx: &ListContext<'_>, mode: SelectMode) -> Result<()> {
-    //get these in bulk to avoid doing a query per file when we display them
-    let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
-    let matches_by_file: BTreeMap<_, Vec<_>> = matches.iter().fold(BTreeMap::new(), |mut acc, m| {
-        acc.entry(&m.file_id).or_default().push(m);
-        acc
-    });
-
-    // Bulk-load all rom records referenced by those matches
-    let rom_ids: BTreeSet<_> = matches.iter().map(|m| m.rom_id).collect();
-    let roms_by_id: BTreeMap<_, _> = db::RomRecord::get_by_ids(ctx.conn, &rom_ids)?
-        .into_iter()
-        .map(|r| (r.id, r))
-        .collect();
+    let details = db::MatchRecord::get_found_set_details(ctx.conn, ctx.dat_id)?;
+    let mut matches_by_file: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for row in details {
+        if let Some(matched) = row.matched {
+            matches_by_file
+                .entry(matched.file_id)
+                .or_default()
+                .push((matched, row.rom));
+        }
+    }
 
     let dirs = db::DirRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
     for dir in dirs {
@@ -196,11 +201,8 @@ pub(crate) fn list_scanned_files(ctx: &ListContext<'_>, mode: SelectMode) -> Res
         let mut lines = Vec::new();
         for file in files {
             if let Some(file_matches) = matches_by_file.get(&file.id) {
-                for fm in file_matches {
+                for (fm, rom) in file_matches {
                     if should_display_file_status(Some(fm.status), mode) {
-                        let rom = roms_by_id
-                            .get(&fm.rom_id)
-                            .ok_or_else(|| anyhow!("match references missing rom id {:?}", fm.rom_id))?;
                         lines.push(format_match_status(&file, Some((fm, rom)), ctx.term.tty_out));
                     }
                 }

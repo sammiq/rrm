@@ -194,6 +194,7 @@ impl Insertable for SetRecord {
 }
 
 impl SetRecord {
+    #[allow(dead_code)]
     pub fn get_roms(&self, conn: &Connection) -> Result<Vec<RomRecord>> {
         RomRecord::get_by_set(conn, self.id)
     }
@@ -293,6 +294,7 @@ impl Insertable for RomRecord {
 }
 
 impl RomRecord {
+    #[allow(dead_code)]
     fn get_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<Self>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {set_id}, Self::from_row)?;
         Ok(matches)
