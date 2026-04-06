@@ -312,6 +312,7 @@ impl RomRecord {
         Ok(crcs)
     }
 
+    #[allow(dead_code)]
     pub fn get_by_sets<I>(conn: &Connection, set_ids: &I) -> Result<HashMap<SetId, Vec<Self>>>
     where
         for<'a> &'a I: IntoIterator<Item = &'a SetId>,
@@ -683,6 +684,14 @@ pub struct MatchRecord {
     pub rom_id: RomId,
 }
 
+#[derive(Debug, Clone)]
+pub struct FoundSetDetailRow {
+    pub set: SetRecord,
+    pub rom: RomRecord,
+    pub matched: Option<MatchRecord>,
+    pub file: Option<FileRecord>,
+}
+
 impl Queryable for MatchRecord {
     type IdType = MatchId;
 
@@ -781,6 +790,99 @@ impl rusqlite::ToSql for MatchStatus {
 }
 
 impl MatchRecord {
+    pub fn get_found_set_details(conn: &Connection, dat_id: DatId) -> Result<Vec<FoundSetDetailRow>> {
+        let sql = r#"
+            WITH found_sets AS (
+                SELECT DISTINCT set_id
+                FROM matches
+                WHERE dat_id = ?1
+            )
+            SELECT
+                s.id AS set_id,
+                s.dat_id AS set_dat_id,
+                s.name AS set_name,
+                r.id AS rom_id,
+                r.dat_id AS rom_dat_id,
+                r.set_id AS rom_set_id,
+                r.name AS rom_name,
+                r.size AS rom_size,
+                r.hash AS rom_hash,
+                r.crc AS rom_crc,
+                m.id AS match_id,
+                m.dat_id AS match_dat_id,
+                m.file_id AS match_file_id,
+                m.status AS match_status,
+                m.set_id AS match_set_id,
+                m.rom_id AS match_rom_id,
+                f.id AS file_id,
+                f.dat_id AS file_dat_id,
+                f.dir_id AS file_dir_id,
+                f.name AS file_name,
+                f.size AS file_size,
+                f.hash AS file_hash
+            FROM found_sets fs
+            JOIN sets s ON s.id = fs.set_id AND s.dat_id = ?1
+            JOIN roms r ON r.set_id = fs.set_id AND r.dat_id = ?1
+            LEFT JOIN matches m ON m.dat_id = ?1 AND m.set_id = r.set_id AND m.rom_id = r.id
+            LEFT JOIN files f ON f.id = m.file_id
+            ORDER BY s.id, r.id, m.id
+        "#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([dat_id], |row| {
+                let set = SetRecord {
+                    id: row.get("set_id")?,
+                    dat_id: row.get("set_dat_id")?,
+                    name: row.get("set_name")?,
+                };
+                let rom = RomRecord {
+                    id: row.get("rom_id")?,
+                    dat_id: row.get("rom_dat_id")?,
+                    set_id: row.get("rom_set_id")?,
+                    name: row.get("rom_name")?,
+                    size: row.get::<_, StoredU64>("rom_size")?.0,
+                    hash: row.get("rom_hash")?,
+                    crc: row.get("rom_crc")?,
+                };
+
+                let matched = if let Some(id) = row.get::<_, Option<MatchId>>("match_id")? {
+                    Some(MatchRecord {
+                        id,
+                        dat_id: row.get("match_dat_id")?,
+                        file_id: row.get("match_file_id")?,
+                        status: row.get("match_status")?,
+                        set_id: row.get("match_set_id")?,
+                        rom_id: row.get("match_rom_id")?,
+                    })
+                } else {
+                    None
+                };
+
+                let file = if let Some(id) = row.get::<_, Option<FileId>>("file_id")? {
+                    Some(FileRecord {
+                        id,
+                        dat_id: row.get("file_dat_id")?,
+                        dir_id: row.get("file_dir_id")?,
+                        name: row.get("file_name")?,
+                        size: row.get::<_, StoredU64>("file_size")?.0,
+                        hash: row.get("file_hash")?,
+                    })
+                } else {
+                    None
+                };
+
+                Ok(FoundSetDetailRow {
+                    set,
+                    rom,
+                    matched,
+                    file,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn delete_by_file_id(conn: &Connection, file_id: FileId) -> Result<usize> {
         let sql = format!("DELETE FROM {} WHERE file_id = :file_id", Self::table_name());
         let num_deleted = conn.execute(&sql, named_params! {":file_id": file_id})?;
