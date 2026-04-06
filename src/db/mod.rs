@@ -232,8 +232,8 @@ pub fn with_transaction_mut<T, F: FnOnce(&mut Transaction) -> Result<T>>(conn: &
 }
 
 pub fn with_savepoint<T, F: FnOnce(&Savepoint) -> Result<T>>(conn: &mut Transaction, op: F) -> Result<T> {
-    let mut sp = conn.savepoint()?;
-    let result = op(&mut sp)?;
+    let sp = conn.savepoint()?;
+    let result = op(&sp)?;
     sp.commit()?;
     Ok(result)
 }
