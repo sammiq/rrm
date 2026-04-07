@@ -60,11 +60,19 @@ pub(crate) fn list_dat_records(conn: &Connection, dat_id: db::DatId) -> Result<(
     println!("Version:     {}", dat_record.version);
     println!("Author:      {}", dat_record.author);
 
+    let all_roms = db::RomRecord::get_by_dat(conn, dat_id)?;
+    let mut roms_by_set: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    all_roms
+        .iter()
+        .for_each(|rom| roms_by_set.entry(rom.set_id).or_default().push(rom));
+
     println!("--- SETS ---");
     for set in db::SetRecord::get_by_dat(conn, dat_id)? {
         println!("{}", set.name);
-        for rom in set.get_roms(conn)? {
-            println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
+        if let Some(roms) = roms_by_set.get(&set.id) {
+            for rom in roms {
+                println!("    {} {} - {}", rom.hash, rom.name, util::human_size(rom.size));
+            }
         }
     }
     Ok(())
@@ -167,26 +175,26 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 }
 
 pub(crate) fn list_scanned_files(ctx: &ListContext<'_>, mode: SelectMode) -> Result<()> {
-    //get these in bulk to avoid doing a query per file when we display them
-    let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
-    let matches_by_file: BTreeMap<_, Vec<_>> = matches.iter().fold(BTreeMap::new(), |mut acc, m| {
-        acc.entry(&m.file_id).or_default().push(m);
-        acc
-    });
+    let details = db::MatchRecord::get_found_set_details(ctx.conn, ctx.dat_id)?;
+    let mut matches_by_file: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for row in details {
+        if let Some(matched) = row.matched {
+            matches_by_file
+                .entry(matched.file_id)
+                .or_default()
+                .push((matched, row.rom));
+        }
+    }
 
-    // Bulk-load all rom records referenced by those matches
-    let rom_ids: BTreeSet<_> = matches.iter().map(|m| m.rom_id).collect();
-    let roms_by_id: BTreeMap<_, _> = db::RomRecord::get_by_ids(ctx.conn, &rom_ids)?
-        .into_iter()
-        .map(|r| (r.id, r))
-        .collect();
-
-    let dirs = db::DirRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
-    for dir in dirs {
-        let files = if let Some(partial_name) = ctx.partial_name {
-            dir.find_files(ctx.conn, partial_name, false)?
+    let dirs_with_files = db::DirRecord::get_by_dat_with_files(ctx.conn, ctx.dat_id)?;
+    for (dir, files) in dirs_with_files {
+        let files: Vec<_> = if let Some(partial_name) = ctx.partial_name {
+            files
+                .into_iter()
+                .filter(|f| contains_ascii_case_insensitive(&f.name, partial_name))
+                .collect()
         } else {
-            dir.get_files(ctx.conn)?
+            files
         };
 
         if files.is_empty() {
@@ -196,11 +204,8 @@ pub(crate) fn list_scanned_files(ctx: &ListContext<'_>, mode: SelectMode) -> Res
         let mut lines = Vec::new();
         for file in files {
             if let Some(file_matches) = matches_by_file.get(&file.id) {
-                for fm in file_matches {
+                for (fm, rom) in file_matches {
                     if should_display_file_status(Some(fm.status), mode) {
-                        let rom = roms_by_id
-                            .get(&fm.rom_id)
-                            .ok_or_else(|| anyhow!("match references missing rom id {:?}", fm.rom_id))?;
                         lines.push(format_match_status(&file, Some((fm, rom)), ctx.term.tty_out));
                     }
                 }
@@ -223,21 +228,32 @@ pub(crate) fn list_scanned_files(ctx: &ListContext<'_>, mode: SelectMode) -> Res
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum SetStatus {
+enum SetStatus {
     Missing,
     Partial,
     Complete,
 }
 
-pub(crate) fn calculate_set_status(set_roms: &[db::RomRecord], matched_rom_ids: &BTreeSet<db::RomId>) -> SetStatus {
+fn calculate_set_status<'a, I>(set_roms: I, matched_rom_ids: &BTreeSet<db::RomId>) -> SetStatus
+where
+    I: IntoIterator<Item = &'a db::RomRecord>,
+{
+    let mut set_roms = set_roms.into_iter().peekable();
+
+    if set_roms.peek().is_none() {
+        return SetStatus::Complete;
+    }
+
     if matched_rom_ids.is_empty() {
         return SetStatus::Missing;
     }
-    if set_roms.iter().all(|rom| matched_rom_ids.contains(&rom.id)) {
-        SetStatus::Complete
-    } else {
-        SetStatus::Partial
+
+    for rom in set_roms {
+        if !matched_rom_ids.contains(&rom.id) {
+            return SetStatus::Partial;
+        }
     }
+    SetStatus::Complete
 }
 
 #[rustfmt::skip] //single line match arms are more readable
@@ -273,67 +289,71 @@ pub(crate) fn list_missing_sets(ctx: &ListContext<'_>) -> Result<()> {
 }
 
 pub(crate) fn list_found_sets(ctx: &ListContext<'_>) -> Result<()> {
-    //get all the matches so we know what sets we found
-    let matches = db::MatchRecord::get_by_dat(ctx.conn, ctx.dat_id)?;
-    let set_ids: BTreeSet<_> = matches.iter().map(|m| m.set_id).collect();
-    let found_sets = db::SetRecord::get_by_ids(ctx.conn, &set_ids)?;
-    let roms_by_set = db::RomRecord::get_by_sets(ctx.conn, &set_ids)?;
-    let file_ids: BTreeSet<_> = matches.iter().map(|m| m.file_id).collect();
-    let files_by_id: BTreeMap<_, _> = db::FileRecord::get_by_ids(ctx.conn, &file_ids)?
-        .into_iter()
-        .map(|f| (f.id, f))
-        .collect();
-    let matches_by_set: BTreeMap<_, Vec<_>> = matches.into_iter().fold(BTreeMap::new(), |mut acc, m| {
-        acc.entry(m.set_id).or_default().push(m);
-        acc
-    });
-    let all_set_count = db::SetRecord::get_num_by_dat(ctx.conn, ctx.dat_id)?;
+    let details = db::MatchRecord::get_found_set_details(ctx.conn, ctx.dat_id)?;
+    let mut details_by_set: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for row in details {
+        details_by_set.entry(row.set.id).or_default().push(row);
+    }
 
     println!("--- FOUND SETS ---");
-    let partial_status = format_set_indicator(SetStatus::Partial, ctx.term.tty_out);
-    let complete_status = format_set_indicator(SetStatus::Complete, ctx.term.tty_out);
-    for set in &found_sets {
-        if let Some(partial_name) = ctx.partial_name
-            && !contains_ascii_case_insensitive(&set.name, partial_name)
-        {
-            continue;
-        }
+    let found_set_count = details_by_set.len();
+    let all_set_count = db::SetRecord::get_num_by_dat(ctx.conn, ctx.dat_id)?;
+    for set_rows in details_by_set.into_values() {
+        render_found_set(ctx, set_rows)?;
+    }
 
-        if let Some(set_roms) = roms_by_set.get(&set.id)
-            && let Some(set_matches) = matches_by_set.get(&set.id)
-        {
-            let matched_rom_ids: BTreeSet<_> = set_matches.iter().map(|m| m.rom_id).collect();
-            let roms_by_romid: BTreeMap<_, _> = set_roms.iter().map(|rom| (&rom.id, rom)).collect();
+    println!("{} / {} sets found.", found_set_count, all_set_count);
+    Ok(())
+}
 
-            if calculate_set_status(set_roms, &matched_rom_ids) == SetStatus::Complete {
-                println!("[{complete_status}] {}", set.name);
-            } else {
-                println!("[{partial_status}] {}, set has missing roms", set.name);
-            }
+fn render_found_set(ctx: &ListContext<'_>, set_rows: Vec<db::FoundSetDetailRow>) -> Result<()> {
+    let Some(set_name) = set_rows.first().map(|row| row.set.name.clone()) else {
+        return Ok(());
+    };
 
-            for matched in set_matches {
-                let file = files_by_id
-                    .get(&matched.file_id)
-                    .ok_or_else(|| anyhow!("set match references missing file id {:?}", matched.file_id))?;
-                let rom = roms_by_romid
-                    .get(&matched.rom_id)
-                    .ok_or_else(|| anyhow!("set match references missing rom id {:?}", matched.rom_id))?;
-                let status = format_match_status(file, Some((matched, rom)), ctx.term.tty_out);
-                println!(" {status}");
-            }
+    if let Some(partial_name) = ctx.partial_name
+        && !contains_ascii_case_insensitive(&set_name, partial_name)
+    {
+        return Ok(());
+    }
 
-            let missing_indicator = format_file_indicator(None, ctx.term.tty_out);
-            for rom in set_roms {
-                println_if!(
-                    !matched_rom_ids.contains(&rom.id),
-                    " {missing_indicator}  {} {} - missing file",
-                    rom.hash,
-                    rom.name
-                );
-            }
+    let mut set_roms: BTreeMap<db::RomId, db::RomRecord> = BTreeMap::new();
+    let mut set_matches: Vec<(db::MatchRecord, db::FileRecord)> = Vec::new();
+    let mut matched_rom_ids: BTreeSet<db::RomId> = BTreeSet::new();
+    for row in set_rows {
+        set_roms.entry(row.rom.id).or_insert(row.rom);
+        if let (Some(matched), Some(file)) = (row.matched, row.file) {
+            matched_rom_ids.insert(matched.rom_id);
+            set_matches.push((matched, file));
         }
     }
-    println!("{} / {} sets found.", found_sets.len(), all_set_count);
+
+    let set_status = calculate_set_status(set_roms.values(), &matched_rom_ids);
+    let set_indicator = format_set_indicator(set_status, ctx.term.tty_out);
+    if set_status == SetStatus::Complete {
+        println!("[{set_indicator}] {}", set_name);
+    } else {
+        println!("[{set_indicator}] {}, set has missing roms", set_name);
+    }
+
+    for (matched, file) in &set_matches {
+        let rom = set_roms
+            .get(&matched.rom_id)
+            .ok_or_else(|| anyhow!("set match references missing rom id {:?}", matched.rom_id))?;
+        let status = format_match_status(file, Some((matched, rom)), ctx.term.tty_out);
+        println!(" {status}");
+    }
+
+    let missing_indicator = format_file_indicator(None, ctx.term.tty_out);
+    for rom in set_roms.values() {
+        println_if!(
+            !matched_rom_ids.contains(&rom.id),
+            " {missing_indicator}  {} {} - missing file",
+            rom.hash,
+            rom.name
+        );
+    }
+
     Ok(())
 }
 
@@ -437,5 +457,11 @@ mod tests {
         let roms = [make_rom(1, 1, 1, 100, "a")];
         let matched_ids = BTreeSet::from([1i64.into()]);
         assert_eq!(calculate_set_status(&roms, &matched_ids), SetStatus::Complete);
+    }
+
+    #[test]
+    fn set_status_complete_with_no_roms() {
+        let roms: [db::RomRecord; 0] = [];
+        assert_eq!(calculate_set_status(&roms, &BTreeSet::new()), SetStatus::Complete);
     }
 }

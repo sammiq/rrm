@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, named_params, params, params_from_iter};
@@ -194,6 +194,7 @@ impl Insertable for SetRecord {
 }
 
 impl SetRecord {
+    #[allow(dead_code)]
     pub fn get_roms(&self, conn: &Connection) -> Result<Vec<RomRecord>> {
         RomRecord::get_by_set(conn, self.id)
     }
@@ -293,6 +294,7 @@ impl Insertable for RomRecord {
 }
 
 impl RomRecord {
+    #[allow(dead_code)]
     fn get_by_set(conn: &Connection, set_id: SetId) -> Result<Vec<Self>> {
         let matches = sql_query!(conn, Self::table_name(), Self::fields(), where {set_id}, Self::from_row)?;
         Ok(matches)
@@ -312,6 +314,7 @@ impl RomRecord {
         Ok(crcs)
     }
 
+    #[allow(dead_code)]
     pub fn get_by_sets<I>(conn: &Connection, set_ids: &I) -> Result<HashMap<SetId, Vec<Self>>>
     where
         for<'a> &'a I: IntoIterator<Item = &'a SetId>,
@@ -438,6 +441,62 @@ impl DirRecord {
         FileRecord::get_by_dir(conn, self.id)
     }
 
+    pub fn get_by_dat_with_files(conn: &Connection, dat_id: DatId) -> Result<Vec<(DirRecord, Vec<FileRecord>)>> {
+        let sql = r#"
+            SELECT
+                d.id AS dir_id,
+                d.dat_id AS dir_dat_id,
+                d.path AS dir_path,
+                f.id AS file_id,
+                f.dat_id AS file_dat_id,
+                f.dir_id AS file_dir_id,
+                f.name AS file_name,
+                f.size AS file_size,
+                f.hash AS file_hash
+            FROM dirs d
+            LEFT JOIN files f ON f.dir_id = d.id AND f.dat_id = d.dat_id
+            WHERE d.dat_id = ?1
+            ORDER BY d.path, f.name
+        "#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query([dat_id])?;
+
+        let mut grouped: Vec<(DirRecord, Vec<FileRecord>)> = Vec::new();
+        let mut index_by_dir: BTreeMap<DirId, usize> = BTreeMap::new();
+
+        while let Some(row) = rows.next()? {
+            let dir = DirRecord {
+                id: row.get("dir_id")?,
+                dat_id: row.get("dir_dat_id")?,
+                path: row.get("dir_path")?,
+            };
+
+            let dir_idx = if let Some(idx) = index_by_dir.get(&dir.id) {
+                *idx
+            } else {
+                let idx = grouped.len();
+                index_by_dir.insert(dir.id, idx);
+                grouped.push((dir, Vec::new()));
+                idx
+            };
+
+            if let Some(file_id) = row.get::<_, Option<FileId>>("file_id")? {
+                grouped[dir_idx].1.push(FileRecord {
+                    id: file_id,
+                    dat_id: row.get("file_dat_id")?,
+                    dir_id: row.get("file_dir_id")?,
+                    name: row.get("file_name")?,
+                    size: row.get::<_, StoredU64>("file_size")?.0,
+                    hash: row.get("file_hash")?,
+                });
+            }
+        }
+
+        Ok(grouped)
+    }
+
+    #[allow(dead_code)]
     pub fn find_files(&self, conn: &Connection, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
         FileRecord::find_by_name_in_dir(conn, self.id, name, exact)
     }
@@ -569,6 +628,7 @@ impl FileRecord {
         Ok(matches)
     }
 
+    #[allow(dead_code)]
     pub fn find_by_name_in_dir(conn: &Connection, dir_id: DirId, name: &str, exact: bool) -> Result<Vec<FileRecord>> {
         let matches = if exact {
             sql_query!(conn, Self::table_name(), FileRecord::fields(), where {dir_id, name}, order by "name", Self::from_row)
@@ -683,6 +743,14 @@ pub struct MatchRecord {
     pub rom_id: RomId,
 }
 
+#[derive(Debug, Clone)]
+pub struct FoundSetDetailRow {
+    pub set: SetRecord,
+    pub rom: RomRecord,
+    pub matched: Option<MatchRecord>,
+    pub file: Option<FileRecord>,
+}
+
 impl Queryable for MatchRecord {
     type IdType = MatchId;
 
@@ -781,6 +849,99 @@ impl rusqlite::ToSql for MatchStatus {
 }
 
 impl MatchRecord {
+    pub fn get_found_set_details(conn: &Connection, dat_id: DatId) -> Result<Vec<FoundSetDetailRow>> {
+        let sql = r#"
+            WITH found_sets AS (
+                SELECT DISTINCT set_id
+                FROM matches
+                WHERE dat_id = ?1
+            )
+            SELECT
+                s.id AS set_id,
+                s.dat_id AS set_dat_id,
+                s.name AS set_name,
+                r.id AS rom_id,
+                r.dat_id AS rom_dat_id,
+                r.set_id AS rom_set_id,
+                r.name AS rom_name,
+                r.size AS rom_size,
+                r.hash AS rom_hash,
+                r.crc AS rom_crc,
+                m.id AS match_id,
+                m.dat_id AS match_dat_id,
+                m.file_id AS match_file_id,
+                m.status AS match_status,
+                m.set_id AS match_set_id,
+                m.rom_id AS match_rom_id,
+                f.id AS file_id,
+                f.dat_id AS file_dat_id,
+                f.dir_id AS file_dir_id,
+                f.name AS file_name,
+                f.size AS file_size,
+                f.hash AS file_hash
+            FROM found_sets fs
+            JOIN sets s ON s.id = fs.set_id AND s.dat_id = ?1
+            JOIN roms r ON r.set_id = fs.set_id AND r.dat_id = ?1
+            LEFT JOIN matches m ON m.dat_id = ?1 AND m.set_id = r.set_id AND m.rom_id = r.id
+            LEFT JOIN files f ON f.id = m.file_id
+            ORDER BY s.id, r.id, m.id
+        "#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([dat_id], |row| {
+                let set = SetRecord {
+                    id: row.get("set_id")?,
+                    dat_id: row.get("set_dat_id")?,
+                    name: row.get("set_name")?,
+                };
+                let rom = RomRecord {
+                    id: row.get("rom_id")?,
+                    dat_id: row.get("rom_dat_id")?,
+                    set_id: row.get("rom_set_id")?,
+                    name: row.get("rom_name")?,
+                    size: row.get::<_, StoredU64>("rom_size")?.0,
+                    hash: row.get("rom_hash")?,
+                    crc: row.get("rom_crc")?,
+                };
+
+                let matched = if let Some(id) = row.get::<_, Option<MatchId>>("match_id")? {
+                    Some(MatchRecord {
+                        id,
+                        dat_id: row.get("match_dat_id")?,
+                        file_id: row.get("match_file_id")?,
+                        status: row.get("match_status")?,
+                        set_id: row.get("match_set_id")?,
+                        rom_id: row.get("match_rom_id")?,
+                    })
+                } else {
+                    None
+                };
+
+                let file = if let Some(id) = row.get::<_, Option<FileId>>("file_id")? {
+                    Some(FileRecord {
+                        id,
+                        dat_id: row.get("file_dat_id")?,
+                        dir_id: row.get("file_dir_id")?,
+                        name: row.get("file_name")?,
+                        size: row.get::<_, StoredU64>("file_size")?.0,
+                        hash: row.get("file_hash")?,
+                    })
+                } else {
+                    None
+                };
+
+                Ok(FoundSetDetailRow {
+                    set,
+                    rom,
+                    matched,
+                    file,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn delete_by_file_id(conn: &Connection, file_id: FileId) -> Result<usize> {
         let sql = format!("DELETE FROM {} WHERE file_id = :file_id", Self::table_name());
         let num_deleted = conn.execute(&sql, named_params! {":file_id": file_id})?;
@@ -797,6 +958,7 @@ impl MatchRecord {
         Ok(num_deleted)
     }
 
+    #[allow(dead_code)]
     pub fn get_by_file_id(conn: &Connection, file_id: FileId) -> Result<Vec<Self>> {
         let matches =
             sql_query!(conn, Self::table_name(), Self::fields(), where {file_id}, order by "id", Self::from_row)?;
